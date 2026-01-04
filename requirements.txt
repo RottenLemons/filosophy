@@ -1,0 +1,5 @@
+vectorlite-py
+apsw
+numpy
+sentence_transformers
+git+https://github.com/apple/ml-mobileclip.git
