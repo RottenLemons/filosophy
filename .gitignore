@@ -1,4 +1,3 @@
-test.db*
 *.db
 image.onnx
 text.onnx
@@ -7,3 +6,4 @@ text_old/**
 image/**
 text/**
 native/**
+test.ipynb

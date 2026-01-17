@@ -2,24 +2,22 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	// "github.com/jmoiron/sqlx"
+	"github.com/Microsoft/go-winio"
+	vips "github.com/cshum/vipsgen/vips817"
 	"github.com/rahulpoonia29/extractous-go"
 	"github.com/tmc/langchaingo/textsplitter"
-
-	"github.com/Microsoft/go-winio"
-	// "encoding/json"
-	// _ "github.com/mattn/go-sqlite3"
-	// sqlite_vec "github.com/vlasky/sqlite-vec/bindings/go/cgo"
 )
 
 var parentDir string = "C:/Users/Mahir/Downloads/test/"
@@ -44,6 +42,7 @@ var c int = 1000
 // }
 
 func send(data interface{}, task string) string {
+	fmt.Println("enter" + task)
 	pipePath := `\\.\pipe\test`
 	f, err := winio.DialPipe(pipePath, nil)
 	if err != nil {
@@ -68,7 +67,77 @@ type metadata struct {
 	content, path string
 }
 
+type dataType struct {
+	data []byte
+	mode string
+}
+
+var imageExtensions = map[string]struct{}{
+	".jpg":  {},
+	".jpeg": {},
+	".png":  {},
+	".gif":  {},
+	".bmp":  {},
+	".tiff": {},
+	".tif":  {},
+	// ".webp": {}, Not supported for now
+	".heic": {},
+	".heif": {},
+	// ".svg":  {}, Not supported for now
+	".ico":   {},
+	".avif":  {},
+	".jfif":  {},
+	".pjpeg": {},
+	".pjp":   {},
+}
+
+func IsImageFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	_, ok := imageExtensions[ext]
+	return ok
+}
+
+func handleChunk(chunks chan metadata, sendQueue chan dataType, mode, content, path string) {
+	select {
+	case chunks <- metadata{content, path}:
+	default:
+		dataMap := make(map[string][]string)
+
+		for j := 0; j < cap(chunks); j++ {
+			select {
+			case tmp := <-chunks:
+				dataMap["content"] = append(dataMap["content"], tmp.content)
+				dataMap["path"] = append(dataMap["path"], tmp.path)
+			default:
+			}
+		}
+		chunks <- metadata{content, path}
+		if len(dataMap["content"]) > 0 {
+			data, _ := json.Marshal(dataMap)
+			sendQueue <- dataType{data, mode}
+		}
+	}
+}
+
+func drainRemain(chunks chan metadata, mode string, sendQueue chan dataType) {
+	fmt.Print(len(chunks))
+	if len(chunks) > 0 {
+		dataMap := make(map[string][]string)
+		for len(chunks) > 0 {
+			tmp := <-chunks
+			dataMap["content"] = append(dataMap["content"], tmp.content)
+			dataMap["path"] = append(dataMap["path"], tmp.path)
+		}
+		data, _ := json.Marshal(dataMap)
+		sendQueue <- dataType{data, mode}
+	}
+}
+
 func main() {
+	// _, err := v4.ExtractFileSync("document.pdf", nil)
+	// if err == nil {
+	// 	return
+	// }
 	index := flag.Bool("index", false, "index files for search")
 	flag.Parse()
 	if *index {
@@ -85,15 +154,25 @@ func main() {
 		}
 		defer extractor.Close()
 		chunks := make(chan metadata, 1000)
-		sendQueue := make(chan []byte, 10) // Queue for data to send
+		images := make(chan metadata, 100)
+		sendQueue := make(chan dataType, 10) // Queue for data to send
 		sendDone := make(chan struct{})
+		// imgQueue := make(chan []byte, 10)
+		// imgDone := make(chan struct{})
 		// Dedicated sender goroutine - ensures sequential sends
 		go func() {
 			for data := range sendQueue {
-				send(data, "text")
+				send(data.data, data.mode)
 			}
 			sendDone <- struct{}{}
 		}()
+
+		// go func() {
+		// 	for data := range imgQueue {
+		// 		send(data, "image")
+		// 	}
+		// 	imgDone <- struct{}{}
+		// }()
 
 		for errRead != io.EOF {
 			var wg sync.WaitGroup
@@ -101,10 +180,35 @@ func main() {
 				wg.Add(1)
 				go func(name string) {
 					defer wg.Done()
-					var b strings.Builder
-					reader, _, err := extractor.ExtractFile(parentDir + name)
-					if err != nil {
+					path := parentDir + name
+
+					if IsImageFile(name) {
+						im_bytes, err := os.ReadFile(path)
+						if err != nil {
+							log.Fatal(err)
+						}
+						vImg, err := vips.NewThumbnailBuffer(im_bytes, 256, &vips.ThumbnailBufferOptions{
+							Height: 256,
+							FailOn: vips.FailOnError, // Fail on first error
+						})
+						if err != nil {
+							log.Fatalf("Failed to load image: %v", err)
+						}
+						defer vImg.Close()
+						im_bytes, err = vImg.PngsaveBuffer(nil)
+						if err != nil {
+							log.Fatalf("Failed to save image as buffer: %v", err)
+						}
+						im_string := base64.StdEncoding.EncodeToString(im_bytes)
+						handleChunk(images, sendQueue, "image", im_string, path)
 						return
+					}
+
+					var b strings.Builder
+
+					reader, _, err := extractor.ExtractFile(path)
+					if err != nil {
+						handleChunk(chunks, sendQueue, "text", "", path)
 					}
 					defer reader.Close()
 
@@ -116,19 +220,7 @@ func main() {
 							splits, err := splitter.SplitText(b.String())
 							if err == nil {
 								for _, i := range splits {
-									select {
-									case chunks <- metadata{i, parentDir + name}:
-									default:
-										dataMap := make(map[string][]string)
-										for j := 0; j < len(chunks); j++ {
-											tmp := <-chunks
-											dataMap["content"] = append(dataMap["content"], tmp.content)
-											dataMap["path"] = append(dataMap["path"], tmp.path)
-										}
-										chunks <- metadata{i, parentDir + name}
-										data, _ := json.Marshal(dataMap)
-										sendQueue <- data
-									}
+									handleChunk(chunks, sendQueue, "text", i, path)
 								}
 							} else {
 								fmt.Println(err)
@@ -145,19 +237,10 @@ func main() {
 
 			names, errRead = file.Readdirnames(c)
 		}
-		print("DONE YALL")
-		if len(chunks) > 0 {
-			dataMap := make(map[string][]string)
-			for len(chunks) > 0 {
-				tmp := <-chunks
-				dataMap["content"] = append(dataMap["content"], tmp.content)
-				dataMap["path"] = append(dataMap["path"], tmp.path)
-			}
-			data, _ := json.Marshal(dataMap)
-			sendQueue <- data
-		}
-
+		drainRemain(chunks, "text", sendQueue)
+		drainRemain(images, "image", sendQueue)
 		close(sendQueue)
+		// close(imgQueue)
 		<-sendDone
 		end := time.Now()
 		fmt.Println(end.Sub(start))
