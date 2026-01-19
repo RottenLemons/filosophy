@@ -194,7 +194,7 @@ def search(query, tokenizer, model1, model2, conn):
             distance * 0.5 as dist,
             'image' as source
         from image_embs
-        where knn_search(embs, knn_param(:query_emb, :k))
+        where knn_search(embs, knn_param(:query_emb, :k)) and distance <= 0.80
         ),
         -- combine and rank all vector matches together
         combined_vec as (
@@ -279,7 +279,7 @@ def image_search(query, tokenizer, model, conn):
             row_number() over (order by i.distance) as rank_number
         from image_embs i 
         join metadata m on m.id = i.rowid
-        where knn_search(embs, knn_param(:query_emb, :k))
+        where knn_search(embs, knn_param(:query_emb, :k)) and distance <= 0.80
         ),
         final as (
             select path, min(rank_number)  as prio
@@ -490,12 +490,12 @@ def server_main():
         while True:
             # Wait for a connection
             win32pipe.ConnectNamedPipe(pipe, None)
-            _, buf = win32file.ReadFile(pipe, int(10e6))
-            while win32pipe.PeekNamedPipe(pipe, 0)[1] > 0:
-                _, data = win32file.ReadFile(pipe, int(10e6))
-                print("reading")
-                buf += data
-            print(len(buf))
+            _, buf = win32file.ReadFile(pipe, int(100e6))
+            # while win32pipe.PeekNamedPipe(pipe, 0)[1] > 0:
+            #     _, data = win32file.ReadFile(pipe, int(10e6))
+            #     print("reading")
+            #     buf += data
+            # print(len(buf))
             data = json.loads(buf.decode())  # type: ignore
             if data["task"] == "text":
                 index_text(data["data"], text_model, conn)
