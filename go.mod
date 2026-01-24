@@ -12,6 +12,7 @@ require (
 	github.com/cshum/vipsgen v1.3.1 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/kreuzberg-dev/kreuzberg/packages/go/v4 v4.1.0 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.8 // indirect
 	gitlab.com/golang-commonmark/html v0.0.0-20191124015941-a22733972181 // indirect
 	gitlab.com/golang-commonmark/linkify v0.0.0-20200225224916-64bca66f6ad3 // indirect

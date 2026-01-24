@@ -3,10 +3,8 @@ import unittest
 
 import apsw
 import apsw.fts5
-import mobileclip
 import requests
 import vectorlite_py
-from sentence_transformers import SentenceTransformer
 
 import sidecar
 
@@ -50,11 +48,11 @@ def create_db():
 class TestSideCar(unittest.TestCase):
     def __init__(self, *args, **kwargs):
         super(TestSideCar, self).__init__(*args, **kwargs)
-        self.text_model = SentenceTransformer("text", truncate_dim=256)
-        self.vision_model, _, self.preprocess = mobileclip.create_model_and_transforms(
-            "mobileclip_s0", pretrained="image/mobileclip_s0.pt"
-        )
-        self.tokenizer = mobileclip.get_tokenizer("mobileclip_s0")
+        # self.text_model = SentenceTransformer("text", truncate_dim=256)
+        # self.vision_model, _, self.preprocess = mobileclip.create_model_and_transforms(
+        #     "mobileclip_s0", pretrained="image/mobileclip_s0.pt"
+        # )
+        # self.tokenizer = mobileclip.get_tokenizer("mobileclip_s0")
 
     def test_insert_text(self):
         conn = create_db()
@@ -63,7 +61,8 @@ class TestSideCar(unittest.TestCase):
             "path": ["Hello.txt", "test.txt"],
         }
         expected_count = 2
-        sidecar.index_text(test_data, self.text_model, conn)
+        # sidecar.index_text(test_data, self.text_model, conn)
+        sidecar.index_text(test_data, conn)
         cursor = conn.cursor()
         count_metadata = cursor.execute("select count(*) from metadata").fetchone()[0]  # type: ignore
         count_search = cursor.execute("select count(*) from search").fetchone()[0]  # type: ignore
@@ -90,7 +89,9 @@ class TestSideCar(unittest.TestCase):
             test_data["path"].append(f"img{i}.png")
 
         expected_count = 2
-        sidecar.index_image(test_data, self.vision_model, self.preprocess, conn)
+        # sidecar.index_image(test_data, self.vision_model, self.preprocess, conn)
+        sidecar.index_image(test_data, conn)
+
         cursor = conn.cursor()
         count_metadata = cursor.execute("select count(*) from metadata").fetchone()[0]  # type: ignore
         count_search = cursor.execute("select count(*) from search").fetchone()[0]  # type: ignore
@@ -110,8 +111,8 @@ class TestSideCar(unittest.TestCase):
             "content": ["Hello World", "Testing 123"],
             "path": ["Hello.txt", "test.txt"],
         }
-        sidecar.index_text(test_data, self.text_model, conn)
-        records = sidecar.text_search("hello", self.text_model, conn)
+        sidecar.index_text(test_data, conn)
+        records = sidecar.text_search("hello", conn)
 
         self.assertNotEqual(len(records), 0)
 
@@ -127,8 +128,8 @@ class TestSideCar(unittest.TestCase):
             )
             test_data["path"].append(f"img{i}.png")
 
-        sidecar.index_image(test_data, self.vision_model, self.preprocess, conn)
-        records = sidecar.image_search("hello", self.tokenizer, self.vision_model, conn)
+        sidecar.index_image(test_data, conn)
+        records = sidecar.image_search("png", conn)
 
         self.assertNotEqual(len(records), 0)
 
@@ -144,17 +145,15 @@ class TestSideCar(unittest.TestCase):
             )
             image_data["path"].append(f"img{i}.png")
 
-        sidecar.index_image(image_data, self.vision_model, self.preprocess, conn)
+        sidecar.index_image(image_data, conn)
 
         test_data = {
             "content": ["Hello World", "Testing 123"],
             "path": ["Hello.txt", "test.txt"],
         }
-        sidecar.index_text(test_data, self.text_model, conn)
+        sidecar.index_text(test_data, conn)
 
-        records = sidecar.search(
-            "hello", self.tokenizer, self.vision_model, self.text_model, conn
-        )
+        records = sidecar.search("hello", conn)
 
         self.assertNotEqual(len(records), 0)
 

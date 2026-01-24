@@ -157,8 +157,11 @@ func main() {
 		images := make(chan metadata, 100)
 		sendQueue := make(chan dataType, 10) // Queue for data to send
 		sendDone := make(chan struct{})
-		// imgQueue := make(chan []byte, 10)
-		// imgDone := make(chan struct{})
+
+		// Semaphore to limit concurrent CGO calls (extractous and vips are not thread-safe)
+		maxConcurrency := 10 // Limit concurrent workers
+		sem := make(chan struct{}, maxConcurrency)
+
 		// Dedicated sender goroutine - ensures sequential sends
 		go func() {
 			for data := range sendQueue {
@@ -167,19 +170,16 @@ func main() {
 			sendDone <- struct{}{}
 		}()
 
-		// go func() {
-		// 	for data := range imgQueue {
-		// 		send(data, "image")
-		// 	}
-		// 	imgDone <- struct{}{}
-		// }()
-
 		for errRead != io.EOF {
 			var wg sync.WaitGroup
 			for _, name := range names {
 				wg.Add(1)
 				go func(name string) {
 					defer wg.Done()
+					// Acquire semaphore before CGO operations
+					sem <- struct{}{}
+					defer func() { <-sem }()
+
 					path := parentDir + name
 
 					if IsImageFile(name) {
@@ -237,8 +237,8 @@ func main() {
 
 			names, errRead = file.Readdirnames(c)
 		}
-		drainRemain(chunks, "text", sendQueue)
-		drainRemain(images, "image", sendQueue)
+		drainRemain(chunks, "text", sendQueue)   // Last Text
+		drainRemain(images, "limage", sendQueue) // Last image
 		close(sendQueue)
 		// close(imgQueue)
 		<-sendDone
