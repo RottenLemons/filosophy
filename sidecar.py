@@ -8,6 +8,7 @@
 # This code is in the public domain.
 import argparse
 import base64
+import gc
 import json
 import random
 import time
@@ -23,23 +24,6 @@ import win32file
 import win32pipe
 from PIL import Image
 from sentence_transformers import SentenceTransformer
-
-# def img_to_numpy(imgdata):
-#     """Translates an image (as received from the client) into a numpy array.
-
-#     The received image is an array of 3072 bytes (32x32x3), where each byte
-#     represents the intensity of a single color channel at a single pixel.
-#     The array is in row-major order, with the red channel first, then green,
-#     then blue.
-
-#     The resulting Numpy array has shape (32, 32, 3) and dtype float64, in
-#     a format expected by the model.
-#     """
-#     red = np.frombuffer(imgdata[:1024], dtype=np.uint8).reshape((32, 32))
-#     green = np.frombuffer(imgdata[1024:2048], dtype=np.uint8).reshape((32, 32))
-#     blue = np.frombuffer(imgdata[2048:], dtype=np.uint8).reshape((32, 32))
-#     uints = np.stack([red, green, blue], axis=-1)
-#     return uints.astype(np.float64) / 255.0
 
 EPOCH = int(
     time.mktime(time.strptime("2026-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")) * 1000
@@ -100,6 +84,10 @@ def index_text(data, model, conn):
         cursor.execute("rollback")
         print(e)
         raise
+    finally:
+        # Free image memory
+        del data, embs
+        gc.collect()
 
 
 def index_image(data, model, processor, conn):
@@ -149,6 +137,10 @@ def index_image(data, model, processor, conn):
         cursor.execute("rollback")
         print(e)
         raise
+    finally:
+        # Free image memory
+        del imgs, im_procs, embs, data
+        gc.collect()
 
 
 def search(query, tokenizer, model1, model2, conn):
