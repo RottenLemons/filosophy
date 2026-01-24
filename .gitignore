@@ -7,3 +7,5 @@ image/**
 text/**
 native/**
 test.ipynb
+*.bin
+kreuzberg-ffi/**

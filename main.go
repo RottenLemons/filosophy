@@ -24,21 +24,21 @@ var parentDir string = "C:/Users/Mahir/Downloads/test/"
 var c int = 1000
 
 // func main2() {
-// 	pipePath := `\\.\pipe\Foo`
-// 	for i := 0; i < 5; i++ {
-// 		f, err := winio.DialPipe(pipePath, nil)
-// 		if err != nil {
-// 			log.Fatalf("error opening pipe: %v", err)
-// 		}
-// 		defer f.Close()
-// 		_, err = f.Write([]byte(`{"type": "text","data":["HELLO, this is my text"]}`))
-// 		chunk := make([]byte, 1024)
-// 		_, err = f.Read(chunk)
-// 		if err != nil {
-// 			log.Fatalf("write error: %v", err)
-// 		}
-// 		fmt.Println("read:", string(chunk))
-// 	}
+//  pipePath := `\\.\pipe\Foo`
+//  for i := 0; i < 5; i++ {
+//      f, err := winio.DialPipe(pipePath, nil)
+//      if err != nil {
+//          log.Fatalf("error opening pipe: %v", err)
+//      }
+//      defer f.Close()
+//      _, err = f.Write([]byte(`{"type": "text","data":["HELLO, this is my text"]}`))
+//      chunk := make([]byte, 1024)
+//      _, err = f.Read(chunk)
+//      if err != nil {
+//          log.Fatalf("write error: %v", err)
+//      }
+//      fmt.Println("read:", string(chunk))
+//  }
 // }
 
 func send(data interface{}, task string) string {
@@ -136,7 +136,7 @@ func drainRemain(chunks chan metadata, mode string, sendQueue chan dataType) {
 func main() {
 	// _, err := v4.ExtractFileSync("document.pdf", nil)
 	// if err == nil {
-	// 	return
+	//  return
 	// }
 	index := flag.Bool("index", false, "index files for search")
 	flag.Parse()
@@ -157,8 +157,11 @@ func main() {
 		images := make(chan metadata, 100)
 		sendQueue := make(chan dataType, 10) // Queue for data to send
 		sendDone := make(chan struct{})
-		// imgQueue := make(chan []byte, 10)
-		// imgDone := make(chan struct{})
+
+		// Semaphore to limit concurrent CGO calls (extractous and vips are not thread-safe)
+		maxConcurrency := 10 // Limit concurrent workers
+		sem := make(chan struct{}, maxConcurrency)
+
 		// Dedicated sender goroutine - ensures sequential sends
 		go func() {
 			for data := range sendQueue {
@@ -167,19 +170,16 @@ func main() {
 			sendDone <- struct{}{}
 		}()
 
-		// go func() {
-		// 	for data := range imgQueue {
-		// 		send(data, "image")
-		// 	}
-		// 	imgDone <- struct{}{}
-		// }()
-
 		for errRead != io.EOF {
 			var wg sync.WaitGroup
 			for _, name := range names {
 				wg.Add(1)
 				go func(name string) {
 					defer wg.Done()
+					// Acquire semaphore before CGO operations
+					sem <- struct{}{}
+					defer func() { <-sem }()
+
 					path := parentDir + name
 
 					if IsImageFile(name) {
@@ -237,8 +237,8 @@ func main() {
 
 			names, errRead = file.Readdirnames(c)
 		}
-		drainRemain(chunks, "text", sendQueue)
-		drainRemain(images, "image", sendQueue)
+		drainRemain(chunks, "text", sendQueue)  // Last Text
+		drainRemain(images, "image", sendQueue) // Last image
 		close(sendQueue)
 		// close(imgQueue)
 		<-sendDone
