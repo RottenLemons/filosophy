@@ -1,3 +1,5 @@
+// This code is written by Mahir Shah
+
 package main
 
 import (
