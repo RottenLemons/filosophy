@@ -6,40 +6,20 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Microsoft/go-winio"
 	vips "github.com/cshum/vipsgen/vips817"
-	"github.com/rahulpoonia29/extractous-go"
+	kreuzberg "github.com/kreuzberg-dev/kreuzberg/packages/go/v4"
+
 	"github.com/tmc/langchaingo/textsplitter"
 )
 
 var parentDir string = "C:/Users/Mahir/Downloads/test/"
-var c int = 1000
-
-// func main2() {
-//  pipePath := `\\.\pipe\Foo`
-//  for i := 0; i < 5; i++ {
-//      f, err := winio.DialPipe(pipePath, nil)
-//      if err != nil {
-//          log.Fatalf("error opening pipe: %v", err)
-//      }
-//      defer f.Close()
-//      _, err = f.Write([]byte(`{"type": "text","data":["HELLO, this is my text"]}`))
-//      chunk := make([]byte, 1024)
-//      _, err = f.Read(chunk)
-//      if err != nil {
-//          log.Fatalf("write error: %v", err)
-//      }
-//      fmt.Println("read:", string(chunk))
-//  }
-// }
 
 func send(data interface{}, task string) string {
 	fmt.Println("enter" + task)
@@ -134,25 +114,13 @@ func drainRemain(chunks chan metadata, mode string, sendQueue chan dataType) {
 }
 
 func main() {
-	// _, err := v4.ExtractFileSync("document.pdf", nil)
-	// if err == nil {
-	//  return
-	// }
 	index := flag.Bool("index", false, "index files for search")
 	flag.Parse()
 	if *index {
 		start := time.Now()
-		// db, _ = sqlx.Open("sqlite3", "test.db")
-		file, _ := os.Open(parentDir)
-		names, errRead := file.Readdirnames(c)
-		extractor := extractous.New()
 		splitter := textsplitter.NewRecursiveCharacter(func(o *textsplitter.Options) {
 			o.ChunkSize = 8096
 		})
-		if extractor == nil {
-			log.Fatal("Failed to create extractor")
-		}
-		defer extractor.Close()
 		chunks := make(chan metadata, 1000)
 		images := make(chan metadata, 100)
 		sendQueue := make(chan dataType, 10) // Queue for data to send
@@ -170,77 +138,78 @@ func main() {
 			sendDone <- struct{}{}
 		}()
 
-		for errRead != io.EOF {
-			var wg sync.WaitGroup
-			for _, name := range names {
-				wg.Add(1)
-				go func(name string) {
-					defer wg.Done()
-					// Acquire semaphore before CGO operations
-					sem <- struct{}{}
-					defer func() { <-sem }()
+		filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
 
-					path := parentDir + name
+			if info.IsDir() {
+				handleChunk(chunks, sendQueue, "text", "", path)
+				return nil
+			}
 
-					if IsImageFile(name) {
-						im_bytes, err := os.ReadFile(path)
-						if err != nil {
-							log.Fatal(err)
-						}
-						vImg, err := vips.NewThumbnailBuffer(im_bytes, 256, &vips.ThumbnailBufferOptions{
-							Height: 256,
-							FailOn: vips.FailOnError, // Fail on first error
-						})
-						if err != nil {
-							log.Fatalf("Failed to load image: %v", err)
-						}
-						defer vImg.Close()
-						im_bytes, err = vImg.PngsaveBuffer(nil)
-						if err != nil {
-							log.Fatalf("Failed to save image as buffer: %v", err)
-						}
-						im_string := base64.StdEncoding.EncodeToString(im_bytes)
-						handleChunk(images, sendQueue, "image", im_string, path)
+			// Acquire semaphore before spawning goroutine
+			sem <- struct{}{}
+
+			go func(path string) {
+				defer func() { <-sem }()
+
+				if IsImageFile(path) {
+					im_bytes, err := os.ReadFile(path)
+					if err != nil {
+						log.Println("Failed to read image:", err)
 						return
 					}
-
-					var b strings.Builder
-
-					reader, _, err := extractor.ExtractFile(path)
+					vImg, err := vips.NewThumbnailBuffer(im_bytes, 256, &vips.ThumbnailBufferOptions{
+						Height: 256,
+						FailOn: vips.FailOnError, // Fail on first error
+					})
+					im_bytes = nil // Free original image bytes
 					if err != nil {
-						handleChunk(chunks, sendQueue, "text", "", path)
+						log.Println("Failed to load image:", err)
+						return
 					}
-					defer reader.Close()
-
-					// Process the document in chunks
-					buffer := make([]byte, 16000)
-					for {
-						n, err := reader.Read(buffer)
-						if err == io.EOF {
-							splits, err := splitter.SplitText(b.String())
-							if err == nil {
-								for _, i := range splits {
-									handleChunk(chunks, sendQueue, "text", i, path)
-								}
-							} else {
-								fmt.Println(err)
-							}
-							return
-						}
-						if err != nil {
-						}
-						b.Write(buffer[:n])
+					pngBytes, err := vImg.PngsaveBuffer(nil)
+					defer vImg.Close() // Close immediately after use
+					if err != nil {
+						log.Println("Failed to save image as buffer:", err)
+						return
 					}
-				}(name)
-			}
-			wg.Wait()
+					im_string := base64.StdEncoding.EncodeToString(pngBytes)
+					pngBytes = nil // Free PNG bytes after encoding
+					handleChunk(images, sendQueue, "image", im_string, path)
+					return
+				}
 
-			names, errRead = file.Readdirnames(c)
+				result, err := kreuzberg.ExtractFileSync(path, nil)
+
+				if err != nil {
+					handleChunk(chunks, sendQueue, "text", "", path)
+					return
+				}
+
+				splits, err := splitter.SplitText(result.Content)
+
+				if err == nil {
+					for _, i := range splits {
+						handleChunk(chunks, sendQueue, "text", i, path)
+					}
+				} else {
+					fmt.Println(err)
+				}
+			}(path)
+
+			return nil
+		})
+
+		// Wait for all goroutines to finish by filling the semaphore
+		for i := 0; i < maxConcurrency; i++ {
+			sem <- struct{}{}
 		}
+
 		drainRemain(chunks, "text", sendQueue)  // Last Text
 		drainRemain(images, "image", sendQueue) // Last image
 		close(sendQueue)
-		// close(imgQueue)
 		<-sendDone
 		end := time.Now()
 		fmt.Println(end.Sub(start))

@@ -43,8 +43,12 @@ def generate_rowid():
 
 def index_text(data, model, conn):
     t0 = time.time()
+    contents = data["content"]
+    paths = data["path"]
+    del data  # Free input data structure early
+    
     embs = model.encode(
-        data["content"],
+        contents,
         convert_to_numpy=True,
         # normalize_embeddings=True,
     )
@@ -59,8 +63,9 @@ def index_text(data, model, conn):
         t2 = time.time()
         cursor.executemany(
             "insert into metadata(id, content, path) values (?, ?, ?)",
-            [(ids[i], data["content"][i], data["path"][i]) for i in range(len(ids))],
+            [(ids[i], contents[i], paths[i]) for i in range(len(ids))],
         )
+        del contents, paths  # Free after insert
         t3 = time.time()
         print(f"Metadata insert: {t3 - t2:.2f}s")
 
@@ -85,22 +90,40 @@ def index_text(data, model, conn):
         print(e)
         raise
     finally:
-        # Free image memory
-        del data, embs
+        del embs, ids
         gc.collect()
 
 
 def index_image(data, model, processor, conn):
-    imgs = []
     t0 = time.time()
-    for i in data["content"]:
-        im = Image.open(BytesIO(base64.b64decode(i)))
-        im_proc = processor(im.convert("RGB"))
-        imgs.append(im_proc)
-
-    im_procs = torch.stack(imgs)
-    with torch.no_grad():
-        embs = model.encode_image(im_procs).numpy()
+    batch_size = 20  # Process in smaller batches to reduce peak memory
+    all_embs = []
+    paths = data["path"]
+    contents = data["content"]
+    del data  # Free input data early
+    
+    for batch_start in range(0, len(contents), batch_size):
+        batch_end = min(batch_start + batch_size, len(contents))
+        imgs = []
+        for i in range(batch_start, batch_end):
+            raw = base64.b64decode(contents[i])
+            contents[i] = None  # Free decoded content immediately
+            im = Image.open(BytesIO(raw))
+            del raw
+            im_proc = processor(im.convert("RGB"))
+            im.close()
+            imgs.append(im_proc)
+        
+        im_procs = torch.stack(imgs)
+        del imgs
+        with torch.no_grad():
+            batch_embs = model.encode_image(im_procs).numpy()
+        del im_procs
+        all_embs.append(batch_embs)
+    
+    del contents
+    embs = all_embs[0] if len(all_embs) == 1 else __import__('numpy').vstack(all_embs)
+    del all_embs
     t1 = time.time()
     print(f"Encode {len(embs)} images: {t1 - t0:.2f}s")
 
@@ -112,8 +135,9 @@ def index_image(data, model, processor, conn):
         t2 = time.time()
         cursor.executemany(
             "insert into metadata(id, content, path) values (?, ?, ?)",
-            [(ids[i], "", data["path"][i]) for i in range(len(ids))],
+            [(ids[i], "", paths[i]) for i in range(len(ids))],
         )
+        del paths
         t3 = time.time()
         print(f"Metadata insert: {t3 - t2:.2f}s")
 
@@ -138,8 +162,7 @@ def index_image(data, model, processor, conn):
         print(e)
         raise
     finally:
-        # Free image memory
-        del imgs, im_procs, embs, data
+        del embs, ids
         gc.collect()
 
 
@@ -489,6 +512,7 @@ def server_main():
                 buf += data
             print(len(buf))
             data = json.loads(buf.decode())  # type: ignore
+            del buf  # Free buffer after parsing
             if data["task"] == "text":
                 index_text(data["data"], text_model, conn)
                 some_data = "done"

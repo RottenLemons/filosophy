@@ -4,15 +4,17 @@ go 1.25.5
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/rahulpoonia29/extractous-go v0.3.0
+	github.com/cshum/vipsgen v1.3.1
+	github.com/kreuzberg-dev/kreuzberg/packages/go/v4 v4.1.1
 	github.com/tmc/langchaingo v0.1.14
 )
 
 require (
-	github.com/cshum/vipsgen v1.3.1 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/kardianos/service v1.2.4 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.8 // indirect
+	github.com/syncthing/notify v0.0.0-20250528144937-c7027d4f7465 // indirect
 	gitlab.com/golang-commonmark/html v0.0.0-20191124015941-a22733972181 // indirect
 	gitlab.com/golang-commonmark/linkify v0.0.0-20200225224916-64bca66f6ad3 // indirect
 	gitlab.com/golang-commonmark/markdown v0.0.0-20211110145824-bf3e522c626a // indirect
