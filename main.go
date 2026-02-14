@@ -2,9 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/base64"
-	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -13,10 +10,8 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
-	vips "github.com/cshum/vipsgen/vips817"
-	kreuzberg "github.com/kreuzberg-dev/kreuzberg/packages/go/v4"
 
-	"github.com/tmc/langchaingo/textsplitter"
+	"filosophy/shared"
 )
 
 var parentDir string = "C:/Users/Mahir/Downloads/test/"
@@ -43,97 +38,21 @@ func send(data interface{}, task string) string {
 	return string(chunk)
 }
 
-type metadata struct {
-	content, path string
-}
-
-type dataType struct {
-	data []byte
-	mode string
-}
-
-var imageExtensions = map[string]struct{}{
-	".jpg":  {},
-	".jpeg": {},
-	".png":  {},
-	".gif":  {},
-	".bmp":  {},
-	".tiff": {},
-	".tif":  {},
-	// ".webp": {}, Not supported for now
-	".heic": {},
-	".heif": {},
-	// ".svg":  {}, Not supported for now
-	".ico":   {},
-	".avif":  {},
-	".jfif":  {},
-	".pjpeg": {},
-	".pjp":   {},
-}
-
-func IsImageFile(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	_, ok := imageExtensions[ext]
-	return ok
-}
-
-func handleChunk(chunks chan metadata, sendQueue chan dataType, mode, content, path string) {
-	select {
-	case chunks <- metadata{content, path}:
-	default:
-		dataMap := make(map[string][]string)
-
-		for j := 0; j < cap(chunks); j++ {
-			select {
-			case tmp := <-chunks:
-				dataMap["content"] = append(dataMap["content"], tmp.content)
-				dataMap["path"] = append(dataMap["path"], tmp.path)
-			default:
-			}
-		}
-		chunks <- metadata{content, path}
-		if len(dataMap["content"]) > 0 {
-			data, _ := json.Marshal(dataMap)
-			sendQueue <- dataType{data, mode}
-		}
-	}
-}
-
-func drainRemain(chunks chan metadata, mode string, sendQueue chan dataType) {
-	fmt.Print(len(chunks))
-	if len(chunks) > 0 {
-		dataMap := make(map[string][]string)
-		for len(chunks) > 0 {
-			tmp := <-chunks
-			dataMap["content"] = append(dataMap["content"], tmp.content)
-			dataMap["path"] = append(dataMap["path"], tmp.path)
-		}
-		data, _ := json.Marshal(dataMap)
-		sendQueue <- dataType{data, mode}
-	}
-}
-
 func main() {
-	index := flag.Bool("index", false, "index files for search")
-	flag.Parse()
-	if *index {
+	index := len(os.Args) > 1 && os.Args[1] == "--index"
+	if index {
 		start := time.Now()
-		splitter := textsplitter.NewRecursiveCharacter(func(o *textsplitter.Options) {
-			o.ChunkSize = 8096
-		})
-		chunks := make(chan metadata, 1000)
-		images := make(chan metadata, 100)
-		sendQueue := make(chan dataType, 10) // Queue for data to send
+		cfg := shared.NewProcessorConfig(8096, 1000, 100, 10)
 		sendDone := make(chan struct{})
 
 		// Semaphore to limit concurrent CGO calls (extractous and vips are not thread-safe)
-		maxConcurrency := 10 // Limit concurrent workers
+		maxConcurrency := 10
 		sem := make(chan struct{}, maxConcurrency)
 
 		// Dedicated sender goroutine - ensures sequential sends
 		go func() {
-			for data := range sendQueue {
-				send(data.data, data.mode)
+			for data := range cfg.SendQueue {
+				send(data.Data, data.Mode)
 			}
 			sendDone <- struct{}{}
 		}()
@@ -144,7 +63,7 @@ func main() {
 			}
 
 			if info.IsDir() {
-				handleChunk(chunks, sendQueue, "text", "", path)
+				shared.ProcessDirectory(path, cfg)
 				return nil
 			}
 
@@ -153,50 +72,7 @@ func main() {
 
 			go func(path string) {
 				defer func() { <-sem }()
-
-				if IsImageFile(path) {
-					im_bytes, err := os.ReadFile(path)
-					if err != nil {
-						log.Println("Failed to read image:", err)
-						return
-					}
-					vImg, err := vips.NewThumbnailBuffer(im_bytes, 256, &vips.ThumbnailBufferOptions{
-						Height: 256,
-						FailOn: vips.FailOnError, // Fail on first error
-					})
-					im_bytes = nil // Free original image bytes
-					if err != nil {
-						log.Println("Failed to load image:", err)
-						return
-					}
-					pngBytes, err := vImg.PngsaveBuffer(nil)
-					defer vImg.Close() // Close immediately after use
-					if err != nil {
-						log.Println("Failed to save image as buffer:", err)
-						return
-					}
-					im_string := base64.StdEncoding.EncodeToString(pngBytes)
-					pngBytes = nil // Free PNG bytes after encoding
-					handleChunk(images, sendQueue, "image", im_string, path)
-					return
-				}
-
-				result, err := kreuzberg.ExtractFileSync(path, nil)
-
-				if err != nil {
-					handleChunk(chunks, sendQueue, "text", "", path)
-					return
-				}
-
-				splits, err := splitter.SplitText(result.Content)
-
-				if err == nil {
-					for _, i := range splits {
-						handleChunk(chunks, sendQueue, "text", i, path)
-					}
-				} else {
-					fmt.Println(err)
-				}
+				shared.ProcessFile(path, cfg)
 			}(path)
 
 			return nil
@@ -207,9 +83,9 @@ func main() {
 			sem <- struct{}{}
 		}
 
-		drainRemain(chunks, "text", sendQueue)  // Last Text
-		drainRemain(images, "image", sendQueue) // Last image
-		close(sendQueue)
+		shared.DrainRemaining(cfg.Chunks, "text", cfg.SendQueue)
+		shared.DrainRemaining(cfg.Images, "image", cfg.SendQueue)
+		close(cfg.SendQueue)
 		<-sendDone
 		end := time.Now()
 		fmt.Println(end.Sub(start))
