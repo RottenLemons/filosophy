@@ -41,12 +41,76 @@ def generate_rowid():
     return rand  # rowid
 
 
+def upsert_files(file_paths, file_hashes, cursor):
+    """Insert or update file-level hashes from batch data."""
+    if file_paths and file_hashes:
+        cursor.executemany(
+            "INSERT INTO files(path, hash) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash",
+            list(zip(file_paths, file_hashes)),
+        )
+
+
+def delete_paths(data, conn):
+    """Delete all references (metadata, embeddings, files) for the given paths."""
+    paths = data["paths"]
+    cursor = conn.cursor()
+    cursor.execute("begin")
+    try:
+        for path in paths:
+            ids = [
+                row[0]
+                for row in cursor.execute(
+                    "SELECT id FROM metadata WHERE path = ?", (path,)
+                ).fetchall()
+            ]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                cursor.execute(
+                    f"DELETE FROM text_embs WHERE rowid IN ({placeholders})", ids
+                )
+                cursor.execute(
+                    f"DELETE FROM image_embs WHERE rowid IN ({placeholders})", ids
+                )
+                cursor.execute(
+                    f"DELETE FROM metadata WHERE id IN ({placeholders})", ids
+                )
+            cursor.execute("DELETE FROM files WHERE path = ?", (path,))
+        cursor.execute("commit")
+    except Exception as e:
+        cursor.execute("rollback")
+        print(e)
+        raise
+
+
+def rename_paths(data, conn):
+    """Rename file paths in metadata and files tables."""
+    old_paths = data["old_paths"]
+    new_paths = data["new_paths"]
+    cursor = conn.cursor()
+    cursor.execute("begin")
+    try:
+        for old_path, new_path in zip(old_paths, new_paths):
+            cursor.execute(
+                "UPDATE metadata SET path = ? WHERE path = ?", (new_path, old_path)
+            )
+            cursor.execute(
+                "UPDATE files SET path = ? WHERE path = ?", (new_path, old_path)
+            )
+        cursor.execute("commit")
+    except Exception as e:
+        cursor.execute("rollback")
+        print(e)
+        raise
+
+
 def index_text(data, model, conn):
     t0 = time.time()
     contents = data["content"]
     paths = data["path"]
+    file_paths = data.get("file_path")
+    file_hashes = data.get("file_hash")
     del data  # Free input data structure early
-    
+
     embs = model.encode(
         contents,
         convert_to_numpy=True,
@@ -58,6 +122,7 @@ def index_text(data, model, conn):
     cursor = conn.cursor()
     cursor.execute("begin")
     try:
+        upsert_files(file_paths, file_hashes, cursor)
         ids = [generate_rowid() for _ in range(len(embs))]
 
         t2 = time.time()
@@ -100,8 +165,10 @@ def index_image(data, model, processor, conn):
     all_embs = []
     paths = data["path"]
     contents = data["content"]
+    file_paths = data.get("file_path")
+    file_hashes = data.get("file_hash")
     del data  # Free input data early
-    
+
     for batch_start in range(0, len(contents), batch_size):
         batch_end = min(batch_start + batch_size, len(contents))
         imgs = []
@@ -113,16 +180,16 @@ def index_image(data, model, processor, conn):
             im_proc = processor(im.convert("RGB"))
             im.close()
             imgs.append(im_proc)
-        
+
         im_procs = torch.stack(imgs)
         del imgs
         with torch.no_grad():
             batch_embs = model.encode_image(im_procs).numpy()
         del im_procs
         all_embs.append(batch_embs)
-    
+
     del contents
-    embs = all_embs[0] if len(all_embs) == 1 else __import__('numpy').vstack(all_embs)
+    embs = all_embs[0] if len(all_embs) == 1 else __import__("numpy").vstack(all_embs)
     del all_embs
     t1 = time.time()
     print(f"Encode {len(embs)} images: {t1 - t0:.2f}s")
@@ -130,6 +197,7 @@ def index_image(data, model, processor, conn):
     cursor = conn.cursor()
     cursor.execute("begin")
     try:
+        upsert_files(file_paths, file_hashes, cursor)
         ids = [generate_rowid() for _ in range(len(embs))]
 
         t2 = time.time()
@@ -452,6 +520,15 @@ def server_main():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            hash INTEGER NOT NULL
+        )
+        """
+    )
+
     if not conn.table_exists("main", "search"):
         # create does all the hard work
         apsw.fts5.Table.create(
@@ -518,6 +595,12 @@ def server_main():
                 some_data = "done"
             elif data["task"] == "image":
                 index_image(data["data"], vision_model, preprocess, conn)
+                some_data = "done"
+            elif data["task"] == "delete":
+                delete_paths(data["data"], conn)
+                some_data = "done"
+            elif data["task"] == "rename":
+                rename_paths(data["data"], conn)
                 some_data = "done"
             else:
                 some_data = str(

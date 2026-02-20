@@ -9,34 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Microsoft/go-winio"
-
 	"filosophy/shared"
 )
 
 var parentDir string = "C:/Users/Mahir/Downloads/test/"
-
-func send(data interface{}, task string) string {
-	fmt.Println("enter" + task)
-	pipePath := `\\.\pipe\test`
-	f, err := winio.DialPipe(pipePath, nil)
-	if err != nil {
-		log.Fatalf("error opening pipe: %v", err)
-	}
-	defer f.Close()
-	msg := fmt.Sprintf(`{"task": %q,"data": %s}`, task, data)
-	_, err = f.Write([]byte(msg))
-	if err != nil {
-		log.Fatalf("write error: %v", err)
-
-	}
-	chunk := make([]byte, 1024)
-	_, err = f.Read(chunk)
-	if err != nil {
-		log.Fatalf("write error: %v", err)
-	}
-	return string(chunk)
-}
 
 func main() {
 	index := len(os.Args) > 1 && os.Args[1] == "--index"
@@ -52,7 +28,9 @@ func main() {
 		// Dedicated sender goroutine - ensures sequential sends
 		go func() {
 			for data := range cfg.SendQueue {
-				send(data.Data, data.Mode)
+				if _, err := shared.Send(data.Data, data.Mode); err != nil {
+					log.Fatal(err)
+				}
 			}
 			sendDone <- struct{}{}
 		}()
@@ -99,6 +77,10 @@ func main() {
 			return
 		}
 		query = strings.TrimSpace(query)
-		fmt.Println(send(fmt.Sprintf("\"%s\"", query), "search"))
+		resp, err := shared.Send(fmt.Sprintf("\"%s\"", query), "search")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(resp)
 	}
 }
