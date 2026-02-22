@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"filosophy/shared"
 
@@ -220,7 +221,9 @@ func (t *tracker) drain() map[string]*fileChanges {
 }
 
 func (p *program) flush() {
+	fmt.Println("[FLUSH] attempting lock...")
 	if !p.flushMu.TryLock() {
+		fmt.Println("[FLUSH] skipped — another flush in progress")
 		return // another flush is already in progress
 	}
 	defer p.flushMu.Unlock()
@@ -229,6 +232,7 @@ func (p *program) flush() {
 	changes := p.t.drain()
 	p.t.mu.Unlock()
 
+	fmt.Printf("[FLUSH] drained %d changed paths\n", len(changes))
 	if len(changes) == 0 {
 		return
 	}
@@ -263,8 +267,11 @@ func (p *program) flush() {
 		}
 	}
 
+	fmt.Printf("[FLUSH] deletes=%d, renames=%d, adds=%d\n", len(deletePaths), len(renamePairs), len(addPaths))
+
 	// 1. Delete all references for removed/modified files
 	if len(deletePaths) > 0 {
+		fmt.Println("[FLUSH] deleting:", deletePaths)
 		data, _ := json.Marshal(map[string]interface{}{"paths": deletePaths})
 		if _, err := shared.Send(data, "delete"); err != nil {
 			log.Println("flush delete error:", err)
@@ -279,6 +286,7 @@ func (p *program) flush() {
 
 	// 2. Rename paths in DB
 	if len(renamePairs) > 0 {
+		fmt.Println("[FLUSH] renaming:", renamePairs)
 		oldPaths := make([]string, len(renamePairs))
 		newPaths := make([]string, len(renamePairs))
 		for i, pair := range renamePairs {
@@ -296,10 +304,12 @@ func (p *program) flush() {
 
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
+		fmt.Println("[FLUSH] indexing:", addPaths)
 		cfg := shared.NewProcessorConfig(8096, 100, 50, 10)
 		sendDone := make(chan struct{})
 		go func() {
 			for d := range cfg.SendQueue {
+				fmt.Println(d.Data)
 				if _, err := shared.Send(d.Data, d.Mode); err != nil {
 					log.Println("flush index error:", err)
 				}
@@ -320,11 +330,17 @@ func (p *program) flush() {
 			}
 		}
 
+		for i := 0; i < len(cfg.Chunks); i++ {
+			j := <-cfg.Chunks
+			fmt.Println(j.Path)
+			cfg.Chunks <- j
+		}
 		shared.DrainRemaining(cfg.Chunks, "text", cfg.SendQueue)
 		shared.DrainRemaining(cfg.Images, "image", cfg.SendQueue)
 		close(cfg.SendQueue)
 		<-sendDone
 	}
+	fmt.Println("[FLUSH] done")
 }
 
 type program struct {
@@ -337,7 +353,7 @@ type program struct {
 
 func (p *program) Start(s service.Service) error {
 	var err error
-	p.baseDir, err = os.UserHomeDir()
+	p.baseDir, err = "C:/Users/Mahir/Downloads/test/", nil //os.UserHomeDir()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -353,11 +369,19 @@ func (p *program) Start(s service.Service) error {
 }
 
 func (p *program) run() {
+	// DB lives in the project root (parent of daemon/)
+	// Use Getwd instead of Executable — go run compiles to a temp dir
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatal("cannot get working directory:", err)
+	}
+	dbPath := filepath.Join(cwd, "..", "filosophy.db")
+
 	// Do work here
 	p.t = &tracker{
 		changes: make(map[string]*fileChanges),
 		hashes:  make(map[string]int64),
-		dbPath:  "filosophy.db",
+		dbPath:  dbPath,
 		prev:    sentinel{},
 	}
 	if err := notify.Watch(p.baseDir, p.structureChan, structureEventMask); err != nil {
@@ -463,6 +487,20 @@ func (p *program) run() {
 			}
 		}
 	}()
+	// Flush every 5 minutes regardless of action count
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	go func() {
+		for range ticker.C {
+			p.t.mu.Lock()
+			hasChanges := p.t.count > 0
+			p.t.mu.Unlock()
+			if hasChanges {
+				go p.flush()
+			}
+		}
+	}()
+
 	<-p.exit
 }
 func (p *program) Stop(s service.Service) error {

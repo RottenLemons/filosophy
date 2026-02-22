@@ -30,6 +30,23 @@ EPOCH = int(
 )
 
 
+def fts5_escape(query):
+    """Escape tokens for FTS5: quote only tokens with special chars,
+    add prefix matching (*) to plain alphanumeric tokens for broader recall."""
+    import re
+
+    tokens = query.split()
+    out = []
+    for t in tokens:
+        if re.search(r"[^a-zA-Z0-9]", t):
+            # Contains punctuation/special chars — quote it
+            out.append('"' + t.replace('"', '""') + '"')
+        else:
+            # Plain word — use prefix match for broader recall
+            out.append(t + "*")
+    return " ".join(out)
+
+
 def generate_rowid():
     # ts = int(time.time() * 1000) - EPOCH  # milliseconds since epoch
     # if ts < 0 or ts >= (1 << 30):
@@ -242,8 +259,9 @@ def search(query, tokenizer, model1, model2, conn):
     query_emb2 = model2.encode(query)
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 10,
         "rrf_k": 60,
         "weight_fts": 1.0,
@@ -342,8 +360,9 @@ def image_search(query, tokenizer, model, conn):
         query_emb = model.encode_text(tokenizer(query)).numpy()
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 10,
         "query_emb": query_emb.tobytes(),
     }
@@ -390,8 +409,9 @@ def text_search(query, model, conn):
     query_emb = model.encode(query)
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 15,
         "k2": 10,
         "rrf_k": 60,
@@ -489,7 +509,6 @@ def server_main():
     pragma_cursor.execute("PRAGMA temp_store=MEMORY;")
     pragma_cursor.execute("PRAGMA mmap_size=536870912;")
     pragma_cursor.execute("PRAGMA cache_size=-200000;")
-    pragma_cursor.execute("PRAGMA locking_mode=EXCLUSIVE;")
     cursor = conn.cursor()
     # check if vectorlite is loaded
     print(cursor.execute("select vectorlite_info()").fetchall())

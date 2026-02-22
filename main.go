@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -77,7 +78,11 @@ func main() {
 			return
 		}
 		query = strings.TrimSpace(query)
-		resp, err := shared.Send(fmt.Sprintf("\"%s\"", query), "search")
+		queryJSON, err := json.Marshal(query)
+		if err != nil {
+			log.Fatal(err)
+		}
+		resp, err := shared.Send(string(queryJSON), "search")
 		if err != nil {
 			log.Fatal(err)
 		}

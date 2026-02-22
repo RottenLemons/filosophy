@@ -1,0 +1,11 @@
+prefix=/usr/local/mxe/usr/x86_64-w64-mingw32.shared
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: harfbuzz-subset
+Description: HarfBuzz font subsetter
+Version: 12.2.0
+Requires: harfbuzz =  12.2.0
+Libs: -L${libdir} -lharfbuzz-subset
+Libs.private: -lm
+Cflags: -I${includedir}/harfbuzz

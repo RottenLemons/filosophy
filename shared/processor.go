@@ -6,15 +6,41 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/cespare/xxhash"
-	vips "github.com/cshum/vipsgen/vips817"
 	kreuzberg "github.com/kreuzberg-dev/kreuzberg/packages/go/v4"
 	"github.com/tmc/langchaingo/textsplitter"
 )
+
+// vipsThumbnailPath returns the path to the bundled vipsthumbnail.exe.
+// It first checks relative to the executable (for production), then falls
+// back to the working directory (for development / go run).
+func vipsThumbnailPath() string {
+	var rel = filepath.FromSlash("vips-dev-8.18/bin/vipsthumbnail.exe")
+
+	// Try relative to the executable first (production layout)
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), rel)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// Fall back to working directory (development / go run)
+	if wd, err := os.Getwd(); err == nil {
+		p := filepath.Join(wd, rel)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// Last resort: rely on PATH
+	return "vipsthumbnail"
+}
 
 // Send connects to the named pipe, writes {"task":…,"data":…}, and returns the response.
 func Send(data interface{}, task string) (string, error) {
@@ -62,6 +88,7 @@ var imageExtensions = map[string]struct{}{
 	".jfif":  {},
 	".pjpeg": {},
 	".pjp":   {},
+	".svg":   {},
 }
 
 var empty int64 = int64(xxhash.Sum64String(""))
@@ -142,7 +169,8 @@ type ProcessorConfig struct {
 	SendQueue chan DataType
 }
 
-// ProcessImage processes an image file and adds it to the images channel
+// ProcessImage processes an image file using the bundled vipsthumbnail CLI
+// and adds the base64-encoded PNG to the images channel.
 func ProcessImage(path string, cfg *ProcessorConfig) {
 	imBytes, err := os.ReadFile(path)
 	if err != nil {
@@ -150,30 +178,38 @@ func ProcessImage(path string, cfg *ProcessorConfig) {
 		return
 	}
 	hash := int64(xxhash.Sum64(imBytes))
-	vImg, err := vips.NewThumbnailBuffer(imBytes, 256, &vips.ThumbnailBufferOptions{
-		Height: 256,
-		FailOn: vips.FailOnError,
-	})
-	imBytes = nil // Free original image bytes
+	imBytes = nil // Only needed for hashing
+
+	tmpFile, err := os.CreateTemp("", "vips-*.png")
 	if err != nil {
-		log.Println("Failed to load image:", err)
+		log.Println("Failed to create temp file:", err)
 		return
 	}
-	pngBytes, err := vImg.PngsaveBuffer(nil)
-	defer vImg.Close()
-	if err != nil {
-		log.Println("Failed to save image as buffer:", err)
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	// vipsthumbnail resizes to fit within 256x256, auto-detects input format
+	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256", "-o", tmpPath+"[strip]")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("vipsthumbnail failed for %s: %v\n%s", path, err, string(output))
 		return
 	}
+
+	pngBytes, err := os.ReadFile(tmpPath)
+	if err != nil {
+		log.Println("Failed to read vips output:", err)
+		return
+	}
+
 	imString := base64.StdEncoding.EncodeToString(pngBytes)
-	pngBytes = nil // Free PNG bytes after encoding
 	HandleChunk(cfg.Images, cfg.SendQueue, "image", imString, path, hash)
 }
 
 // ProcessText extracts text from a file and adds chunks to the channel
 func ProcessText(path string, cfg *ProcessorConfig) {
 	result, err := kreuzberg.ExtractFileSync(path, nil)
-	if err != nil {
+	if err != nil || result.Content == "" {
 		HandleChunk(cfg.Chunks, cfg.SendQueue, "text", "", path, empty)
 		return
 	}
