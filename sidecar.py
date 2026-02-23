@@ -8,6 +8,7 @@
 # This code is in the public domain.
 import argparse
 import base64
+import gc
 import json
 import random
 import time
@@ -24,26 +25,26 @@ import win32pipe
 from PIL import Image
 from sentence_transformers import SentenceTransformer
 
-# def img_to_numpy(imgdata):
-#     """Translates an image (as received from the client) into a numpy array.
-
-#     The received image is an array of 3072 bytes (32x32x3), where each byte
-#     represents the intensity of a single color channel at a single pixel.
-#     The array is in row-major order, with the red channel first, then green,
-#     then blue.
-
-#     The resulting Numpy array has shape (32, 32, 3) and dtype float64, in
-#     a format expected by the model.
-#     """
-#     red = np.frombuffer(imgdata[:1024], dtype=np.uint8).reshape((32, 32))
-#     green = np.frombuffer(imgdata[1024:2048], dtype=np.uint8).reshape((32, 32))
-#     blue = np.frombuffer(imgdata[2048:], dtype=np.uint8).reshape((32, 32))
-#     uints = np.stack([red, green, blue], axis=-1)
-#     return uints.astype(np.float64) / 255.0
-
 EPOCH = int(
     time.mktime(time.strptime("2026-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")) * 1000
 )
+
+
+def fts5_escape(query):
+    """Escape tokens for FTS5: quote only tokens with special chars,
+    add prefix matching (*) to plain alphanumeric tokens for broader recall."""
+    import re
+
+    tokens = query.split()
+    out = []
+    for t in tokens:
+        if re.search(r"[^a-zA-Z0-9]", t):
+            # Contains punctuation/special chars — quote it
+            out.append('"' + t.replace('"', '""') + '"')
+        else:
+            # Plain word — use prefix match for broader recall
+            out.append(t + "*")
+    return " ".join(out)
 
 
 def generate_rowid():
@@ -57,10 +58,78 @@ def generate_rowid():
     return rand  # rowid
 
 
+def upsert_files(file_paths, file_hashes, cursor):
+    """Insert or update file-level hashes from batch data."""
+    if file_paths and file_hashes:
+        cursor.executemany(
+            "INSERT INTO files(path, hash) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash",
+            list(zip(file_paths, file_hashes)),
+        )
+
+
+def delete_paths(data, conn):
+    """Delete all references (metadata, embeddings, files) for the given paths."""
+    paths = data["paths"]
+    cursor = conn.cursor()
+    cursor.execute("begin")
+    try:
+        for path in paths:
+            ids = [
+                row[0]
+                for row in cursor.execute(
+                    "SELECT id FROM metadata WHERE path = ?", (path,)
+                ).fetchall()
+            ]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                cursor.execute(
+                    f"DELETE FROM text_embs WHERE rowid IN ({placeholders})", ids
+                )
+                cursor.execute(
+                    f"DELETE FROM image_embs WHERE rowid IN ({placeholders})", ids
+                )
+                cursor.execute(
+                    f"DELETE FROM metadata WHERE id IN ({placeholders})", ids
+                )
+            cursor.execute("DELETE FROM files WHERE path = ?", (path,))
+        cursor.execute("commit")
+    except Exception as e:
+        cursor.execute("rollback")
+        print(e)
+        raise
+
+
+def rename_paths(data, conn):
+    """Rename file paths in metadata and files tables."""
+    old_paths = data["old_paths"]
+    new_paths = data["new_paths"]
+    cursor = conn.cursor()
+    cursor.execute("begin")
+    try:
+        for old_path, new_path in zip(old_paths, new_paths):
+            cursor.execute(
+                "UPDATE metadata SET path = ? WHERE path = ?", (new_path, old_path)
+            )
+            cursor.execute(
+                "UPDATE files SET path = ? WHERE path = ?", (new_path, old_path)
+            )
+        cursor.execute("commit")
+    except Exception as e:
+        cursor.execute("rollback")
+        print(e)
+        raise
+
+
 def index_text(data, model, conn):
     t0 = time.time()
+    contents = data["content"]
+    paths = data["path"]
+    file_paths = data.get("file_path")
+    file_hashes = data.get("file_hash")
+    del data  # Free input data structure early
+
     embs = model.encode(
-        data["content"],
+        contents,
         convert_to_numpy=True,
         # normalize_embeddings=True,
     )
@@ -70,13 +139,15 @@ def index_text(data, model, conn):
     cursor = conn.cursor()
     cursor.execute("begin")
     try:
+        upsert_files(file_paths, file_hashes, cursor)
         ids = [generate_rowid() for _ in range(len(embs))]
 
         t2 = time.time()
         cursor.executemany(
             "insert into metadata(id, content, path) values (?, ?, ?)",
-            [(ids[i], data["content"][i], data["path"][i]) for i in range(len(ids))],
+            [(ids[i], contents[i], paths[i]) for i in range(len(ids))],
         )
+        del contents, paths  # Free after insert
         t3 = time.time()
         print(f"Metadata insert: {t3 - t2:.2f}s")
 
@@ -100,32 +171,58 @@ def index_text(data, model, conn):
         cursor.execute("rollback")
         print(e)
         raise
+    finally:
+        del embs, ids
+        gc.collect()
 
 
 def index_image(data, model, processor, conn):
-    imgs = []
     t0 = time.time()
-    for i in data["content"]:
-        im = Image.open(BytesIO(base64.b64decode(i)))
-        im_proc = processor(im.convert("RGB"))
-        imgs.append(im_proc)
+    batch_size = 20  # Process in smaller batches to reduce peak memory
+    all_embs = []
+    paths = data["path"]
+    contents = data["content"]
+    file_paths = data.get("file_path")
+    file_hashes = data.get("file_hash")
+    del data  # Free input data early
 
-    im_procs = torch.stack(imgs)
-    with torch.no_grad():
-        embs = model.encode_image(im_procs).numpy()
+    for batch_start in range(0, len(contents), batch_size):
+        batch_end = min(batch_start + batch_size, len(contents))
+        imgs = []
+        for i in range(batch_start, batch_end):
+            raw = base64.b64decode(contents[i])
+            contents[i] = None  # Free decoded content immediately
+            im = Image.open(BytesIO(raw))
+            del raw
+            im_proc = processor(im.convert("RGB"))
+            im.close()
+            imgs.append(im_proc)
+
+        im_procs = torch.stack(imgs)
+        del imgs
+        with torch.no_grad():
+            batch_embs = model.encode_image(im_procs).numpy()
+        del im_procs
+        all_embs.append(batch_embs)
+
+    del contents
+    embs = all_embs[0] if len(all_embs) == 1 else __import__("numpy").vstack(all_embs)
+    del all_embs
     t1 = time.time()
     print(f"Encode {len(embs)} images: {t1 - t0:.2f}s")
 
     cursor = conn.cursor()
     cursor.execute("begin")
     try:
+        upsert_files(file_paths, file_hashes, cursor)
         ids = [generate_rowid() for _ in range(len(embs))]
 
         t2 = time.time()
         cursor.executemany(
             "insert into metadata(id, content, path) values (?, ?, ?)",
-            [(ids[i], "", data["path"][i]) for i in range(len(ids))],
+            [(ids[i], "", paths[i]) for i in range(len(ids))],
         )
+        del paths
         t3 = time.time()
         print(f"Metadata insert: {t3 - t2:.2f}s")
 
@@ -149,6 +246,9 @@ def index_image(data, model, processor, conn):
         cursor.execute("rollback")
         print(e)
         raise
+    finally:
+        del embs, ids
+        gc.collect()
 
 
 def search(query, tokenizer, model1, model2, conn):
@@ -159,8 +259,9 @@ def search(query, tokenizer, model1, model2, conn):
     query_emb2 = model2.encode(query)
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 10,
         "rrf_k": 60,
         "weight_fts": 1.0,
@@ -259,8 +360,9 @@ def image_search(query, tokenizer, model, conn):
         query_emb = model.encode_text(tokenizer(query)).numpy()
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 10,
         "query_emb": query_emb.tobytes(),
     }
@@ -307,8 +409,9 @@ def text_search(query, model, conn):
     query_emb = model.encode(query)
     t1 = time.time()
     print(f"Search encode: {t1 - t0:.2f}s")
+    fts_query = fts5_escape(query)
     params = {
-        "query": query,
+        "query": fts_query,
         "k": 15,
         "k2": 10,
         "rrf_k": 60,
@@ -406,7 +509,6 @@ def server_main():
     pragma_cursor.execute("PRAGMA temp_store=MEMORY;")
     pragma_cursor.execute("PRAGMA mmap_size=536870912;")
     pragma_cursor.execute("PRAGMA cache_size=-200000;")
-    pragma_cursor.execute("PRAGMA locking_mode=EXCLUSIVE;")
     cursor = conn.cursor()
     # check if vectorlite is loaded
     print(cursor.execute("select vectorlite_info()").fetchall())
@@ -433,6 +535,15 @@ def server_main():
             id INTEGER PRIMARY KEY,
             content TEXT,
             path TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            hash INTEGER NOT NULL
         )
         """
     )
@@ -497,11 +608,18 @@ def server_main():
                 buf += data
             print(len(buf))
             data = json.loads(buf.decode())  # type: ignore
+            del buf  # Free buffer after parsing
             if data["task"] == "text":
                 index_text(data["data"], text_model, conn)
                 some_data = "done"
             elif data["task"] == "image":
                 index_image(data["data"], vision_model, preprocess, conn)
+                some_data = "done"
+            elif data["task"] == "delete":
+                delete_paths(data["data"], conn)
+                some_data = "done"
+            elif data["task"] == "rename":
+                rename_paths(data["data"], conn)
                 some_data = "done"
             else:
                 some_data = str(
