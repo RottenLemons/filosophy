@@ -1,6 +1,25 @@
+# Python dependencies for Filosophy sidecar
+
+# Core machine learning
+torch
+sentence-transformers
+
+# Image model and processing
+git+https://github.com/apple/ml-mobileclip.git
+Pillow
+
+# Database and vector search
 vectorlite-py
 apsw
-numpy
-sentence_transformers
-git+https://github.com/apple/ml-mobileclip.git
+
+# Windows IPC (required on Windows only)
 pywin32
+
+# Utilities
+numpy
+````
+````
+
+LICENSE
+````plaintext
+<<<<<<< SEARCH

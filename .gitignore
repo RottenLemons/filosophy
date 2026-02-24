@@ -1,4 +1,7 @@
+# Database and index files
 *.db
+filosophy.db
+*.bin
 image.onnx
 text.onnx
 image_old/**
@@ -6,7 +9,63 @@ text_old/**
 image/**
 text/**
 native/**
-test.ipynb
-*.bin
 kreuzberg-ffi/**
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+frontend/dist/
+frontend/.svelte-kit/
+
+# Go
+go.sum          # (optional, but you may wish to keep it in version control)
+vendor/
+*.exe
+*.dll
+*.so
+*.dylib
+filosophy       # binary name
+
+# Wails
+build/bin/
+wailsjs/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter notebooks
+test.ipynb
+.ipynb_checkpoints/
+
+# Miscellaneous
 .aider*
