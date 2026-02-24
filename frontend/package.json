@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@sveltejs/adapter-auto": "latest",
+    "@sveltejs/adapter-static": "latest",
     "@sveltejs/kit": "latest",
     "carbon-components-svelte": "latest",
     "carbon-icons-svelte": "latest",
