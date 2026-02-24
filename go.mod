@@ -10,6 +10,7 @@ require (
 	github.com/syncthing/notify v0.0.0-20250528144937-c7027d4f7465
 	github.com/tmc/langchaingo v0.1.14
 	zombiezen.com/go/sqlite v1.4.2
+	github.com/wailsapp/wails/v2 v2.11.0
 )
 
 require (
