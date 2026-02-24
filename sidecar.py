@@ -4,8 +4,8 @@
 # Has to be run from inside a virtualenv created following the README
 # instructions.
 #
-# Adated from Eli Bendersky [https://eli.thegreenplace.net]
-# This code is in the public domain.
+# Adapted from Eli Bendersky [https://eli.thegreenplace.net]
+# Copyright (C) 2025 Filosophy
 import argparse
 import base64
 import gc

@@ -1,4 +1,4 @@
-// This code is written by Mahir Shah
+// Copyright (C) 2025 Filosophy
 
 package main
 
@@ -117,7 +117,7 @@ func main() {
 
 	// Application options
 	err := wails.Run(&options.App{
-		Title:  "filosophy",
+		Title:  "Filosophy",
 		Width:  1024,
 		Height: 768,
 		AssetServer: &assetserver.Options{

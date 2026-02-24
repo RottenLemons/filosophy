@@ -1,0 +1,24 @@
+{
+  "$schema": "https://wails.io/schemas/config/v2.json",
+  "name": "Filosophy",
+  "outputfilename": "filosophy",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://localhost:34115",
+  "author": {
+    "name": "Mahir Shah",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Filosophy",
+    "productName": "Filosophy",
+    "productVersion": "1.0.0",
+    "comments": "AI-Powered Local File Search"
+  },
+  "frontend:dir": "./frontend",
+  "build:dir": "./frontend/build",
+  "wailsjsdir": "./frontend/src/lib",
+  "appargs": "",
+  "nsisType": "multiple"
+}
