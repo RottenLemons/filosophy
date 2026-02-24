@@ -1,8 +1,7 @@
-package main
+package daemon
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,13 +13,10 @@ import (
 	"filosophy/shared"
 
 	"github.com/cespare/xxhash"
-	"github.com/kardianos/service"
 	"github.com/syncthing/notify"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
-
-var logger service.Logger
 
 const (
 	// Track file/folder creation, deletion, and rename
@@ -220,17 +216,32 @@ func (t *tracker) drain() map[string]*fileChanges {
 	return result
 }
 
-func (p *program) flush() {
+type Daemon struct {
+	t                          *tracker
+	flushMu                    sync.Mutex
+	exit                       chan struct{}
+	structureChan, contentChan chan notify.EventInfo
+	baseDir                    string
+}
+
+func NewDaemon(baseDir string) *Daemon {
+	return &Daemon{
+		baseDir: baseDir,
+		exit:    make(chan struct{}),
+	}
+}
+
+func (d *Daemon) flush() {
 	fmt.Println("[FLUSH] attempting lock...")
-	if !p.flushMu.TryLock() {
+	if !d.flushMu.TryLock() {
 		fmt.Println("[FLUSH] skipped — another flush in progress")
 		return // another flush is already in progress
 	}
-	defer p.flushMu.Unlock()
+	defer d.flushMu.Unlock()
 
-	p.t.mu.Lock()
-	changes := p.t.drain()
-	p.t.mu.Unlock()
+	d.t.mu.Lock()
+	changes := d.t.drain()
+	d.t.mu.Unlock()
 
 	fmt.Printf("[FLUSH] drained %d changed paths\n", len(changes))
 	if len(changes) == 0 {
@@ -277,11 +288,11 @@ func (p *program) flush() {
 			log.Println("flush delete error:", err)
 		}
 		// Clear cached hashes so big-file handler won't re-trigger
-		p.t.mu.Lock()
+		d.t.mu.Lock()
 		for _, path := range deletePaths {
-			delete(p.t.hashes, path)
+			delete(d.t.hashes, path)
 		}
-		p.t.mu.Unlock()
+		d.t.mu.Unlock()
 	}
 
 	// 2. Rename paths in DB
@@ -343,32 +354,18 @@ func (p *program) flush() {
 	fmt.Println("[FLUSH] done")
 }
 
-type program struct {
-	t                          *tracker
-	flushMu                    sync.Mutex
-	exit                       chan struct{}
-	structureChan, contentChan chan notify.EventInfo
-	baseDir                    string
-}
-
-func (p *program) Start(s service.Service) error {
-	var err error
-	p.baseDir, err = "C:/Users/Mahir/Downloads/test/", nil //os.UserHomeDir()
-	if err != nil {
-		log.Fatal(err)
-	}
-	p.exit = make(chan struct{})
+func (d *Daemon) Start() error {
 	// Channel for structure changes (create, delete, rename) - ALL files
-	p.structureChan = make(chan notify.EventInfo, 500)
+	d.structureChan = make(chan notify.EventInfo, 500)
 	// Channel for content changes - filtered files only
-	p.contentChan = make(chan notify.EventInfo, 500)
+	d.contentChan = make(chan notify.EventInfo, 500)
 
 	// Start should not block. Do the actual work async.
-	go p.run()
+	go d.run()
 	return nil
 }
 
-func (p *program) run() {
+func (d *Daemon) run() {
 	// DB lives in the project root (parent of daemon/)
 	// Use Getwd instead of Executable — go run compiles to a temp dir
 	cwd, err := os.Getwd()
@@ -378,18 +375,18 @@ func (p *program) run() {
 	dbPath := filepath.Join(cwd, "..", "filosophy.db")
 
 	// Do work here
-	p.t = &tracker{
+	d.t = &tracker{
 		changes: make(map[string]*fileChanges),
 		hashes:  make(map[string]int64),
 		dbPath:  dbPath,
 		prev:    sentinel{},
 	}
-	if err := notify.Watch(p.baseDir, p.structureChan, structureEventMask); err != nil {
+	if err := notify.Watch(d.baseDir, d.structureChan, structureEventMask); err != nil {
 		fmt.Println("Error watching structure:", err)
 		return
 	}
-	defer notify.Stop(p.structureChan)
-	entries, err := os.ReadDir(p.baseDir)
+	defer notify.Stop(d.structureChan)
+	entries, err := os.ReadDir(d.baseDir)
 	if err != nil {
 		fmt.Println("Error reading base directory:", err)
 		return
@@ -405,12 +402,12 @@ func (p *program) run() {
 		}
 
 		// Set up recursive watch for this folder
-		watchPath := filepath.Join(p.baseDir, name, "...")
-		if err := notify.Watch(watchPath, p.contentChan, contentEventMask); err != nil {
+		watchPath := filepath.Join(d.baseDir, name, "...")
+		if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
 			fmt.Println("Error watching content for", name, ":", err)
 			continue
 		}
-		if err := notify.Watch(watchPath, p.structureChan, structureEventMask); err != nil {
+		if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
 			fmt.Println("Error watching structure for", name, ":", err)
 			continue
 		}
@@ -418,34 +415,34 @@ func (p *program) run() {
 	}
 
 	// Also watch the base directory itself (non-recursive) for content changes
-	if err := notify.Watch(p.baseDir, p.contentChan, contentEventMask); err != nil {
+	if err := notify.Watch(d.baseDir, d.contentChan, contentEventMask); err != nil {
 		fmt.Println("Error watching base directory content:", err)
 	} else {
-		fmt.Println("Watching base:", p.baseDir)
+		fmt.Println("Watching base:", d.baseDir)
 	}
-	defer notify.Stop(p.contentChan)
+	defer notify.Stop(d.contentChan)
 
 	// Goroutine for structure changes (create, delete, rename) - no filtering
 	go func() {
-		for ei := range p.structureChan {
-			p.t.mu.Lock()
-			p.t.record(ei)
-			shouldFlush := p.t.count >= 50
-			p.t.mu.Unlock()
+		for ei := range d.structureChan {
+			d.t.mu.Lock()
+			d.t.record(ei)
+			shouldFlush := d.t.count >= 50
+			d.t.mu.Unlock()
 
 			fmt.Println("[STRUCTURE]", ei.Event(), ei.Path(), ei.Sys())
 
 			// Auto-watch new top-level folders in the user's home directory
 			if (ei.Event() == notify.FileActionAdded || ei.Event() == notify.FileActionRenamedNewName) &&
-				filepath.Dir(ei.Path()) == p.baseDir {
+				filepath.Dir(ei.Path()) == d.baseDir {
 				name := filepath.Base(ei.Path())
 				if !shouldFilterFolder(name) {
 					if info, err := os.Stat(ei.Path()); err == nil && info.IsDir() {
-						watchPath := filepath.Join(p.baseDir, name, "...")
-						if err := notify.Watch(watchPath, p.contentChan, contentEventMask); err != nil {
+						watchPath := filepath.Join(d.baseDir, name, "...")
+						if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
 							fmt.Println("Error watching content for new folder", name, ":", err)
 						}
-						if err := notify.Watch(watchPath, p.structureChan, structureEventMask); err != nil {
+						if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
 							fmt.Println("Error watching structure for new folder", name, ":", err)
 						} else {
 							fmt.Println("Now watching new folder:", watchPath)
@@ -455,35 +452,35 @@ func (p *program) run() {
 			}
 
 			if shouldFlush {
-				go p.flush()
+				go d.flush()
 			}
 		}
 	}()
 
 	// Goroutine for content changes - already filtered by folder selection
 	go func() {
-		for ei := range p.contentChan {
+		for ei := range d.contentChan {
 			if shouldFilterPath(ei.Path()) {
 				continue
 			}
-			p.t.mu.Lock()
+			d.t.mu.Lock()
 			if isFileTooLarge(ei.Path()) {
 				// Too large — only mark modified if previously content-indexed
-				if h, _ := p.t.getHash(ei.Path()); h != 0 {
-					p.t.getOrCreate(ei.Path()).modified = true
-					p.t.count++
+				if h, _ := d.t.getHash(ei.Path()); h != 0 {
+					d.t.getOrCreate(ei.Path()).modified = true
+					d.t.count++
 				}
-				p.t.prev = ei
+				d.t.prev = ei
 			} else {
-				p.t.record(ei)
+				d.t.record(ei)
 			}
-			shouldFlush := p.t.count >= 50
-			p.t.mu.Unlock()
+			shouldFlush := d.t.count >= 50
+			d.t.mu.Unlock()
 
 			fmt.Println("[CONTENT]", ei.Event(), ei.Path(), ei.Sys())
 
 			if shouldFlush {
-				go p.flush()
+				go d.flush()
 			}
 		}
 	}()
@@ -492,73 +489,29 @@ func (p *program) run() {
 	defer ticker.Stop()
 	go func() {
 		for range ticker.C {
-			p.t.mu.Lock()
-			hasChanges := p.t.count > 0
-			p.t.mu.Unlock()
+			d.t.mu.Lock()
+			hasChanges := d.t.count > 0
+			d.t.mu.Unlock()
 			if hasChanges {
-				go p.flush()
+				go d.flush()
 			}
 		}
 	}()
 
-	<-p.exit
+	<-d.exit
 }
-func (p *program) Stop(s service.Service) error {
+
+func (d *Daemon) Stop() error {
 	// Stop should not block. Return with a few seconds.
-	fmt.Println(p.t.changes)
-	close(p.exit)
-	close(p.structureChan)
-	close(p.contentChan)
+	if d.t != nil {
+		fmt.Println(d.t.changes)
+	}
+	close(d.exit)
+	if d.structureChan != nil {
+		close(d.structureChan)
+	}
+	if d.contentChan != nil {
+		close(d.contentChan)
+	}
 	return nil
 }
-
-func main() {
-	svcFlag := flag.String("service", "", "Control the system service.")
-	flag.Parse()
-	options := make(service.KeyValue)
-	options["Restart"] = "on-success"
-	options["SuccessExitStatus"] = "1 2 8 SIGKILL"
-	svcConfig := &service.Config{
-		Name:        "GoServiceTest",
-		DisplayName: "Go Service Test",
-		Description: "This is a test Go service.",
-		Option:      options,
-	}
-
-	prg := &program{}
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		fmt.Println(err)
-	}
-	errs := make(chan error, 5)
-	logger, err = s.Logger(errs)
-	if err != nil {
-		logger.Error(err)
-	}
-
-	go func() {
-		for {
-			err := <-errs
-			if err != nil {
-				log.Print(err)
-			}
-		}
-	}()
-
-	if len(*svcFlag) != 0 {
-		err := service.Control(s, *svcFlag)
-		if err != nil {
-			log.Printf("Valid actions: %q\n", service.ControlAction)
-			log.Fatal(err)
-		}
-		return
-	}
-
-	err = s.Run()
-	if err != nil {
-		fmt.Println(err)
-	}
-}
-
-// Search C:\Users\Mahir\AppData\Roaming\Microsoft\Windows\Start Menu\Programs for program exe and search userprofile. thats it
-// DO NOT READ APPDATA STUFF, and also windows stuff, just add the path
