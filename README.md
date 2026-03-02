@@ -33,7 +33,7 @@ Filosophy is built as a three‑layer system:
 
 ```bash
 git clone https://github.com/yourusername/filosophy.git
-cd filosofy
+cd filosophy
 ```
 
 ### 2. Install Python dependencies

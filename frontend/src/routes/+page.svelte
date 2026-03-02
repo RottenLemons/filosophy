@@ -1,8 +1,8 @@
 <script>
-  import { Search } from "carbon-components-svelte";
   import SearchIcon from "carbon-icons-svelte/lib/Search.svelte";
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
-  import { onMount } from "svelte";
+  import Button from "$lib/components/Button.svelte";
+  import Input from "$lib/components/Input.svelte";
 
   let searchQuery = "";
   let selectedFile = null;
@@ -16,14 +16,19 @@
       // Assuming the Go backend method is bound to window.go.main.App.Search
       const result = await window.go.main.App.Search(searchQuery);
       files = result || [];
+      if (files.length > 0) {
+        selectedFile = files[0]; // Auto-select first result for better flow
+      } else {
+        selectedFile = null;
+      }
     } catch (error) {
       console.error("Search failed:", error);
       files = [];
+      selectedFile = null;
     }
     searching = false;
   }
 
-  // Search on Enter key press
   function onKeyUp(e) {
     if (e.key === "Enter") {
       handleSearch();
@@ -31,141 +36,120 @@
   }
 </script>
 
-<div class="app-container">
-  <aside class="sidebar">
-    <div class="header">
-      <h2>File Search</h2>
-      <Search bind:value={searchQuery} placeholder="Search file contents..." on:keyup={onKeyUp} />
-      <button on:click={handleSearch} disabled={searching} class="search-button">
-        {searching ? 'Searching...' : 'Search'}
-      </button>
+<div class="relative min-h-screen flex text-md-on-background overflow-hidden">
+  
+  <!-- Atmospheric Background Decor (MD3 Signature) -->
+  <div class="absolute top-0 right-0 w-[800px] h-[800px] bg-md-secondary-container/30 blur-[100px] rounded-full mix-blend-multiply translate-x-1/3 -translate-y-1/3 pointer-events-none z-0"></div>
+  <div class="absolute bottom-0 left-[20%] w-[600px] h-[600px] bg-md-primary/10 blur-[80px] rounded-full mix-blend-multiply pointer-events-none z-0"></div>
+
+  <!-- Sidebar (Surface Container) -->
+  <aside class="relative z-10 w-96 flex-shrink-0 flex flex-col bg-md-surface-container border-r border-md-outline/10 shadow-md-sm">
+    <!-- Header -->
+    <div class="p-6 md-lg:p-8 flex flex-col gap-4 border-b border-md-outline/10 z-20 bg-md-surface-container">
+      <h2 class="text-[2rem] font-medium leading-tight text-md-on-background">File Search</h2>
+      
+      <div class="flex flex-col gap-3 mt-2">
+        <Input 
+          bind:value={searchQuery} 
+          placeholder="Search file contents..." 
+          on:keyup={onKeyUp}
+        >
+          <div slot="leadingIcon">
+            <SearchIcon size={20} />
+          </div>
+        </Input>
+        
+        <Button 
+          variant="primary" 
+          disabled={searching} 
+          on:click={handleSearch}
+          class="w-full"
+        >
+          {searching ? 'Searching...' : 'Search Files'}
+        </Button>
+      </div>
     </div>
 
-    <div class="sidebar-content">
+    <!-- Results List -->
+    <div class="flex-1 overflow-y-auto w-full p-4 custom-scrollbar">
       {#if files.length > 0}
-        <ul class="file-list">
+        <ul class="flex flex-col gap-2 relative z-20">
           {#each files as file (file)}
-            <li class="file-item" on:click={() => selectedFile = file}>
-              <DocumentIcon size={16} class="icon" />
-              <span class="file-path">{file}</span>
+            <!-- svelte-ignore a11y-click-events-have-key-events - File Item (Tonal Card) -->
+            <li 
+              class="group flex items-center gap-3 p-4 rounded-md-large cursor-pointer transition-all duration-300 ease-md-emphasized 
+                     {selectedFile === file ? 'bg-md-primary-container text-md-on-primary-container shadow-md-sm' : 'hover:bg-md-primary/10 hover:shadow-md-sm text-md-on-surface'}"
+              on:click={() => selectedFile = file}
+            >
+              <div class="flex-shrink-0 transition-transform duration-300 ease-md-emphasized group-hover:scale-110 group-active:scale-95 {selectedFile === file ? 'text-md-primary' : 'text-md-on-surface-variant'}">
+                <DocumentIcon size={20} />
+              </div>
+              <span class="text-sm font-medium truncate flex-1">{file}</span>
             </li>
           {/each}
         </ul>
       {:else if searchQuery.trim() !== ''}
-        <div class="empty-state">
-          <SearchIcon size={32} class="icon" />
-          <p>No results found</p>
+        <div class="flex flex-col items-center justify-center h-full opacity-60 relative z-20">
+          <div class="mb-4 bg-md-secondary-container p-4 rounded-full text-md-on-secondary-container">
+            <SearchIcon size={32} />
+          </div>
+          <p class="text-base font-medium text-md-on-surface-variant">No results found</p>
         </div>
       {:else}
-        <div class="empty-state">
-          <SearchIcon size={32} class="icon" />
-          <p>Enter a search query to find files</p>
+        <div class="flex flex-col items-center justify-center h-full opacity-60 relative z-20">
+          <div class="mb-4 bg-md-primary/10 p-4 rounded-full text-md-primary">
+            <SearchIcon size={32} />
+          </div>
+          <p class="text-base font-medium text-md-on-surface-variant text-center px-4">Enter a search query to find files</p>
         </div>
       {/if}
     </div>
   </aside>
 
-  <main class="detail-view">
+  <!-- Detail View (Main Surface) -->
+  <main class="relative z-10 flex-1 flex flex-col p-6 md:p-8 overflow-y-auto">
     {#if selectedFile}
-      <div class="file-preview">
-        <h3>{selectedFile}</h3>
-        <!-- TODO: implement file content preview -->
+      <div class="bg-md-surface-container-low rounded-md-2xl shadow-md-sm p-8 flex-1 flex flex-col ring-1 ring-md-outline/5 transition-all duration-300 ease-md-emphasized hover:shadow-md-lg">
+        <div class="flex items-center gap-4 mb-8">
+          <div class="bg-md-primary-container text-md-on-primary-container p-3 rounded-full flex-shrink-0">
+             <DocumentIcon size={24} />
+          </div>
+          <h3 class="text-2xl font-medium truncate max-w-full text-md-on-background">{selectedFile}</h3>
+        </div>
+        
+        <div class="flex-1 bg-md-background rounded-md-large p-6 border border-md-outline/10 font-mono text-sm text-md-on-surface-variant overflow-y-auto shadow-inner relative">
+           <div class="absolute inset-x-0 top-0 h-4 bg-gradient-to-b from-black/5 to-transparent pointer-events-none rounded-t-md-large"></div>
+          <!-- TODO: implement file content preview inside here -->
+          <div class="flex flex-col items-center justify-center h-full opacity-50">
+             <p>File content preview will be loaded here.</p>
+          </div>
+        </div>
       </div>
     {:else}
-      <div class="empty-state">
-        <DocumentIcon size={64} class="icon" />
-        <p>Select a file to view its contents</p>
+      <div class="flex-1 flex flex-col items-center justify-center opacity-70">
+        <div class="mb-6 bg-md-surface-container shadow-md-base p-6 rounded-[2rem] text-md-primary transform transition-transform duration-500 hover:scale-105 hover:rotate-3">
+          <DocumentIcon size={48} />
+        </div>
+        <p class="text-xl font-medium text-md-on-surface-variant mb-2">Select a file</p>
+        <p class="text-sm text-md-outline text-center max-w-xs">Click on any file in the sidebar to view its contents right here.</p>
       </div>
     {/if}
   </main>
 </div>
 
 <style>
-  .app-container {
-    display: flex;
-    height: calc(100vh - 3rem);
-    margin: -1rem;
+  /* Custom scrollbar to match MD3 aesthetics */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
   }
-
-  .sidebar {
-    width: 400px;
-    background: white;
-    border-right: 1px solid #e0e0e0;
-    display: flex;
-    flex-direction: column;
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
   }
-
-  .header {
-    padding: 1.5rem;
-    border-bottom: 1px solid #f4f4f4;
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: theme('colors.md.outline-variant');
+    border-radius: 9999px;
   }
-
-  h2 {
-    font-size: 1.25rem;
-    font-weight: 400;
-    margin-bottom: 1rem;
-  }
-
-  .search-button {
-    margin-top: 1rem;
-    padding: 0.5rem 1rem;
-    background-color: #0f62fe;
-    color: white;
-    border: none;
-    border-radius: 2px;
-    cursor: pointer;
-  }
-
-  .search-button:disabled {
-    background-color: #8d8d8d;
-    cursor: not-allowed;
-  }
-
-  .sidebar-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 1rem;
-  }
-
-  .file-list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  .file-item {
-    display: flex;
-    align-items: center;
-    padding: 0.75rem;
-    border-bottom: 1px solid #f0f0f0;
-    cursor: pointer;
-  }
-
-  .file-item:hover {
-    background-color: #f5f5f5;
-  }
-
-  .file-path {
-    margin-left: 0.5rem;
-    font-size: 0.875rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .detail-view {
-    flex: 1;
-    background-color: #f4f4f4;
-    padding: 2rem;
-  }
-
-  .empty-state {
-    text-align: center;
-    color: #8d8d8d;
-  }
-
-  :global(.icon) {
-    margin-bottom: 1rem;
-    fill: #c6c6c6;
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: theme('colors.md.outline');
   }
 </style>

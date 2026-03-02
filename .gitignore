@@ -1,6 +1,8 @@
 # Database and index files
 *.db
 filosophy.db
+*.db-shm
+*.db-wal
 *.bin
 image.onnx
 text.onnx
@@ -9,6 +11,7 @@ text_old/**
 image/**
 text/**
 native/**
+vips-dev-8.18/
 kreuzberg-ffi/**
 
 # Python
@@ -69,3 +72,5 @@ test.ipynb
 
 # Miscellaneous
 .aider*
+*.txt
+check_dll.py

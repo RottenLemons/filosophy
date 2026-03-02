@@ -209,7 +209,7 @@ func ProcessImage(path string, cfg *ProcessorConfig) {
 
 // ProcessText extracts text from a file and adds chunks to the channel
 func ProcessText(path string, cfg *ProcessorConfig) {
-	result, err := kreuzberg.Extract(path, nil)
+	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result == nil || result.Content == "" {
 		HandleChunk(cfg.Chunks, cfg.SendQueue, "text", "", path, empty)
 		return
