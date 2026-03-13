@@ -9,3 +9,4 @@ native/**
 test.ipynb
 *.bin
 kreuzberg-ffi/**
+.indexed
