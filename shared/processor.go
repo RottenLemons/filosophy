@@ -2,64 +2,35 @@
 package shared
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
-	"github.com/Microsoft/go-winio"
 	"github.com/cespare/xxhash"
 	kreuzberg "github.com/kreuzberg-dev/kreuzberg/packages/go/v4"
 	"github.com/tmc/langchaingo/textsplitter"
 )
 
 // vipsThumbnailPath returns the path to the bundled vipsthumbnail.exe.
-// It first checks relative to the executable (for production), then falls
-// back to the working directory (for development / go run).
 func vipsThumbnailPath() string {
 	var rel = filepath.FromSlash("vips-dev-8.18/bin/vipsthumbnail.exe")
-
-	// Try relative to the executable first (production layout)
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), rel)
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-
-	// Fall back to working directory (development / go run)
 	if wd, err := os.Getwd(); err == nil {
 		p := filepath.Join(wd, rel)
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-
-	// Last resort: rely on PATH
 	return "vipsthumbnail"
-}
-
-// Send connects to the named pipe, writes {"task":…,"data":…}, and returns the response.
-func Send(data interface{}, task string) (string, error) {
-	pipePath := `\\.\pipe\test`
-	f, err := winio.DialPipe(pipePath, nil)
-	if err != nil {
-		return "", fmt.Errorf("error opening pipe: %w", err)
-	}
-	defer f.Close()
-	msg := fmt.Sprintf(`{"task": %q,"data": %s}`, task, data)
-	if _, err := f.Write([]byte(msg)); err != nil {
-		return "", fmt.Errorf("write error: %w", err)
-	}
-	chunk := make([]byte, 1024)
-	if _, err := f.Read(chunk); err != nil {
-		return "", fmt.Errorf("read error: %w", err)
-	}
-	return string(chunk), nil
 }
 
 // Metadata holds content and path information for indexing
@@ -68,28 +39,12 @@ type Metadata struct {
 	Hash          int64
 }
 
-// DataType represents a batch of data to send
-type DataType struct {
-	Data []byte
-	Mode string
-}
-
 var imageExtensions = map[string]struct{}{
-	".jpg":   {},
-	".jpeg":  {},
-	".png":   {},
-	".gif":   {},
-	".bmp":   {},
-	".tiff":  {},
-	".tif":   {},
-	".heic":  {},
-	".heif":  {},
-	".ico":   {},
-	".avif":  {},
-	".jfif":  {},
-	".pjpeg": {},
-	".pjp":   {},
-	".svg":   {},
+	".jpg": {}, ".jpeg": {}, ".png": {}, ".gif": {},
+	".bmp": {}, ".tiff": {}, ".tif": {},
+	".heic": {}, ".heif": {}, ".ico": {},
+	".avif": {}, ".jfif": {}, ".pjpeg": {},
+	".pjp": {}, ".webp": {},
 }
 
 var empty int64 = int64(xxhash.Sum64String(""))
@@ -101,20 +56,17 @@ func IsImageFile(filename string) bool {
 	return ok
 }
 
-// SendBatch marshals and sends a batch of metadata items to the send queue
-func SendBatch(items []Metadata, mode string, sendQueue chan DataType) {
+// IndexBatch directly indexes a batch of metadata items using the Engine.
+func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	if len(items) == 0 {
 		return
 	}
-	dataMap := make(map[string]interface{})
 	contents := make([]string, 0, len(items))
 	paths := make([]string, 0, len(items))
 	for _, item := range items {
 		contents = append(contents, item.Content)
 		paths = append(paths, item.Path)
 	}
-	dataMap["content"] = contents
-	dataMap["path"] = paths
 
 	// Deduplicate file-level hashes by path
 	var filePaths []string
@@ -126,17 +78,33 @@ func SendBatch(items []Metadata, mode string, sendQueue chan DataType) {
 		filePaths = append(filePaths, item.Path)
 		fileHashes = append(fileHashes, item.Hash)
 	}
-	if len(filePaths) > 0 {
-		dataMap["file_path"] = filePaths
-		dataMap["file_hash"] = fileHashes
+
+	var err error
+	if mode == "image" {
+		err = sc.IndexImage(contents, paths, filePaths, fileHashes)
+	} else {
+		err = sc.IndexText(contents, paths, filePaths, fileHashes)
+	}
+	if err != nil {
+		log.Printf("IndexBatch %s error: %v", mode, err)
 	}
 
-	data, _ := json.Marshal(dataMap)
-	sendQueue <- DataType{data, mode}
+	// Index unique paths in FTS5 for path keyword search
+	seen := make(map[string]struct{})
+	var uniquePaths []string
+	for _, p := range paths {
+		if _, ok := seen[p]; !ok {
+			seen[p] = struct{}{}
+			uniquePaths = append(uniquePaths, p)
+		}
+	}
+	sc.IndexPathsFTS(uniquePaths)
 }
 
 // HandleChunk adds metadata to a channel and flushes when full
-func HandleChunk(chunks chan Metadata, sendQueue chan DataType, mode, content, path string, hash int64) {
+func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash int64, mu *sync.Mutex) {
+	mu.Lock()
+	defer mu.Unlock()
 	select {
 	case chunks <- Metadata{content, path, hash}:
 	default:
@@ -149,69 +117,67 @@ func HandleChunk(chunks chan Metadata, sendQueue chan DataType, mode, content, p
 			}
 		}
 		chunks <- Metadata{content, path, hash}
-		SendBatch(items, mode, sendQueue)
+		// IndexBatch shouldn't be under the same lock if we want to add more to channel
+		// but since we are limiting concurrency via maxConcurrency semaphore anyway,
+		// guarding the channel drain is safer.
+		IndexBatch(items, mode, sc)
 	}
 }
 
-// DrainRemaining drains all remaining items from a channel and sends them
-func DrainRemaining(chunks chan Metadata, mode string, sendQueue chan DataType) {
+// DrainRemaining drains all remaining items from a channel and indexes them
+func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
 	var items []Metadata
 	for len(chunks) > 0 {
 		items = append(items, <-chunks)
 	}
-	SendBatch(items, mode, sendQueue)
+	IndexBatch(items, mode, sc)
 }
 
 // ProcessorConfig holds configuration for file processing
 type ProcessorConfig struct {
-	Splitter  *textsplitter.RecursiveCharacter
-	Chunks    chan Metadata
-	Images    chan Metadata
-	SendQueue chan DataType
+	Splitter *textsplitter.RecursiveCharacter
+	Chunks   chan Metadata
+	Images   chan Metadata
+	Engine   *Engine
+	TempDir  string // temp dir for converted images, cleaned up after indexing
+	Mu       *sync.Mutex
 }
 
-// ProcessImage processes an image file using the bundled vipsthumbnail CLI
-// and adds the base64-encoded PNG to the images channel.
+// ProcessImage converts an image to PNG via vips, hashes the original raw bytes,
+// and queues it for indexing. The converted PNG path is passed as "content"
+// so hugot's RunWithImagePaths can load it.
 func ProcessImage(path string, cfg *ProcessorConfig) {
+	// Hash original raw bytes for dedup
 	imBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Println("Failed to read image:", err)
 		return
 	}
 	hash := int64(xxhash.Sum64(imBytes))
-	imBytes = nil // Only needed for hashing
+	imBytes = nil
 
-	tmpFile, err := os.CreateTemp("", "vips-*.png")
-	if err != nil {
-		log.Println("Failed to create temp file:", err)
-		return
-	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Close()
-	defer os.Remove(tmpPath)
-
-	// vipsthumbnail resizes to fit within 256x256, auto-detects input format
-	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256", "-o", tmpPath+"[strip]")
+	// Convert to JPEG via vips (small temp, handles all formats: HEIC, AVIF, WebP, etc.)
+	outPath := filepath.Join(cfg.TempDir, fmt.Sprintf("%d.jpg", hash))
+	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256x256!", "-o", outPath+"[Q=80,strip]")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("vipsthumbnail failed for %s: %v\n%s", path, err, string(output))
 		return
 	}
 
-	pngBytes, err := os.ReadFile(tmpPath)
-	if err != nil {
-		log.Println("Failed to read vips output:", err)
-		return
-	}
-
-	imString := base64.StdEncoding.EncodeToString(pngBytes)
-	HandleChunk(cfg.Images, cfg.SendQueue, "image", imString, path, hash)
+	// Content = converted JPEG path for hugot, Path = original path for metadata
+	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, cfg.Mu)
 }
 
 // ProcessText extracts text from a file and adds chunks to the channel
 func ProcessText(path string, cfg *ProcessorConfig) {
 	result, err := kreuzberg.ExtractFileSync(path, nil)
+<<<<<<< HEAD
 	if err != nil || result == nil || result.Content == "" {
 		HandleChunk(cfg.Chunks, cfg.SendQueue, "text", "", path, empty)
+=======
+	if err != nil || result.Content == "" {
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, cfg.Mu)
+>>>>>>> main
 		return
 	}
 	hash := int64(xxhash.Sum64String(result.Content))
@@ -224,10 +190,10 @@ func ProcessText(path string, cfg *ProcessorConfig) {
 	first := true
 	for _, chunk := range splits {
 		if first {
-			HandleChunk(cfg.Chunks, cfg.SendQueue, "text", chunk, path, hash)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, cfg.Mu)
 			first = false
 		} else {
-			HandleChunk(cfg.Chunks, cfg.SendQueue, "text", chunk, path, empty)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, cfg.Mu)
 		}
 	}
 }
@@ -243,18 +209,40 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 
 // ProcessDirectory adds directory path to the chunks channel
 func ProcessDirectory(path string, cfg *ProcessorConfig) {
-	HandleChunk(cfg.Chunks, cfg.SendQueue, "text", "", path, empty)
+	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, cfg.Mu)
 }
 
-// NewProcessorConfig creates a new ProcessorConfig with default settings
-func NewProcessorConfig(chunkSize, chunkCap, imageCap, sendQueueCap int) *ProcessorConfig {
+// NewProcessorConfig creates a new ProcessorConfig with default settings.
+// Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
+func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) *ProcessorConfig {
+	if err := sc.InitIndexTables(); err != nil {
+		log.Printf("Failed to initialize index tables: %v", err)
+	}
+
 	splitter := textsplitter.NewRecursiveCharacter(func(o *textsplitter.Options) {
 		o.ChunkSize = chunkSize
 	})
+	tmpDir, err := os.MkdirTemp("", "filosophy-img-*")
+	if err != nil {
+		log.Println("Failed to create temp dir for images:", err)
+	}
+	// Cap the image capacity high enough batching is effective
+	if imageCap < 100 {
+		imageCap = 100
+	}
 	return &ProcessorConfig{
-		Splitter:  &splitter,
-		Chunks:    make(chan Metadata, chunkCap),
-		Images:    make(chan Metadata, imageCap),
-		SendQueue: make(chan DataType, sendQueueCap),
+		Splitter: &splitter,
+		Chunks:   make(chan Metadata, chunkCap),
+		Images:   make(chan Metadata, imageCap),
+		Engine:   sc,
+		TempDir:  tmpDir,
+		Mu:       &sync.Mutex{},
+	}
+}
+
+// CleanupTempDir removes the temp directory used for image conversions.
+func (cfg *ProcessorConfig) CleanupTempDir() {
+	if cfg.TempDir != "" {
+		os.RemoveAll(cfg.TempDir)
 	}
 }

@@ -264,7 +264,7 @@ def search(query, tokenizer, model1, model2, conn):
         "query": fts_query,
         "k": 10,
         "rrf_k": 60,
-        "weight_fts": 1.0,
+        "weight_fts": 2.0,
         "weight_vec": 1.0,
         "weight_img": 1.5,  # 50% larger for images (no BM25)
         "query_emb": query_emb.tobytes(),

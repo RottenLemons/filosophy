@@ -1,0 +1,140 @@
+2026/03/10 15:56:27 text collection: vectorstore: create_collection: collection 'text' already exists
+2026/03/10 15:56:27 image collection: vectorstore: create_collection: collection 'image' already exists
+2026/03/10 15:56:30   -> loadAndPreprocess: 170.7479ms for 100 images
+2026/03/10 15:56:32   -> ONNX single-batch inference loop run: 2.1314133s
+2026/03/10 15:56:32 Encode 100 images: 2.3025045s
+2026/03/10 15:56:32 Total image indexing: 2.3562717s
+2026/03/10 15:56:33   -> loadAndPreprocess: 221.0793ms for 100 images
+2026/03/10 15:56:36   -> ONNX single-batch inference loop run: 2.2849909s
+2026/03/10 15:56:36 Encode 100 images: 2.5060702s
+2026/03/10 15:56:36 Total image indexing: 2.5877085s
+2026/03/10 15:56:48   -> Tokenize: 11.7407162s for 4000 texts
+2026/03/10 15:56:56   -> Text Sub-Batched ONNX: 7.2069589s
+2026/03/10 15:56:56 Encode 4000 text: 18.9480194s
+2026/03/10 15:57:02 Total text indexing: 25.6707859s
+2026/03/10 15:57:03   -> loadAndPreprocess: 194.2004ms for 100 images
+2026/03/10 15:57:05   -> ONNX single-batch inference loop run: 2.2866132s
+2026/03/10 15:57:05 Encode 100 images: 2.4808136s
+2026/03/10 15:57:06 Total image indexing: 2.6187813s
+2026/03/10 15:57:07   -> loadAndPreprocess: 179.8641ms for 100 images
+2026/03/10 15:57:10   -> ONNX single-batch inference loop run: 2.3271433s
+2026/03/10 15:57:10 Encode 100 images: 2.5071229s
+2026/03/10 15:57:10 Total image indexing: 2.6297623s
+2026/03/10 15:57:11   -> loadAndPreprocess: 204.1739ms for 100 images
+2026/03/10 15:57:14   -> ONNX single-batch inference loop run: 2.3508186s
+2026/03/10 15:57:14 Encode 100 images: 2.5549925s
+2026/03/10 15:57:14 Total image indexing: 2.6648034s
+2026/03/10 15:57:26   -> Tokenize: 11.4447587s for 4000 texts
+2026/03/10 15:57:32   -> Text Sub-Batched ONNX: 6.4603043s
+2026/03/10 15:57:32 Encode 4000 text: 17.905063s
+2026/03/10 15:57:44 Total text indexing: 29.547369s
+2026/03/10 15:57:45   -> loadAndPreprocess: 183.9415ms for 100 images
+2026/03/10 15:57:48   -> ONNX single-batch inference loop run: 2.5846521s
+2026/03/10 15:57:48 Encode 100 images: 2.7686389s
+2026/03/10 15:57:48 Total image indexing: 2.9148724s
+2026/03/10 15:57:50   -> loadAndPreprocess: 220.1617ms for 100 images
+2026/03/10 15:57:52   -> ONNX single-batch inference loop run: 2.3669422s
+2026/03/10 15:57:52 Encode 100 images: 2.5880023s
+2026/03/10 15:57:53 Total image indexing: 2.7181432s
+2026/03/10 15:58:03   -> Tokenize: 10.1619569s for 4000 texts
+2026/03/10 15:58:09   -> Text Sub-Batched ONNX: 5.5622318s
+2026/03/10 15:58:09 Encode 4000 text: 15.724842s
+2026/03/10 15:58:18 Total text indexing: 25.1326816s
+2026/03/10 15:58:20   -> loadAndPreprocess: 263.2844ms for 100 images
+2026/03/10 15:58:22   -> ONNX single-batch inference loop run: 2.5331783s
+2026/03/10 15:58:22 Encode 100 images: 2.7964627s
+2026/03/10 15:58:22 Total image indexing: 2.9248238s
+2026/03/10 15:58:34   -> Tokenize: 11.5170693s for 4000 texts
+2026/03/10 15:58:41   -> Text Sub-Batched ONNX: 6.4420785s
+2026/03/10 15:58:41 Encode 4000 text: 17.9634571s
+2026/03/10 15:58:48 Total text indexing: 24.9996153s
+2026/03/10 15:58:49   -> loadAndPreprocess: 203.0815ms for 100 images
+2026/03/10 15:58:51   -> ONNX single-batch inference loop run: 2.3508638s
+2026/03/10 15:58:51 Encode 100 images: 2.5548975s
+2026/03/10 15:58:51 Total image indexing: 2.7140109s
+2026/03/10 15:58:53   -> loadAndPreprocess: 173.3351ms for 100 images
+2026/03/10 15:58:55   -> ONNX single-batch inference loop run: 2.3983589s
+2026/03/10 15:58:55 Encode 100 images: 2.571694s
+2026/03/10 15:58:56 Total image indexing: 2.7379914s
+2026/03/10 15:58:57   -> loadAndPreprocess: 223.9779ms for 100 images
+2026/03/10 15:59:00   -> ONNX single-batch inference loop run: 2.2787923s
+2026/03/10 15:59:00 Encode 100 images: 2.5032792s
+2026/03/10 15:59:00 Total image indexing: 2.6448377s
+2026/03/10 15:59:11   -> Tokenize: 10.3978293s for 4000 texts
+2026/03/10 15:59:17   -> Text Sub-Batched ONNX: 6.2858099s
+2026/03/10 15:59:17 Encode 4000 text: 16.684805s
+2026/03/10 15:59:26 Total text indexing: 25.4193743s
+2026/03/10 15:59:27   -> loadAndPreprocess: 219.3474ms for 100 images
+2026/03/10 15:59:29   -> ONNX single-batch inference loop run: 2.3502835s
+2026/03/10 15:59:29 Encode 100 images: 2.5696309s
+2026/03/10 15:59:29 Total image indexing: 2.7385429s
+2026/03/10 15:59:31   -> loadAndPreprocess: 165.44ms for 100 images
+2026/03/10 15:59:34   -> ONNX single-batch inference loop run: 2.3308075s
+2026/03/10 15:59:34 Encode 100 images: 2.4966224s
+2026/03/10 15:59:34 Total image indexing: 2.6858136s
+2026/03/10 15:59:44   -> Tokenize: 9.6054583s for 4000 texts
+2026/03/10 15:59:50   -> Text Sub-Batched ONNX: 5.7188494s
+2026/03/10 15:59:50 Encode 4000 text: 15.3253665s
+2026/03/10 16:00:00 Total text indexing: 25.330845s
+2026/03/10 16:00:11   -> Tokenize: 9.7479336s for 4000 texts
+2026/03/10 16:00:15   -> Text Sub-Batched ONNX: 3.7227212s
+2026/03/10 16:00:15 Encode 4000 text: 13.4747434s
+2026/03/10 16:00:23 Total text indexing: 21.1566261s
+2026/03/10 16:00:33   -> Tokenize: 9.869753s for 4000 texts
+2026/03/10 16:00:36   -> Text Sub-Batched ONNX: 3.024002s
+2026/03/10 16:00:36 Encode 4000 text: 12.8951354s
+2026/03/10 16:00:43 Total text indexing: 20.523801s
+2026/03/10 16:00:53   -> Tokenize: 9.4432939s for 4000 texts
+2026/03/10 16:00:56   -> Text Sub-Batched ONNX: 3.3374181s
+2026/03/10 16:00:56 Encode 4000 text: 12.7817132s
+2026/03/10 16:01:06 Total text indexing: 22.4687494s
+2026/03/10 16:01:16   -> Tokenize: 10.0542264s for 4000 texts
+2026/03/10 16:01:19   -> Text Sub-Batched ONNX: 3.1495795s
+2026/03/10 16:01:19 Encode 4000 text: 13.2049557s
+2026/03/10 16:01:27 Total text indexing: 21.3266055s
+2026/03/10 16:01:37   -> Tokenize: 9.507567s for 4000 texts
+2026/03/10 16:01:40   -> Text Sub-Batched ONNX: 3.0266577s
+2026/03/10 16:01:40 Encode 4000 text: 12.5368923s
+2026/03/10 16:01:46 Total text indexing: 19.2167688s
+2026/03/10 16:01:56   -> Tokenize: 9.4941863s for 4000 texts
+2026/03/10 16:01:59   -> Text Sub-Batched ONNX: 3.1697763s
+2026/03/10 16:01:59 Encode 4000 text: 12.6639626s
+2026/03/10 16:02:06 Total text indexing: 19.3042858s
+2026/03/10 16:02:15   -> Tokenize: 9.6272651s for 4000 texts
+2026/03/10 16:02:18   -> Text Sub-Batched ONNX: 3.1638667s
+2026/03/10 16:02:18 Encode 4000 text: 12.7911318s
+2026/03/10 16:02:25 Total text indexing: 19.3222702s
+2026/03/10 16:02:25   -> loadAndPreprocess: 159.3649ms for 100 images
+2026/03/10 16:02:27   -> ONNX single-batch inference loop run: 2.2488982s
+2026/03/10 16:02:27 Encode 100 images: 2.4082631s
+2026/03/10 16:02:27 Total image indexing: 2.6287864s
+2026/03/10 16:02:37   -> Tokenize: 9.2546178s for 4000 texts
+2026/03/10 16:02:40   -> Text Sub-Batched ONNX: 3.119029s
+2026/03/10 16:02:40 Encode 4000 text: 12.3736468s
+2026/03/10 16:02:47 Total text indexing: 19.2891777s
+2026/03/10 16:03:01   -> Tokenize: 12.2673578s for 4000 texts
+2026/03/10 16:03:07   -> Text Sub-Batched ONNX: 5.9762058s
+2026/03/10 16:03:07 Encode 4000 text: 18.2442426s
+2026/03/10 16:03:14 Total text indexing: 25.5136992s
+2026/03/10 16:03:16   -> loadAndPreprocess: 188.0031ms for 100 images
+2026/03/10 16:03:19   -> ONNX single-batch inference loop run: 2.3794247s
+2026/03/10 16:03:19 Encode 100 images: 2.5674278s
+2026/03/10 16:03:19 Total image indexing: 2.7714688s
+2026/03/10 16:03:23   -> loadAndPreprocess: 192.148ms for 100 images
+2026/03/10 16:03:25   -> ONNX single-batch inference loop run: 2.3118155s
+2026/03/10 16:03:25 Encode 100 images: 2.5040644s
+2026/03/10 16:03:25 Total image indexing: 2.7136681s
+2026/03/10 16:03:37   -> Tokenize: 11.2798993s for 4000 texts
+2026/03/10 16:03:43   -> Text Sub-Batched ONNX: 6.1687868s
+2026/03/10 16:03:43 Encode 4000 text: 17.449683s
+2026/03/10 16:03:52 Total text indexing: 26.5530817s
+2026/03/10 16:03:54   -> Tokenize: 1.8145943s for 332 texts
+2026/03/10 16:03:55   -> Text Sub-Batched ONNX: 796.5253ms
+2026/03/10 16:03:55 Encode 332 text: 2.6111196s
+2026/03/10 16:03:56 Total text indexing: 3.6254063s
+2026/03/10 16:03:56   -> loadAndPreprocess: 40.5716ms for 27 images
+2026/03/10 16:03:57   -> ONNX single-batch inference loop run: 600.5723ms
+2026/03/10 16:03:57 Encode 27 images: 641.1888ms
+2026/03/10 16:03:57 Total image indexing: 702.5846ms
+7m28.9756031s
+Search: 
