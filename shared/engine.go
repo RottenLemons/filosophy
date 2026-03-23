@@ -25,7 +25,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"net/url"
 
 	"github.com/daulet/tokenizers"
 	"github.com/google/uuid"
@@ -45,6 +48,40 @@ const (
 	clipEmbedDim  = 512 // CLIP native output dimension
 	clipCtxLen    = 77  // CLIP text context_length
 	visionSize    = 256 // CLIP vision input size
+
+	// rrfK is the Reciprocal Rank Fusion constant. Larger values reduce the
+	// penalty gap between adjacent ranks, smoothing signal contributions.
+	rrfK = 60.0
+
+	// Filename scoring constants (addFilenameBoosts).
+	// Each query word that exactly matches a filename word contributes filenameWordBoost.
+	// filenameMultiWordBonus is multiplied by (matchedWords - 1) so that files sharing
+	// more query words rank proportionally higher — no flat ceiling for "all present".
+	filenameWordBoost      = 0.30 // per matched query word (exact)
+	filenamePrefixBoost    = 0.10 // per matched query word (prefix/suffix)
+	filenameSubstrBoost    = 0.04 // per matched query word (substring)
+	filenameMultiWordBonus = 0.60 // × (matchedWords-1), grows with word coverage
+
+	// Fuzzy path scoring constants (addFuzzyPathBoosts).
+	// fuzzyPathBoost scales the Levenshtein similarity contribution.
+	// fuzzyMinWordSim is the minimum average word similarity to apply any boost
+	// (e.g. "albret"→"albert"=0.67, "tyop"→"typo"=0.75 both pass; random noise ~0.3 fails).
+	fuzzyPathBoost  = 0.15
+	fuzzyMinWordSim = 0.55
+
+	// Content FTS RRF boost constants — applied after document-level aggregation.
+	// Phrase match is much stronger than keyword OR: a document containing "Albert Camus"
+	// adjacent should always beat one that merely contains both words separately.
+	// At rank 1: phrase = 50/61 ≈ 0.82, keyword = 10/61 ≈ 0.16, fuzzy = 0.8/61 ≈ 0.013
+	contentPhraseBoost  = 50.0
+	contentKeywordBoost = 10.0
+	contentFuzzyBoost   = 0.8
+
+	// contentTopK is the number of top-scoring chunks per document used to compute
+	// the document-level BM25 score. Averaging the top-K (k-MAX) respects IDF like
+	// pure MAX while still rewarding documents with multiple strong matches.
+	// k=1 → pure MAX; k=∞ → full average (vulnerable to count-dominates-IDF).
+	contentTopK = 3
 )
 
 // CLIP image normalization constants (OpenAI CLIP standard).
@@ -111,7 +148,6 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	if _, err := db.Vector().CreateCollection(ctx, imageCollection, imageEmbedDim); err != nil {
 		log.Printf("image collection: %v", err)
 	}
-
 
 	// Initialize ONNX Runtime
 	ortPath := findOnnxRuntime()
@@ -312,6 +348,7 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	}
 	batch := int64(len(texts))
 
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	seqs := make([]seqData, batch)
 
@@ -340,7 +377,7 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	wg.Wait()
 
 	tTok := time.Now()
-	log.Printf("  -> Tokenize: %v for %d texts", tTok.Sub(t0), len(texts))
+	log.Printf("  -> Tokenize: %v for %d texts (%s)", tTok.Sub(t0), len(texts), getStats(cpu0, t0))
 
 	// Sort sequences by length (shortest to longest) to minimize padding variance
 	sort.Slice(seqs, func(i, j int) bool {
@@ -428,7 +465,7 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	}
 
 	tInfer := time.Now()
-	log.Printf("  -> Text Sub-Batched ONNX: %v", tInfer.Sub(tSort))
+	log.Printf("  -> Text Sub-Batched ONNX: %v (%s)", tInfer.Sub(tSort), getStats(cpu0, tSort))
 
 	return result, nil
 }
@@ -490,6 +527,7 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		return nil, nil
 	}
 
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 
 	pixelsPerImage := 3 * visionSize * visionSize
@@ -510,7 +548,7 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 	}
 
 	tPreprocess := time.Now()
-	log.Printf("  -> loadAndPreprocess: %v for %d images", tPreprocess.Sub(t0), len(imagePaths))
+	log.Printf("  -> loadAndPreprocess: %v for %d images (%s)", tPreprocess.Sub(t0), len(imagePaths), getStats(cpu0, t0))
 
 	if len(validIndices) == 0 {
 		return result, nil
@@ -555,7 +593,7 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 	}
 
 	tInference := time.Now()
-	log.Printf("  -> ONNX single-batch inference loop run: %v", tInference.Sub(tTensor))
+	log.Printf("  -> ONNX single-batch inference loop run: %v (%s)", tInference.Sub(tTensor), getStats(cpu0, tTensor))
 
 	return result, nil
 }
@@ -669,6 +707,45 @@ func normalize(v []float32) {
 }
 
 // ---------------------------------------------------------------------------
+// Resource tracking (Windows)
+// ---------------------------------------------------------------------------
+
+func getCPUTime() int64 {
+	var creationTime, exitTime, kernelTime, userTime syscall.Filetime
+	h := syscall.Handle(^uintptr(0)) // GetCurrentProcess()
+	err := syscall.GetProcessTimes(h, &creationTime, &exitTime, &kernelTime, &userTime)
+	if err != nil {
+		return 0
+	}
+	// units of 100ns
+	k := int64(kernelTime.LowDateTime) | (int64(kernelTime.HighDateTime) << 32)
+	u := int64(userTime.LowDateTime) | (int64(userTime.HighDateTime) << 32)
+	return k + u
+}
+
+func getStats(startCPU int64, startTime time.Time) string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	ramStr := fmt.Sprintf("%.1f MiB", float64(m.Sys)/1024/1024)
+
+	duration := time.Since(startTime).Seconds()
+	if duration <= 0 {
+		return fmt.Sprintf("RAM: %s, CPU: 0.0%%", ramStr)
+	}
+
+	endCPU := getCPUTime()
+	cpuUnits := endCPU - startCPU
+	// 10,000,000 units of 100ns = 1s
+	cpuSecs := float64(cpuUnits) / 10000000.0
+	// Show usage normalized by CPU count (system perspective)
+	cpuUsage := (cpuSecs / duration / float64(runtime.NumCPU())) * 100.0
+	if cpuUsage > 100.0 {
+		cpuUsage = 100.0
+	}
+	return fmt.Sprintf("RAM: %s, CPU: %.1f%%", ramStr, cpuUsage)
+}
+
+// ---------------------------------------------------------------------------
 // Indexing
 // ---------------------------------------------------------------------------
 
@@ -705,6 +782,7 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
 
@@ -713,7 +791,7 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 	if err != nil {
 		return fmt.Errorf("text embedding failed: %w", err)
 	}
-	log.Printf("Encode %d text: %v", len(embs), time.Since(t0))
+	log.Printf("Encode %d text: %v (%s)", len(embs), time.Since(t0), getStats(cpu0, t0))
 
 	// Upsert file hashes
 	tFiles := time.Now()
@@ -742,9 +820,9 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 	}
 
 	tEnd := time.Now()
-	log.Printf("  -> files upsert: %v", tVec.Sub(tFiles))
-	log.Printf("  -> vector upsert: %v", tEnd.Sub(tVec))
-	log.Printf("Total text indexing: %v", tEnd.Sub(t0))
+	log.Printf("  -> files upsert: %v (%s)", tVec.Sub(tFiles), getStats(cpu0, tFiles))
+	log.Printf("  -> vector upsert: %v (%s)", tEnd.Sub(tVec), getStats(cpu0, tVec))
+	log.Printf("Total text indexing: %v (%s)", tEnd.Sub(t0), getStats(cpu0, t0))
 	return nil
 }
 
@@ -755,6 +833,7 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
 
@@ -763,7 +842,7 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 	if err != nil {
 		return fmt.Errorf("image embedding failed: %w", err)
 	}
-	log.Printf("Encode %d images: %v", len(embs), time.Since(t0))
+	log.Printf("Encode %d images: %v (%s)", len(embs), time.Since(t0), getStats(cpu0, t0))
 
 	// Upsert file hashes
 	tFiles := time.Now()
@@ -792,9 +871,9 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 	}
 
 	tEnd := time.Now()
-	log.Printf("  -> files upsert: %v", tVec.Sub(tFiles))
-	log.Printf("  -> vector upsert: %v", tEnd.Sub(tVec))
-	log.Printf("Total image indexing: %v", tEnd.Sub(t0))
+	log.Printf("  -> files upsert: %v (%s)", tVec.Sub(tFiles), getStats(cpu0, tFiles))
+	log.Printf("  -> vector upsert: %v (%s)", tEnd.Sub(tVec), getStats(cpu0, tVec))
+	log.Printf("Total image indexing: %v (%s)", tEnd.Sub(t0), getStats(cpu0, t0))
 	return nil
 }
 
@@ -852,8 +931,16 @@ type SearchResult struct {
 }
 
 // Search performs a combined text + image search over both collections.
-// Signals: path FTS5 (dominates) > RRF(text vector + content FTS5) + image vectors.
+// Signals (all RRF-normalized for consistent scale):
+//  1. Path FTS5 exact word match (3x weighted RRF)
+//  2. Path FTS5 prefix match (1.5x weighted RRF) — handles partial typing
+//  3. Text vector RRF
+//  4. Content FTS5 RRF
+//  5. Image vector RRF (1.1x weighted)
+//  6. Exact/prefix/substring filename match boost
+//  7. Trigram fuzzy path similarity — typo tolerance
 func (s *Engine) Search(query string) ([]SearchResult, error) {
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
 
@@ -872,12 +959,12 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	imageQueryVec := clipEmbs[0]
 
-	log.Printf("Search encode: %v", time.Since(t0))
+	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 
-	// Vector search both collections (cosine similarity, no limit)
+	// Vector search both collections, capped at 200 to reduce noise
 	textResults, err := s.db.Vector().Search(ctx, textQueryVec, core.SearchOptions{
 		Collection: textCollection,
-		TopK:       0,
+		TopK:       200,
 	})
 	if err != nil {
 		log.Printf("text search error: %v", err)
@@ -885,29 +972,44 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	imageResults, err := s.db.Vector().Search(ctx, imageQueryVec, core.SearchOptions{
 		Collection: imageCollection,
-		TopK:       0,
+		TopK:       200,
 	})
 	if err != nil {
 		log.Printf("image search error: %v", err)
 	}
 
 	scores := map[string]float64{}
-	rrfK := 60.0
 
-	// Signal 1: Path FTS5 (raw scores — intentionally overpowers)
+	// Signal 1: Path FTS5 exact word OR (3x)
 	s.addPathFTSScores(ctx, query, scores, 3.0)
+	// Signal 2: Path FTS5 ALL words AND — boosts paths containing every query word (4x)
+	s.addPathFTSAllWords(ctx, query, scores, 4.0)
+	// Signal 3: Path FTS5 full-word prefix OR (1.5x)
+	s.addPathFTSPrefixScores(ctx, query, scores, 1.5)
+	// Signal 4: Path FTS5 3-char anchor AND — "alb"* "cam"* (1.0x)
+	s.addPathFTSShortPrefixScores(ctx, query, scores, 1.0)
 
-	// Signal 2: RRF(text vector + content FTS5)
+	// Signal 5: Text vector RRF
 	for i, res := range textResults {
 		scores[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
 	}
-	s.addContentFTSRRF(ctx, query, scores, rrfK)
+	// Signal 6: Content phrase match — "Albert Camus" adjacent in text (2.5x)
+	s.addContentFTSPhraseRRF(ctx, query, scores)
+	// Signal 7: Content FTS5 exact keyword OR RRF
+	s.addContentFTSRRF(ctx, query, scores)
+	// Signal 8: Content FTS5 3-char prefix fuzzy RRF (0.8x)
+	s.addContentFTSFuzzyRRF(ctx, query, scores)
 
-	// Signal 3: Image vector ranking (1.1x boost via RRF)
+	// Signal 9: Image vector RRF (1.1x)
 	for i, res := range imageResults {
 		path := res.Metadata["path"]
 		scores[path] += 1.1 / (rrfK + float64(i+1))
 	}
+
+	// Signal 10: Filename word-set match + URL-decode + multi-word coverage bonus
+	addFilenameBoosts(query, scores)
+	// Signal 11: Word-level Levenshtein fuzzy path boost
+	addFuzzyPathBoosts(query, scores)
 
 	results := make([]SearchResult, 0, len(scores))
 	for path, score := range scores {
@@ -915,13 +1017,14 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	sortResults(results)
 
-	log.Printf("Search total: %v", time.Since(t0))
+	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return results, nil
 }
 
 // TextSearch performs search over text embeddings only.
-// Signals: path FTS5 (dominates) > RRF(text vector + content FTS5).
+// Signals: path FTS5 exact+prefix (3x/1.5x weighted RRF) > text vector RRF > content FTS5 RRF > filename/fuzzy boosts.
 func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
 
@@ -930,27 +1033,35 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("text query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-	log.Printf("Search encode: %v", time.Since(t0))
+	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: textCollection,
-		TopK:       0,
+		TopK:       200,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("text search failed: %w", err)
 	}
 
 	scores := map[string]float64{}
-	rrfK := 60.0
 
-	// Path FTS5 (dominates)
+	// Path FTS5 exact OR (3x) + ALL-words AND (4x) + full-word prefix (1.5x) + 3-char anchor (1.0x)
 	s.addPathFTSScores(ctx, query, scores, 3.0)
+	s.addPathFTSAllWords(ctx, query, scores, 4.0)
+	s.addPathFTSPrefixScores(ctx, query, scores, 1.5)
+	s.addPathFTSShortPrefixScores(ctx, query, scores, 1.0)
 
-	// RRF(text vector + content FTS5)
+	// Text vector RRF + content phrase (2.5x) + exact keyword + fuzzy prefix
 	for i, res := range results {
 		scores[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
 	}
-	s.addContentFTSRRF(ctx, query, scores, rrfK)
+	s.addContentFTSPhraseRRF(ctx, query, scores)
+	s.addContentFTSRRF(ctx, query, scores)
+	s.addContentFTSFuzzyRRF(ctx, query, scores)
+
+	// Filename word-set match + URL-decode + multi-word coverage bonus + Levenshtein fuzzy
+	addFilenameBoosts(query, scores)
+	addFuzzyPathBoosts(query, scores)
 
 	out := make([]SearchResult, 0, len(scores))
 	for path, score := range scores {
@@ -958,12 +1069,13 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	}
 	sortResults(out)
 
-	log.Printf("Search total: %v", time.Since(t0))
+	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return out, nil
 }
 
 // ImageSearch performs search over image embeddings only.
 func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
+	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
 
@@ -972,11 +1084,11 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("image query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-	log.Printf("Search encode: %v", time.Since(t0))
+	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: imageCollection,
-		TopK:       10,
+		TopK:       50,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("image search failed: %w", err)
@@ -993,7 +1105,7 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 		out = append(out, SearchResult{Path: path, Score: res.Score})
 	}
 
-	log.Printf("Search total: %v", time.Since(t0))
+	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return out, nil
 }
 
@@ -1094,9 +1206,10 @@ func (s *Engine) GetFileHash(path string) (int64, error) {
 // FTS5 helpers
 // ---------------------------------------------------------------------------
 
-// addPathFTSScores queries the paths_fts table and adds matching path scores.
+// addPathFTSScores queries the paths_fts table for exact word matches and adds
+// RRF-normalized scores. Using rank position (not raw BM25 magnitude) keeps
+// this signal on the same scale as vector RRF contributions.
 func (s *Engine) addPathFTSScores(ctx context.Context, query string, scores map[string]float64, boost float64) {
-	// Convert query to FTS5 match expression: "word1" OR "word2" OR ...
 	words := strings.Fields(query)
 	if len(words) == 0 {
 		return
@@ -1108,27 +1221,137 @@ func (s *Engine) addPathFTSScores(ctx context.Context, query string, scores map[
 	ftsQuery := strings.Join(quoted, " OR ")
 
 	rows, err := s.sqlDB.QueryContext(ctx,
-		"SELECT path, rank FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
+		"SELECT path FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
 	if err != nil {
 		log.Printf("paths_fts search warning: %v", err)
 		return
 	}
 	defer rows.Close()
 
+	rankPos := 1
 	for rows.Next() {
 		var path string
-		var rank float64
-		if err := rows.Scan(&path, &rank); err != nil {
+		if err := rows.Scan(&path); err != nil {
 			continue
 		}
-		// FTS5 rank is negative (lower = better), convert to positive score
-		scores[path] += boost * (-rank)
+		scores[path] += boost / (rrfK + float64(rankPos))
+		rankPos++
 	}
 }
 
-// addContentFTSRRF queries sqvect's chunks_fts table for content keyword matches
-// and adds rank-based RRF scores to the provided scores map.
-func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[string]float64, rrfK float64) {
+// addPathFTSAllWords queries paths_fts requiring ALL query words to be present
+// (FTS5 implicit AND semantics). This is only useful for multi-word queries and
+// gives a strong boost to paths like "Albert%20Camus.png" over "Albert.txt".
+func (s *Engine) addPathFTSAllWords(ctx context.Context, query string, scores map[string]float64, boost float64) {
+	words := strings.Fields(query)
+	if len(words) < 2 {
+		return // AND is only meaningful for multi-word queries
+	}
+	quoted := make([]string, len(words))
+	for i, w := range words {
+		quoted[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+	}
+	// Space-separated = implicit AND in FTS5
+	ftsQuery := strings.Join(quoted, " ")
+
+	rows, err := s.sqlDB.QueryContext(ctx,
+		"SELECT path FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
+	if err != nil {
+		log.Printf("paths_fts AND search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	rankPos := 1
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		scores[path] += boost / (rrfK + float64(rankPos))
+		rankPos++
+	}
+}
+
+// addPathFTSPrefixScores queries paths_fts with FTS5 prefix syntax ("word"*)
+// to match partial query terms. Handles mid-typing and abbreviated filenames.
+func (s *Engine) addPathFTSPrefixScores(ctx context.Context, query string, scores map[string]float64, boost float64) {
+	words := strings.Fields(query)
+	prefixed := make([]string, 0, len(words))
+	for _, w := range words {
+		if len(w) >= 2 {
+			prefixed = append(prefixed, `"`+strings.ReplaceAll(w, `"`, `""`)+`"*`)
+		}
+	}
+	if len(prefixed) == 0 {
+		return
+	}
+	ftsQuery := strings.Join(prefixed, " OR ")
+
+	rows, err := s.sqlDB.QueryContext(ctx,
+		"SELECT path FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
+	if err != nil {
+		log.Printf("paths_fts prefix search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	rankPos := 1
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		scores[path] += boost / (rrfK + float64(rankPos))
+		rankPos++
+	}
+}
+
+// addPathFTSShortPrefixScores uses the first 3 characters of each query word as
+// an FTS5 prefix anchor. This bridges transposition typos that the full-word
+// prefix query cannot: "albret"[:3]="alb" matches "albert", "album", etc.;
+// "camuls"[:3]="cam" matches "camus", "camel", etc. Uses AND semantics
+// (space-separated terms) so multi-word queries require all anchors to appear.
+func (s *Engine) addPathFTSShortPrefixScores(ctx context.Context, query string, scores map[string]float64, boost float64) {
+	words := strings.Fields(strings.ToLower(query))
+	anchors := make([]string, 0, len(words))
+	for _, w := range words {
+		if len(w) < 3 {
+			continue
+		}
+		escaped := strings.ReplaceAll(w[:3], `"`, `""`)
+		anchors = append(anchors, `"`+escaped+`"*`)
+	}
+	if len(anchors) == 0 {
+		return
+	}
+	// AND semantics: all anchors must be present in the path
+	ftsQuery := strings.Join(anchors, " ")
+
+	rows, err := s.sqlDB.QueryContext(ctx,
+		"SELECT path FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
+	if err != nil {
+		log.Printf("paths_fts short-prefix search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	rankPos := 1
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		scores[path] += boost / (rrfK + float64(rankPos))
+		rankPos++
+	}
+}
+
+// addContentFTSRRF queries sqvect's chunks_fts table for content keyword matches.
+// Documents are scored by the average BM25 of their top contentTopK chunks (k-MAX):
+// respects IDF like pure MAX but rewards documents with multiple strong matches.
+// Aggregation is done in Go because bm25() cannot be used inside SQLite CTEs.
+func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[string]float64) {
 	words := strings.Fields(query)
 	if len(words) == 0 {
 		return
@@ -1140,11 +1363,12 @@ func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[
 	ftsQuery := strings.Join(quoted, " OR ")
 
 	rows, err := s.sqlDB.QueryContext(ctx, `
-		SELECT json_extract(e.metadata, '$.path')
+		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
 		FROM chunks_fts
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
 		WHERE chunks_fts MATCH ?
 		ORDER BY bm25(chunks_fts)
+		LIMIT 1000
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts search warning: %v", err)
@@ -1152,24 +1376,338 @@ func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[
 	}
 	defer rows.Close()
 
-	rank := 1
-	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
+	docScores := topKAvg(rows, contentTopK)
+	applyDocRRF(docScores, scores, contentKeywordBoost)
+}
+
+// addContentFTSPhraseRRF queries content for the query as an FTS5 phrase
+// (words adjacent, in order). Documents are scored by top-K chunk average (k-MAX).
+// Only runs for multi-word queries.
+func (s *Engine) addContentFTSPhraseRRF(ctx context.Context, query string, scores map[string]float64) {
+	words := strings.Fields(query)
+	if len(words) < 2 {
+		return
+	}
+	escaped := strings.ReplaceAll(query, `"`, `""`)
+	ftsQuery := `"` + escaped + `"`
+
+	rows, err := s.sqlDB.QueryContext(ctx, `
+		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
+		FROM chunks_fts
+		JOIN embeddings e ON chunks_fts.rowid = e.rowid
+		WHERE chunks_fts MATCH ?
+		ORDER BY bm25(chunks_fts)
+		LIMIT 500
+	`, ftsQuery)
+	if err != nil {
+		log.Printf("chunks_fts phrase search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	docScores := topKAvg(rows, contentTopK)
+	applyDocRRF(docScores, scores, contentPhraseBoost)
+}
+
+// addContentFTSFuzzyRRF runs a short-prefix content FTS5 query using 3-char
+// anchors. A chunk containing "Albert" and "Camus" is found by "alb"* AND "cam"*
+// even when the query is "albret camuls". Weighted at 0.8x to stay below the
+// exact-keyword signal but above noise.
+func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores map[string]float64) {
+	words := strings.Fields(strings.ToLower(query))
+	anchors := make([]string, 0, len(words))
+	for _, w := range words {
+		if len(w) < 3 {
 			continue
 		}
-		scores[path] += 1.0 / (rrfK + float64(rank))
-		rank++
+		escaped := strings.ReplaceAll(w[:3], `"`, `""`)
+		anchors = append(anchors, `"`+escaped+`"*`)
+	}
+	if len(anchors) == 0 {
+		return
+	}
+	ftsQuery := strings.Join(anchors, " ") // AND semantics
+
+	rows, err := s.sqlDB.QueryContext(ctx, `
+		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
+		FROM chunks_fts
+		JOIN embeddings e ON chunks_fts.rowid = e.rowid
+		WHERE chunks_fts MATCH ?
+		ORDER BY bm25(chunks_fts)
+		LIMIT 500
+	`, ftsQuery)
+	if err != nil {
+		log.Printf("chunks_fts fuzzy search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	docScores := topKAvg(rows, contentTopK)
+	applyDocRRF(docScores, scores, contentFuzzyBoost)
+}
+
+// topKAvg reads (path, score) rows, keeps the top-k scores per document,
+// and returns a map of path → average of those top-k scores.
+// rows must be ordered best-first (ORDER BY bm25 ASC, since bm25 is negative).
+func topKAvg(rows *sql.Rows, k int) map[string]float64 {
+	type docAcc struct {
+		sum   float64
+		count int
+	}
+	acc := make(map[string]*docAcc)
+	counts := make(map[string]int) // total chunks seen per doc (for top-k gating)
+	for rows.Next() {
+		var path string
+		var score float64
+		if err := rows.Scan(&path, &score); err != nil {
+			continue
+		}
+		counts[path]++
+		if counts[path] > k {
+			continue // already have k chunks for this doc
+		}
+		d := acc[path]
+		if d == nil {
+			d = &docAcc{}
+			acc[path] = d
+		}
+		d.sum += score
+		d.count++
+	}
+	result := make(map[string]float64, len(acc))
+	for path, d := range acc {
+		if d.count > 0 {
+			result[path] = d.sum / float64(d.count)
+		}
+	}
+	return result
+}
+
+// applyDocRRF sorts documents by their aggregated score, then applies RRF
+// (boost / (rrfK + rank)) to the shared scores map.
+func applyDocRRF(docScores map[string]float64, scores map[string]float64, boost float64) {
+	type entry struct {
+		path  string
+		score float64
+	}
+	ranked := make([]entry, 0, len(docScores))
+	for path, score := range docScores {
+		ranked = append(ranked, entry{path, score})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].score > ranked[j].score
+	})
+	for i, e := range ranked {
+		scores[e.path] += boost / (rrfK + float64(i+1))
+	}
+}
+
+// addFilenameBoosts applies score bonuses based on how many query words appear
+// in the filename. Filenames are URL-decoded ("Albert%20Camus.png" → "Albert Camus.png")
+// and split into words so multi-word coverage is measured correctly.
+//
+// Scoring:
+//   - All query words present in filename words → +0.6 (full-name exact match)
+//   - Per matched word: exact → +0.30, prefix → +0.10, substring → +0.04
+//   - Multi-word coverage bonus: +0.30 × (matched − 1) for each word beyond first
+//
+// This ensures "Albert Camus.txt" and "Albert%20Camus.png" (both words) rank
+// above "Albert.txt" (one word) for the query "Albert Camus".
+func addFilenameBoosts(query string, scores map[string]float64) {
+	queryWords := splitWords(query)
+	if len(queryWords) == 0 {
+		return
+	}
+
+	for path := range scores {
+		rawName := filepath.Base(path)
+		// URL-decode so "Albert%20Camus.png" becomes "Albert Camus.png"
+		if decoded, err := url.PathUnescape(rawName); err == nil {
+			rawName = decoded
+		}
+		name := strings.ToLower(rawName)
+		ext := filepath.Ext(name)
+		nameNoExt := strings.TrimSuffix(name, ext)
+		nameWords := splitWords(nameNoExt)
+
+		// Build a set of filename words for O(1) lookup
+		nameWordSet := make(map[string]bool, len(nameWords))
+		for _, nw := range nameWords {
+			nameWordSet[nw] = true
+		}
+
+		// Per-word matching: score each query word against all filename words.
+		// filenameMultiWordBonus scales with (matched-1) so that files sharing more
+		// query words always rank higher than files sharing fewer — no flat ceiling.
+		matched := 0
+		for _, qw := range queryWords {
+			if len(qw) < 2 {
+				continue
+			}
+			for _, nw := range nameWords {
+				if nw == qw {
+					scores[path] += filenameWordBoost
+					matched++
+					break
+				} else if strings.HasPrefix(nw, qw) || strings.HasPrefix(qw, nw) {
+					scores[path] += filenamePrefixBoost
+					matched++
+					break
+				} else if strings.Contains(nw, qw) || strings.Contains(qw, nw) {
+					scores[path] += filenameSubstrBoost
+					matched++
+					break
+				}
+			}
+		}
+		// Coverage bonus: grows with number of matched words, rewarding files whose
+		// names share more of the query (e.g. "Albert Camus.jpg" vs "Albert.txt").
+		if matched >= 2 {
+			scores[path] += filenameMultiWordBonus * float64(matched-1)
+		}
+	}
+}
+
+// computeTrigrams returns the set of character 3-grams for s.
+func computeTrigrams(s string) map[string]struct{} {
+	tg := make(map[string]struct{}, len(s))
+	for i := 0; i+3 <= len(s); i++ {
+		tg[s[i:i+3]] = struct{}{}
+	}
+	return tg
+}
+
+// trigramJaccard returns the Jaccard similarity (0–1) between two trigram sets.
+func trigramJaccard(a, b map[string]struct{}) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	intersection := 0
+	for t := range a {
+		if _, ok := b[t]; ok {
+			intersection++
+		}
+	}
+	union := len(a) + len(b) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+// splitWords tokenises a filename or query into lowercase word tokens,
+// splitting on separators common in file paths (space, dash, underscore, dot, slash).
+func splitWords(s string) []string {
+	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' ' || r == '/'
+	})
+}
+
+// levenshtein returns the edit distance between a and b.
+func levenshtein(a, b string) int {
+	if a == b {
+		return 0
+	}
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i, ca := range a {
+		curr[0] = i + 1
+		for j, cb := range b {
+			cost := 1
+			if ca == cb {
+				cost = 0
+			}
+			del := curr[j] + 1
+			ins := prev[j+1] + 1
+			sub := prev[j] + cost
+			if del < ins {
+				if del < sub {
+					curr[j+1] = del
+				} else {
+					curr[j+1] = sub
+				}
+			} else {
+				if ins < sub {
+					curr[j+1] = ins
+				} else {
+					curr[j+1] = sub
+				}
+			}
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
+}
+
+// wordEditSim returns 1 - normalised Levenshtein distance (range 0–1).
+// "albret" vs "albert" → 0.67; "camuls" vs "camus" → 0.83.
+func wordEditSim(a, b string) float64 {
+	dist := levenshtein(a, b)
+	maxLen := len(a)
+	if len(b) > maxLen {
+		maxLen = len(b)
+	}
+	if maxLen == 0 {
+		return 1.0
+	}
+	return 1.0 - float64(dist)/float64(maxLen)
+}
+
+// addFuzzyPathBoosts applies word-level edit-distance similarity between each
+// query word and each word in the candidate filename. Full-string trigrams miss
+// transposition typos like "albret"→"albert"; word-level Levenshtein catches them.
+func addFuzzyPathBoosts(query string, scores map[string]float64) {
+	if len(scores) == 0 {
+		return
+	}
+	queryWords := splitWords(query)
+	if len(queryWords) == 0 {
+		return
+	}
+
+	for path := range scores {
+		pathWords := splitWords(filepath.Base(path))
+		if len(pathWords) == 0 {
+			continue
+		}
+		totalSim := 0.0
+		for _, qw := range queryWords {
+			if len(qw) < 3 {
+				continue
+			}
+			best := 0.0
+			for _, pw := range pathWords {
+				if len(pw) < 3 {
+					continue
+				}
+				if sim := wordEditSim(qw, pw); sim > best {
+					best = sim
+				}
+			}
+			totalSim += best
+		}
+		avgSim := totalSim / float64(len(queryWords))
+		if avgSim >= fuzzyMinWordSim {
+			scores[path] += fuzzyPathBoost * avgSim
+		}
 	}
 }
 
 // sortResults sorts SearchResults by score descending.
 func sortResults(results []SearchResult) {
-	for i := 1; i < len(results); i++ {
-		for j := i; j > 0 && results[j].Score > results[j-1].Score; j-- {
-			results[j], results[j-1] = results[j-1], results[j]
-		}
-	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 }
 
 // findOnnxRuntime locates onnxruntime.dll by checking:

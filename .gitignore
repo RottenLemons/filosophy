@@ -77,6 +77,7 @@ test.ipynb
 check_dll.py
 =======
 *.bin
+.claude/**
 kreuzberg-ffi/**
 .indexed
 >>>>>>> main
