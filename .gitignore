@@ -8,5 +8,6 @@ text/**
 native/**
 test.ipynb
 *.bin
+.claude/**
 kreuzberg-ffi/**
 .indexed
