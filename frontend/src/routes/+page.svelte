@@ -1,8 +1,9 @@
 <script>
   import SearchIcon from "carbon-icons-svelte/lib/Search.svelte";
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
-  import Button from "$lib/components/Button.svelte";
   import Input from "$lib/components/Input.svelte";
+  // Assuming Button might not be used if we strictly follow code.html, but let's keep it if needed.
+  // Actually code.html uses a standard <button> for filter.
 
   let searchQuery = "";
   let selectedFile = null;
@@ -13,11 +14,10 @@
     if (!searchQuery.trim()) return;
     searching = true;
     try {
-      // Assuming the Go backend method is bound to window.go.main.App.Search
       const result = await window.go.main.App.Search(searchQuery);
       files = result || [];
       if (files.length > 0) {
-        selectedFile = files[0]; // Auto-select first result for better flow
+        selectedFile = files[0];
       } else {
         selectedFile = null;
       }
@@ -34,122 +34,142 @@
       handleSearch();
     }
   }
+
+  function formatBytes(bytes, decimals = 2) {
+      if (!+bytes) return '0 Bytes'
+      const k = 1024
+      const dm = decimals < 0 ? 0 : decimals
+      const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+      const i = Math.floor(Math.log(bytes) / Math.log(k))
+      return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
+  }
 </script>
 
-<div class="relative min-h-screen flex text-md-on-background overflow-hidden">
+<div class="h-screen flex flex-col bg-surface text-on-surface overflow-hidden">
   
-  <!-- Atmospheric Background Decor (MD3 Signature) -->
-  <div class="absolute top-0 right-0 w-[800px] h-[800px] bg-md-secondary-container/30 blur-[100px] rounded-full mix-blend-multiply translate-x-1/3 -translate-y-1/3 pointer-events-none z-0"></div>
-  <div class="absolute bottom-0 left-[20%] w-[600px] h-[600px] bg-md-primary/10 blur-[80px] rounded-full mix-blend-multiply pointer-events-none z-0"></div>
+  <!-- Header -->
+  <header class="bg-surface text-on-surface flex justify-between items-center w-full px-6 py-4 z-50">
+    <div class="flex items-center">
+      <h1 class="text-2xl font-bold tracking-tight font-headline">Filosophy</h1>
+    </div>
+  </header>
 
-  <!-- Sidebar (Surface Container) -->
-  <aside class="relative z-10 w-96 flex-shrink-0 flex flex-col bg-md-surface-container border-r border-md-outline/10 shadow-md-sm">
-    <!-- Header -->
-    <div class="p-6 md-lg:p-8 flex flex-col gap-4 border-b border-md-outline/10 z-20 bg-md-surface-container">
-      <h2 class="text-[2rem] font-medium leading-tight text-md-on-background">File Search</h2>
-      
-      <div class="flex flex-col gap-3 mt-2">
-        <Input 
-          bind:value={searchQuery} 
-          placeholder="Search file contents..." 
-          on:keyup={onKeyUp}
-        >
-          <div slot="leadingIcon">
-            <SearchIcon size={20} />
-          </div>
-        </Input>
+  <main class="flex-1 flex overflow-hidden">
+    
+    <!-- Main Search Content -->
+    <div class="flex-1 overflow-y-auto px-8 py-12 flex flex-col items-center scrollbar-custom">
+      <div class="w-full max-w-3xl space-y-12">
         
-        <Button 
-          variant="primary" 
-          disabled={searching} 
-          on:click={handleSearch}
-          class="w-full"
-        >
-          {searching ? 'Searching...' : 'Search Files'}
-        </Button>
+        <!-- Search Section -->
+        <div class="space-y-6">
+          <div class="flex items-end gap-4 w-full border-b border-outline-variant focus-within:border-primary-container transition-all duration-300 pb-2">
+            <div class="pb-1 text-outline">
+                <SearchIcon size={24} />
+            </div>
+            <input 
+              bind:value={searchQuery}
+              on:keyup={onKeyUp}
+              class="flex-1 bg-transparent border-none focus:ring-0 text-2xl font-headline placeholder:text-outline/40 pb-1 outline-none" 
+              placeholder="Search the archive..." 
+              type="text"
+            />
+            <button class="flex items-center gap-2 px-4 py-2 border border-on-surface hover:bg-surface-container-low transition-colors font-label text-xs uppercase tracking-widest group disabled:opacity-50" on:click={handleSearch} disabled={searching}>
+              <span>{searching ? 'Wait' : 'Filter'}</span>
+              <svg class="w-4 h-4 group-hover:rotate-180 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+            </button>
+          </div>
+          
+          <!-- Filter Badges -->
+          <div class="flex flex-wrap gap-3">
+            <div class="bg-on-surface text-surface px-3 py-1 flex items-center gap-2">
+              <span class="font-label text-[10px] uppercase tracking-tighter">Query</span>
+              <span class="font-label text-[10px] font-bold">ALL</span>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Results List -->
+        <div class="space-y-1">
+          <div class="font-label text-[10px] uppercase tracking-widest text-secondary mb-4 flex justify-between">
+            <span>{files.length} Records Found</span>
+            <span>Sorted by relevance</span>
+          </div>
+          
+          {#if files.length > 0}
+            <div class="flex flex-col gap-1 relative z-20">
+              {#each files as file, i (file)}
+                <!-- svelte-ignore a11y-click-events-have-key-events - Result Card -->
+                <div 
+                  class="group relative flex items-center justify-between p-6 cursor-pointer transition-all duration-200
+                         {selectedFile === file ? 'bg-surface-container-lowest border-l-4 border-primary-container' : 'hover:bg-surface-container-low border-l-4 border-transparent hover:border-outline-variant'}"
+                  on:click={() => selectedFile = file}
+                  style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 20}ms; opacity: 0; transform: translateY(10px);"
+                >
+                  <div class="flex gap-6">
+                    <div class="w-12 h-12 flex items-center justify-center {selectedFile === file ? 'bg-primary-container/10' : 'bg-on-surface/5'}">
+                      <div class={selectedFile === file ? 'text-primary' : 'text-secondary'}>
+                        <DocumentIcon size={24} />
+                      </div>
+                    </div>
+                    <div class="space-y-1">
+                      <h3 class="text-lg font-headline font-medium text-on-surface">{file.split('/').pop() || file.split('\\').pop() || file}</h3>
+                      <p class="font-label text-[11px] text-secondary tracking-tight">{file}</p>
+                      <div class="flex gap-4 pt-2">
+                        <span class="font-label text-[10px] uppercase {selectedFile === file ? 'text-primary font-bold' : 'text-secondary'}">DOC</span>
+                        <span class="font-label text-[10px] text-secondary">Accessed recently</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {:else if searchQuery.trim() !== ''}
+             <div class="p-8 text-center text-secondary font-headline italic">No relevant documents found.</div>
+          {/if}
+        </div>
+        
       </div>
     </div>
-
-    <!-- Results List -->
-    <div class="flex-1 overflow-y-auto w-full p-4 custom-scrollbar">
-      {#if files.length > 0}
-        <ul class="flex flex-col gap-2 relative z-20">
-          {#each files as file (file)}
-            <!-- svelte-ignore a11y-click-events-have-key-events - File Item (Tonal Card) -->
-            <li 
-              class="group flex items-center gap-3 p-4 rounded-md-large cursor-pointer transition-all duration-300 ease-md-emphasized 
-                     {selectedFile === file ? 'bg-md-primary-container text-md-on-primary-container shadow-md-sm' : 'hover:bg-md-primary/10 hover:shadow-md-sm text-md-on-surface'}"
-              on:click={() => selectedFile = file}
-            >
-              <div class="flex-shrink-0 transition-transform duration-300 ease-md-emphasized group-hover:scale-110 group-active:scale-95 {selectedFile === file ? 'text-md-primary' : 'text-md-on-surface-variant'}">
-                <DocumentIcon size={20} />
-              </div>
-              <span class="text-sm font-medium truncate flex-1">{file}</span>
-            </li>
-          {/each}
-        </ul>
-      {:else if searchQuery.trim() !== ''}
-        <div class="flex flex-col items-center justify-center h-full opacity-60 relative z-20">
-          <div class="mb-4 bg-md-secondary-container p-4 rounded-full text-md-on-secondary-container">
-            <SearchIcon size={32} />
-          </div>
-          <p class="text-base font-medium text-md-on-surface-variant">No results found</p>
-        </div>
-      {:else}
-        <div class="flex flex-col items-center justify-center h-full opacity-60 relative z-20">
-          <div class="mb-4 bg-md-primary/10 p-4 rounded-full text-md-primary">
-            <SearchIcon size={32} />
-          </div>
-          <p class="text-base font-medium text-md-on-surface-variant text-center px-4">Enter a search query to find files</p>
-        </div>
-      {/if}
-    </div>
-  </aside>
-
-  <!-- Detail View (Main Surface) -->
-  <main class="relative z-10 flex-1 flex flex-col p-6 md:p-8 overflow-y-auto">
+    
+    <!-- Document Viewer Side Panel -->
     {#if selectedFile}
-      <div class="bg-md-surface-container-low rounded-md-2xl shadow-md-sm p-8 flex-1 flex flex-col ring-1 ring-md-outline/5 transition-all duration-300 ease-md-emphasized hover:shadow-md-lg">
-        <div class="flex items-center gap-4 mb-8">
-          <div class="bg-md-primary-container text-md-on-primary-container p-3 rounded-full flex-shrink-0">
-             <DocumentIcon size={24} />
+      <aside class="w-[500px] bg-surface-container-low border-l border-outline-variant flex flex-col transition-all duration-300 transform translate-x-0">
+        <div class="flex-1 overflow-y-auto p-10 space-y-8 bg-surface scrollbar-custom border-l border-outline-variant shadow-none">
+          <header class="space-y-4">
+            <div class="font-label text-[10px] text-primary uppercase font-bold tracking-[0.2em]">Document Preview</div>
+            <h2 class="text-3xl font-headline font-bold leading-tight truncate">{selectedFile.split('/').pop() || selectedFile.split('\\').pop() || selectedFile}</h2>
+            
+            <div class="flex gap-6 border-y border-outline-variant py-4">
+              <div class="space-y-1">
+                <div class="font-label text-[9px] text-secondary uppercase">Path</div>
+                <div class="font-headline text-sm truncate max-w-[200px]" title={selectedFile}>{selectedFile}</div>
+              </div>
+              <div class="space-y-1">
+                <div class="font-label text-[9px] text-secondary uppercase">Status</div>
+                <div class="font-headline text-sm">Indexed</div>
+              </div>
+            </div>
+          </header>
+          
+          <div class="space-y-6 font-headline text-lg leading-relaxed text-on-surface opacity-50 text-center py-20">
+            <DocumentIcon size={48} class="mx-auto text-secondary mb-4 opacity-30" />
+            <p>File content preview will be loaded here.</p>
           </div>
-          <h3 class="text-2xl font-medium truncate max-w-full text-md-on-background">{selectedFile}</h3>
         </div>
-        
-        <div class="flex-1 bg-md-background rounded-md-large p-6 border border-md-outline/10 font-mono text-sm text-md-on-surface-variant overflow-y-auto shadow-inner relative">
-           <div class="absolute inset-x-0 top-0 h-4 bg-gradient-to-b from-black/5 to-transparent pointer-events-none rounded-t-md-large"></div>
-          <!-- TODO: implement file content preview inside here -->
-          <div class="flex flex-col items-center justify-center h-full opacity-50">
-             <p>File content preview will be loaded here.</p>
-          </div>
-        </div>
-      </div>
-    {:else}
-      <div class="flex-1 flex flex-col items-center justify-center opacity-70">
-        <div class="mb-6 bg-md-surface-container shadow-md-base p-6 rounded-[2rem] text-md-primary transform transition-transform duration-500 hover:scale-105 hover:rotate-3">
-          <DocumentIcon size={48} />
-        </div>
-        <p class="text-xl font-medium text-md-on-surface-variant mb-2">Select a file</p>
-        <p class="text-sm text-md-outline text-center max-w-xs">Click on any file in the sidebar to view its contents right here.</p>
-      </div>
+      </aside>
     {/if}
   </main>
 </div>
 
 <style>
-  /* Custom scrollbar to match MD3 aesthetics */
-  .custom-scrollbar::-webkit-scrollbar {
-    width: 6px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: theme('colors.md.outline-variant');
-    border-radius: 9999px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: theme('colors.md.outline');
+  :global(.scrollbar-custom::-webkit-scrollbar) { width: 4px; }
+  :global(.scrollbar-custom::-webkit-scrollbar-track) { background: #FAF5F5; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #C3C5D9; }
+
+  @keyframes slideFadeIn {
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 </style>
