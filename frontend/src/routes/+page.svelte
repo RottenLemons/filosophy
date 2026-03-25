@@ -1,172 +1,406 @@
 <script>
+  import { slide } from 'svelte/transition';
   import SearchIcon from "carbon-icons-svelte/lib/Search.svelte";
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
-  import Input from "$lib/components/Input.svelte";
-  // Assuming Button might not be used if we strictly follow code.html, but let's keep it if needed.
-  // Actually code.html uses a standard <button> for filter.
+  import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
+  import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
+  import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
+  import ThemeToggle from '$lib/components/ThemeToggle.svelte';
 
+  /** @type {string} */
   let searchQuery = "";
+  /** @type {any} */
   let selectedFile = null;
+  /** @type {any[]} */
   let files = [];
+  /** @type {boolean} */
   let searching = false;
 
-  async function handleSearch() {
-    if (!searchQuery.trim()) return;
-    searching = true;
-    try {
-      const result = await window.go.main.App.Search(searchQuery);
-      files = result || [];
-      if (files.length > 0) {
-        selectedFile = files[0];
-      } else {
-        selectedFile = null;
+  let isFilterOpen = false;
+  let filterType = 'PDF'; // Options: 'All', 'PDF', 'DOCX', 'TXT'
+  let filterDate = 'Last 30 Days'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
+  let filterSize = '> 1 MB'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '> 10 MB'
+
+  $: { filterType; filterDate; filterSize; debouncedSearch(); }
+
+  /** @param {HTMLElement} node */
+  function clickOutside(node) {
+    /** @param {MouseEvent} event */
+    const handleClick = (/** @type {MouseEvent} */ event) => {
+      const target = /** @type {Node} */ (event.target);
+      if (node && !node.contains(target) && !event.defaultPrevented) {
+        node.dispatchEvent(new CustomEvent('click_outside', { detail: node }));
       }
-    } catch (error) {
-      console.error("Search failed:", error);
+    }
+    document.addEventListener('click', handleClick, true);
+    return { destroy() { document.removeEventListener('click', handleClick, true); } }
+  }
+
+  /** @type {any} */
+  let searchTimeout;
+
+  function debouncedSearch() {
+    clearTimeout(searchTimeout);
+    
+    if (!searchQuery.trim()) {
       files = [];
       selectedFile = null;
+      searching = false;
+      return;
     }
-    searching = false;
+
+    searching = true;
+    searchTimeout = setTimeout(async () => {
+      try {
+        const result = await Search(searchQuery);
+        files = result || [];
+        // Auto-select first result if desired, but user wants full-width search by default
+        selectedFile = null; 
+      } catch (error) {
+        console.error("Search failed:", error);
+        files = [];
+        selectedFile = null;
+      }
+      searching = false;
+    }, 300);
   }
 
+  /** @param {KeyboardEvent} e */
   function onKeyUp(e) {
     if (e.key === "Enter") {
-      handleSearch();
+      clearTimeout(searchTimeout);
+      if (!searchQuery.trim()) {
+        files = [];
+        selectedFile = null;
+        return;
+      }
+      searching = true;
+      Search(searchQuery).then(result => {
+        files = result || [];
+        selectedFile = null;
+        searching = false;
+      }).catch(error => {
+        console.error("Search failed:", error);
+        files = [];
+        selectedFile = null;
+        searching = false;
+      });
     }
   }
 
-  function formatBytes(bytes, decimals = 2) {
-      if (!+bytes) return '0 Bytes'
-      const k = 1024
-      const dm = decimals < 0 ? 0 : decimals
-      const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
-      const i = Math.floor(Math.log(bytes) / Math.log(k))
-      return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
+  /** @param {number} score */
+  function formatScore(score) {
+    let percentage = Math.round(score * 100);
+    if (percentage < 1) percentage = 1;
+    if (percentage > 100) percentage = 100;
+    return percentage + "%";
+  }
+
+  /** @param {number} bytes */
+  function formatSize(bytes) {
+    if (bytes === 0 || !bytes) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  }
+
+  /** @param {string} isoString */
+  function formatDate(isoString) {
+    if (!isoString) return 'Unknown';
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return 'Unknown';
+    return d.toLocaleDateString();
+  }
+
+  /** @param {string} path */
+  function getFileType(path) {
+    if (!path) return 'DOC';
+    const parts = path.split('.');
+    if (parts.length > 1) {
+      return (parts.pop() || '').toUpperCase();
+    }
+    return 'DOC';
+  }
+
+  /** @param {string} path */
+  function getFileName(path) {
+    if (!path) return "";
+    return path.split(/[/\\]/).pop();
+  }
+
+  /** @param {string} path */
+  function getFileCategory(path) {
+    if (!path) return 'other';
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    if (['pdf'].includes(ext)) return 'pdf';
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) return 'image';
+    if (['txt', 'md', 'csv', 'json', 'log'].includes(ext)) return 'text';
+    return 'other';
+  }
+
+  let textContent = "";
+  $: if (selectedFile && selectedFile.Path && getFileCategory(selectedFile.Path) === 'text') {
+    fetch('/loadfile/' + encodeURIComponent(selectedFile.Path || ''))
+      .then(res => res.text())
+      .then(text => textContent = text)
+      .catch(err => {
+        console.error("Failed to load text:", err);
+        textContent = "Error loading document.";
+      });
+  } else {
+    textContent = "";
   }
 </script>
 
-<div class="h-screen flex flex-col bg-surface text-on-surface overflow-hidden">
+<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-black text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
+  <ThemeToggle />
   
   <!-- Header -->
-  <header class="bg-surface text-on-surface flex justify-between items-center w-full px-6 py-4 z-50">
-    <div class="flex items-center">
-      <h1 class="text-2xl font-bold tracking-tight font-headline">Filosophy</h1>
-    </div>
+  <header class="w-full px-12 py-6 z-50 shrink-0">
+    <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
   </header>
 
-  <main class="flex-1 flex overflow-hidden">
+  <main class="flex-1 flex overflow-hidden dark:bg-[#0a0a0a]">
     
-    <!-- Main Search Content -->
-    <div class="flex-1 overflow-y-auto px-8 py-12 flex flex-col items-center scrollbar-custom">
-      <div class="w-full max-w-3xl space-y-12">
+    <!-- Main Search Content (Left Column) -->
+    <!-- flex-1 ensures it fills all available space when sidebar is unmounted -->
+    <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#222] transition-all duration-300">
+      <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
         <!-- Search Section -->
-        <div class="space-y-6">
-          <div class="flex items-end gap-4 w-full border-b border-outline-variant focus-within:border-primary-container transition-all duration-300 pb-2">
-            <div class="pb-1 text-outline">
-                <SearchIcon size={24} />
+        <div class="space-y-4">
+          <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#222] pb-3 transition-colors focus-within:border-blue-500">
+            <div class="text-gray-400">
+              <SearchIcon size={24} />
             </div>
             <input 
               bind:value={searchQuery}
+              on:input={debouncedSearch}
               on:keyup={onKeyUp}
-              class="flex-1 bg-transparent border-none focus:ring-0 text-2xl font-headline placeholder:text-outline/40 pb-1 outline-none" 
-              placeholder="Search the archive..." 
+              class="flex-1 bg-transparent border-none focus:ring-0 text-3xl font-serif placeholder:text-gray-200 dark:placeholder:text-gray-600 pb-1 outline-none text-slate-700 dark:text-gray-100" 
+              placeholder="Search the collection..." 
               type="text"
             />
-            <button class="flex items-center gap-2 px-4 py-2 border border-on-surface hover:bg-surface-container-low transition-colors font-label text-xs uppercase tracking-widest group disabled:opacity-50" on:click={handleSearch} disabled={searching}>
-              <span>{searching ? 'Wait' : 'Filter'}</span>
-              <svg class="w-4 h-4 group-hover:rotate-180 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-            </button>
+            <div class="relative" use:clickOutside on:click_outside={() => isFilterOpen = false}>
+              <button 
+                on:click={() => isFilterOpen = !isFilterOpen}
+                class="flex items-center gap-2 px-3 py-1.5 border border-gray-300 dark:border-[#222] hover:border-gray-400 text-gray-600 dark:text-gray-400 transition-colors text-[10px] font-semibold uppercase tracking-widest disabled:opacity-50 rounded-none bg-white dark:bg-[#111]" 
+                disabled={searching}
+              >
+                <span>Filter</span>
+                <svg class="w-3 h-3 pt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+              </button>
+
+              {#if isFilterOpen}
+                <div class="absolute right-0 top-full mt-2 w-72 bg-white dark:bg-[#0a0a0a] border border-gray-200 dark:border-[#333] shadow-xl z-50 rounded-none p-4 flex flex-col gap-6" transition:slide={{ duration: 150 }}>
+                  <!-- Type Filter -->
+                  <div class="space-y-2">
+                    <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Type</span>
+                    <div class="grid grid-cols-2 gap-1">
+                      {#each ['All', 'PDF', 'DOCX', 'TXT'] as type}
+                        <button 
+                          on:click={() => filterType = type}
+                          class="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider transition-colors rounded-none
+                                 {filterType === type ? 'bg-slate-900 text-white font-bold dark:bg-white dark:text-black' : 'hover:bg-gray-100 dark:hover:bg-[#222] text-gray-600 dark:text-gray-400 border border-transparent'}"
+                        >
+                          {type}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+
+                  <!-- Date Filter -->
+                  <div class="space-y-2">
+                    <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Timeframe</span>
+                    <div class="flex flex-col gap-1">
+                      {#each ['Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'] as date}
+                        <button 
+                          on:click={() => filterDate = date}
+                          class="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider transition-colors rounded-none
+                                 {filterDate === date ? 'bg-slate-900 text-white font-bold dark:bg-white dark:text-black' : 'hover:bg-gray-100 dark:hover:bg-[#222] text-gray-600 dark:text-gray-400 border border-transparent'}"
+                        >
+                          {date}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+
+                  <!-- Size Filter -->
+                  <div class="space-y-2">
+                    <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Size</span>
+                    <div class="flex flex-col gap-1">
+                      {#each ['Any', '< 1 MB', '1 MB - 10 MB', '> 10 MB'] as size}
+                        <button 
+                          on:click={() => filterSize = size}
+                          class="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider transition-colors rounded-none
+                                 {filterSize === size ? 'bg-slate-900 text-white font-bold dark:bg-white dark:text-black' : 'hover:bg-gray-100 dark:hover:bg-[#222] text-gray-600 dark:text-gray-400 border border-transparent'}"
+                        >
+                          {size}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+                </div>
+              {/if}
+            </div>
           </div>
           
           <!-- Filter Badges -->
-          <div class="flex flex-wrap gap-3">
-            <div class="bg-on-surface text-surface px-3 py-1 flex items-center gap-2">
-              <span class="font-label text-[10px] uppercase tracking-tighter">Query</span>
-              <span class="font-label text-[10px] font-bold">ALL</span>
+          {#if (filterType !== 'All' || filterDate !== 'Anytime' || filterSize !== 'Any')}
+            <div class="flex flex-wrap gap-2 pt-1">
+              {#if filterType !== 'All'}
+                <div class="flex items-center gap-1.5 border px-2 py-1 bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-black dark:border-white rounded-none">
+                  <span class="text-[9px] font-bold uppercase tracking-widest">Type</span>
+                  <span class="text-[9px] font-bold uppercase tracking-widest opacity-80">{filterType}</span>
+                </div>
+              {/if}
+              {#if filterDate !== 'Anytime'}
+                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#222] rounded-none">
+                  <span class="text-[9px] font-bold uppercase tracking-widest">Date</span>
+                  <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterDate}</span>
+                </div>
+              {/if}
+              {#if filterSize !== 'Any'}
+                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#222] rounded-none">
+                  <span class="text-[9px] font-bold uppercase tracking-widest">Size</span>
+                  <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterSize}</span>
+                </div>
+              {/if}
             </div>
-          </div>
+          {/if}
         </div>
         
         <!-- Results List -->
-        <div class="space-y-1">
-          <div class="font-label text-[10px] uppercase tracking-widest text-secondary mb-4 flex justify-between">
-            <span>{files.length} Records Found</span>
-            <span>Sorted by relevance</span>
-          </div>
+        <div class="space-y-4 pt-4">
+          {#if files.length > 0}
+            <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#222]">
+              <span>{files.length} Records Found</span>
+              <span>Sorted by relevance</span>
+            </div>
+          {/if}
           
           {#if files.length > 0}
-            <div class="flex flex-col gap-1 relative z-20">
-              {#each files as file, i (file)}
+            <div class="flex flex-col gap-6 relative z-20">
+              {#each files as file, i (file.Path)}
                 <!-- svelte-ignore a11y-click-events-have-key-events - Result Card -->
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
                 <div 
-                  class="group relative flex items-center justify-between p-6 cursor-pointer transition-all duration-200
-                         {selectedFile === file ? 'bg-surface-container-lowest border-l-4 border-primary-container' : 'hover:bg-surface-container-low border-l-4 border-transparent hover:border-outline-variant'}"
+                  class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm
+                         {selectedFile === file ? 'bg-blue-50 border-blue-600 dark:bg-[#111] dark:border-l-white' : 'border-transparent hover:shadow hover:border-gray-200 dark:hover:border-[#222] hover:bg-white dark:hover:bg-[#111]'}"
                   on:click={() => selectedFile = file}
-                  style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 20}ms; opacity: 0; transform: translateY(10px);"
+                  on:dblclick={() => OpenFileNative(file.Path)}
+                  style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 15}ms; opacity: 0; transform: translateY(10px);"
                 >
-                  <div class="flex gap-6">
-                    <div class="w-12 h-12 flex items-center justify-center {selectedFile === file ? 'bg-primary-container/10' : 'bg-on-surface/5'}">
-                      <div class={selectedFile === file ? 'text-primary' : 'text-secondary'}>
+                  <div class="flex gap-6 items-start">
+                    <div class="w-12 h-12 shrink-0 flex items-center justify-center {selectedFile === file ? 'bg-blue-100 text-blue-600 dark:bg-[#1a1a1a] dark:text-gray-100' : 'bg-gray-100 dark:bg-[#1a1a1a] text-gray-400 dark:text-gray-500'}">
+                      {#if getFileCategory(file.Path) === 'image'}
+                        <ImageIcon size={24} />
+                      {:else if getFileCategory(file.Path) === 'pdf'}
+                        <PDFIcon size={24} />
+                      {:else}
                         <DocumentIcon size={24} />
-                      </div>
+                      {/if}
                     </div>
-                    <div class="space-y-1">
-                      <h3 class="text-lg font-headline font-medium text-on-surface">{file.split('/').pop() || file.split('\\').pop() || file}</h3>
-                      <p class="font-label text-[11px] text-secondary tracking-tight">{file}</p>
+                    <div class="space-y-1.5 mt-0.5">
+                      <h3 class="text-xl font-serif font-bold text-slate-800 dark:text-gray-100 leading-tight">{getFileName(file.Path)}</h3>
+                      <p class="text-[11px] text-gray-400 dark:text-gray-500 font-sans truncate max-w-sm">{file.Path}</p>
                       <div class="flex gap-4 pt-2">
-                        <span class="font-label text-[10px] uppercase {selectedFile === file ? 'text-primary font-bold' : 'text-secondary'}">DOC</span>
-                        <span class="font-label text-[10px] text-secondary">Accessed recently</span>
+                        <span class="text-[10px] font-bold uppercase tracking-widest {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-500'}">{getFileType(file.Path)}</span>
+                        <span class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-500">{formatSize(file.Size)}</span>
+                        <span class="text-[10px] font-semibold text-gray-400 dark:text-gray-500">Modified {formatDate(file.Modified)}</span>
                       </div>
                     </div>
+                  </div>
+                  <div class="flex flex-col items-end pr-4">
+                    <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
+                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
                   </div>
                 </div>
               {/each}
             </div>
           {:else if searchQuery.trim() !== ''}
-             <div class="p-8 text-center text-secondary font-headline italic">No relevant documents found.</div>
+             <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#222] border-dashed">No relevant documents found.</div>
           {/if}
         </div>
-        
       </div>
     </div>
     
-    <!-- Document Viewer Side Panel -->
+    <!-- Requirement: Master Layout Container Logic (Right Side) -->
+    <!-- Sidebar only mounts when selectedFile is truthy -->
     {#if selectedFile}
-      <aside class="w-[500px] bg-surface-container-low border-l border-outline-variant flex flex-col transition-all duration-300 transform translate-x-0">
-        <div class="flex-1 overflow-y-auto p-10 space-y-8 bg-surface scrollbar-custom border-l border-outline-variant shadow-none">
-          <header class="space-y-4">
-            <div class="font-label text-[10px] text-primary uppercase font-bold tracking-[0.2em]">Document Preview</div>
-            <h2 class="text-3xl font-headline font-bold leading-tight truncate">{selectedFile.split('/').pop() || selectedFile.split('\\').pop() || selectedFile}</h2>
+      <aside 
+        transition:slide={{ axis: 'x', duration: 400 }}
+        class="w-[40%] min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-white flex flex-col z-30 shadow-2xl relative overflow-hidden"
+      >
+        <div class="flex-1 overflow-y-auto p-12 space-y-10 scrollbar-custom">
+          <header class="space-y-6 relative">
+            <button 
+              class="absolute top-0 right-0 p-2 text-gray-400 hover:text-slate-900 transition-colors bg-[#FAF9F6] dark:bg-[#111] dark:hover:text-gray-100 rounded-full shadow-sm"
+              on:click={() => selectedFile = null}
+              aria-label="Close Preview"
+            >
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+              </svg>
+            </button>
+            <div class="font-bold text-[9px] text-blue-600 dark:text-gray-300 uppercase tracking-widest">Key Match Found</div>
+            <h2 class="text-4xl font-serif text-slate-900 dark:text-gray-100 font-bold leading-tight pr-12">{getFileName(selectedFile.Path)}</h2>
             
-            <div class="flex gap-6 border-y border-outline-variant py-4">
+            <div class="grid grid-cols-3 gap-6 border-y border-gray-200 dark:border-[#222] py-6">
               <div class="space-y-1">
-                <div class="font-label text-[9px] text-secondary uppercase">Path</div>
-                <div class="font-headline text-sm truncate max-w-[200px]" title={selectedFile}>{selectedFile}</div>
+                <div class="text-[8px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Type</div>
+                <div class="text-xs text-slate-800 dark:text-gray-100 font-semibold uppercase">{getFileType(selectedFile.Path)}</div>
               </div>
               <div class="space-y-1">
-                <div class="font-label text-[9px] text-secondary uppercase">Status</div>
-                <div class="font-headline text-sm">Indexed</div>
+                <div class="text-[8px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Last Modified</div>
+                <div class="text-xs text-slate-800 dark:text-gray-100 font-semibold">{formatDate(selectedFile.Modified)}</div>
+              </div>
+              <div class="space-y-1">
+                <div class="text-[8px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Size</div>
+                <div class="text-xs text-slate-800 dark:text-gray-100 font-semibold uppercase">{formatSize(selectedFile.Size)}</div>
               </div>
             </div>
           </header>
           
-          <div class="space-y-6 font-headline text-lg leading-relaxed text-on-surface opacity-50 text-center py-20">
-            <DocumentIcon size={48} class="mx-auto text-secondary mb-4 opacity-30" />
-            <p>File content preview will be loaded here.</p>
+          <div class="flex-1 w-full h-full font-serif text-lg leading-relaxed text-slate-700 dark:text-gray-300 bg-white dark:bg-[#111] shadow-inner p-8 overflow-y-auto">
+            {#if getFileCategory(selectedFile.Path) === 'image'}
+              <div class="w-full h-full flex items-center justify-center bg-[#FAF9F6] dark:bg-[#111]">
+                <!-- svelte-ignore a11y-missing-attribute -->
+                <img src={"/loadfile/" + encodeURIComponent(selectedFile.Path)} class="w-full h-full object-contain shadow-sm" />
+              </div>
+            {:else if getFileCategory(selectedFile.Path) === 'text'}
+              <div class="max-w-prose mx-auto font-serif text-slate-800 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">
+                {textContent}
+              </div>
+            {:else if getFileCategory(selectedFile.Path) === 'pdf'}
+              <iframe src={"/loadfile/" + encodeURIComponent(selectedFile.Path)} class="w-full h-full border-none bg-white dark:bg-[#111]" title="Document Preview"></iframe>
+            {:else}
+              <div class="w-full h-full flex flex-col items-center justify-center text-gray-400 dark:text-gray-500 font-mono text-sm space-y-4">
+                <DocumentIcon size={32} />
+                <p>Preview not available for this file type.</p>
+                <div class="px-3 py-1 bg-gray-100 dark:bg-[#1a1a1a] rounded text-[10px] uppercase font-bold tracking-widest text-gray-500 dark:text-gray-400">
+                  {getFileType(selectedFile.Path)}
+                </div>
+              </div>
+            {/if}
           </div>
         </div>
       </aside>
     {/if}
+    
   </main>
 </div>
 
 <style>
-  :global(.scrollbar-custom::-webkit-scrollbar) { width: 4px; }
-  :global(.scrollbar-custom::-webkit-scrollbar-track) { background: #FAF5F5; }
-  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #C3C5D9; }
+  :global(.scrollbar-custom::-webkit-scrollbar) { width: 6px; }
+  :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #E2E8F0; border-radius: 4px; }
+  :global(.dark .scrollbar-custom::-webkit-scrollbar-thumb) { background: #222; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb:hover) { background: #CBD5E1; }
+  :global(.dark .scrollbar-custom::-webkit-scrollbar-thumb:hover) { background: #333; }
 
-  @keyframes slideFadeIn {
+  @keyframes -global-slideFadeIn {
     to {
       opacity: 1;
       transform: translateY(0);

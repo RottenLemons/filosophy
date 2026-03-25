@@ -18,5 +18,8 @@
     "svelte": "latest",
     "tailwindcss": "^4.2.1",
     "vite": "latest"
+  },
+  "dependencies": {
+    "lucide-svelte": "^1.0.1"
   }
 }

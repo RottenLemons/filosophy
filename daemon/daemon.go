@@ -2,11 +2,6 @@
 package daemon
 
 import (
-<<<<<<< HEAD
-	"encoding/json"
-=======
-	"flag"
->>>>>>> main
 	"fmt"
 	"log"
 	"os"
@@ -32,18 +27,20 @@ const (
 
 // shouldFilterPath returns true if the path should be ignored for content changes
 func shouldFilterPath(path string) bool {
-	parts := strings.Split(path, "\\")
-	if len(parts) < 4 {
-		return true
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	for _, part := range parts {
+		name := strings.ToLower(part)
+		if name == "appdata" || strings.HasPrefix(part, ".") || strings.HasPrefix(name, "ntuser") || name == "node_modules" || name == "vendor" {
+			return true
+		}
 	}
-	name := parts[3]
-	// Filter out AppData, hidden files (starting with .), and ntuser.dat
-	return name == "AppData" || strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "ntuser.dat")
+	return false
 }
 
 // shouldFilterFolder returns true if the folder should be skipped
 func shouldFilterFolder(name string) bool {
-	return name == "AppData" || strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "ntuser")
+	lowerName := strings.ToLower(name)
+	return lowerName == "appdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(lowerName, "ntuser") || lowerName == "node_modules" || lowerName == "vendor"
 }
 
 // isFileTooLarge returns true if file is larger than 100MB
@@ -221,17 +218,24 @@ func (t *tracker) drain() map[string]*fileChanges {
 	return result
 }
 
+// Daemon watches a directory for file changes and indexes them using the shared Engine.
+// It runs in the background and does not interfere with search or indexing from the main app.
 type Daemon struct {
 	t                          *tracker
+	sc                         *shared.Engine
 	flushMu                    sync.Mutex
 	exit                       chan struct{}
 	structureChan, contentChan chan notify.EventInfo
 	baseDir                    string
 }
 
-func NewDaemon(baseDir string) *Daemon {
+// NewDaemon creates a new Daemon linked to the given Engine.
+// The daemon shares the Engine with the main App — it watches for file changes
+// and indexes them in the background without interfering with search operations.
+func NewDaemon(baseDir string, engine *shared.Engine) *Daemon {
 	return &Daemon{
 		baseDir: baseDir,
+		sc:      engine,
 		exit:    make(chan struct{}),
 	}
 }
@@ -288,7 +292,7 @@ func (d *Daemon) flush() {
 	// 1. Delete all references for removed/modified files
 	if len(deletePaths) > 0 {
 		fmt.Println("[FLUSH] deleting:", deletePaths)
-		if err := p.sc.DeletePaths(deletePaths); err != nil {
+		if err := d.sc.DeletePaths(deletePaths); err != nil {
 			log.Println("flush delete error:", err)
 		}
 		// Clear cached hashes so big-file handler won't re-trigger
@@ -308,7 +312,7 @@ func (d *Daemon) flush() {
 			oldPaths[i] = pair[0]
 			newPaths[i] = pair[1]
 		}
-		if err := p.sc.RenamePaths(oldPaths, newPaths); err != nil {
+		if err := d.sc.RenamePaths(oldPaths, newPaths); err != nil {
 			log.Println("flush rename error:", err)
 		}
 	}
@@ -316,7 +320,7 @@ func (d *Daemon) flush() {
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
 		fmt.Println("[FLUSH] indexing:", addPaths)
-		cfg := shared.NewProcessorConfig(8096, 100, 50, p.sc)
+		cfg := shared.NewProcessorConfig(8096, 100, 50, d.sc)
 
 		for _, path := range addPaths {
 			info, err := os.Stat(path)
@@ -331,33 +335,14 @@ func (d *Daemon) flush() {
 			}
 		}
 
-		shared.DrainRemaining(cfg.Chunks, "text", p.sc)
-		shared.DrainRemaining(cfg.Images, "image", p.sc)
+		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
+		shared.DrainRemaining(cfg.Images, "image", d.sc)
 		cfg.CleanupTempDir()
 	}
 	fmt.Println("[FLUSH] done")
 }
 
-<<<<<<< HEAD
 func (d *Daemon) Start() error {
-=======
-type program struct {
-	t                          *tracker
-	sc                         *shared.Engine
-	flushMu                    sync.Mutex
-	exit                       chan struct{}
-	structureChan, contentChan chan notify.EventInfo
-	baseDir                    string
-}
-
-func (p *program) Start(s service.Service) error {
-	var err error
-	p.baseDir, err = "C:/Users/Mahir/Downloads/test/", nil //os.UserHomeDir()
-	if err != nil {
-		log.Fatal(err)
-	}
-	p.exit = make(chan struct{})
->>>>>>> main
 	// Channel for structure changes (create, delete, rename) - ALL files
 	d.structureChan = make(chan notify.EventInfo, 500)
 	// Channel for content changes - filtered files only
@@ -369,22 +354,12 @@ func (p *program) Start(s service.Service) error {
 }
 
 func (d *Daemon) run() {
-	// DB lives in the project root (parent of daemon/)
-	// Use Getwd instead of Executable — go run compiles to a temp dir
+	// DB path for the tracker — derive from Engine's working directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal("cannot get working directory:", err)
 	}
-	dbPath := filepath.Join(cwd, "..", "filosophy.db")
-	textModelPath := filepath.Join(cwd, "..", "text")
-	imageModelPath := filepath.Join(cwd, "..", "image")
-
-	// Initialize Engine
-	sc, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Fatal("failed to initialize Engine:", err)
-	}
-	p.sc = sc
+	dbPath := filepath.Join(cwd, "filosophy.db")
 
 	// Do work here
 	d.t = &tracker{
@@ -496,8 +471,8 @@ func (d *Daemon) run() {
 			}
 		}
 	}()
-	// Flush every 5 minutes regardless of action count
-	ticker := time.NewTicker(1 * time.Minute)
+	// Flush every 30 minutes regardless of action count
+	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 	go func() {
 		for range ticker.C {
@@ -510,12 +485,74 @@ func (d *Daemon) run() {
 		}
 	}()
 
+	// Perform initial crawl asynchronously so watch loops continue running
+	go func() {
+		start := time.Now()
+		cfg := shared.NewProcessorConfig(8096, 4000, 100, d.sc)
+		fmt.Println("[DAEMON] Starting initial indexing crawl...")
+		maxConcurrency := 4
+		sem := make(chan struct{}, maxConcurrency)
+
+		filepath.Walk(d.baseDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+
+			if info.IsDir() {
+				if shouldFilterFolder(info.Name()) {
+					return filepath.SkipDir
+				}
+				shared.ProcessDirectory(path, cfg)
+				return nil
+			}
+
+			if shouldFilterPath(path) {
+				return nil
+			}
+
+			if isFileTooLarge(path) {
+				return nil
+			}
+
+			d.t.mu.Lock()
+			cachedHash, _ := d.t.getHash(path)
+			d.t.mu.Unlock()
+
+			currentHash, err := hashFile(path)
+			if err != nil || (cachedHash != 0 && cachedHash == currentHash) {
+				return nil
+			}
+
+			d.t.mu.Lock()
+			d.t.hashes[path] = currentHash
+			d.t.mu.Unlock()
+
+			sem <- struct{}{}
+
+			go func(path string) {
+				defer func() { <-sem }()
+				shared.ProcessFile(path, cfg)
+			}(path)
+
+			return nil
+		})
+
+		for i := 0; i < maxConcurrency; i++ {
+			sem <- struct{}{}
+		}
+
+		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
+		shared.DrainRemaining(cfg.Images, "image", d.sc)
+		cfg.CleanupTempDir()
+		end := time.Now()
+		fmt.Println("[DAEMON] Initial indexing complete in", end.Sub(start))
+	}()
+
 	<-d.exit
 }
 
 func (d *Daemon) Stop() error {
 	// Stop should not block. Return with a few seconds.
-<<<<<<< HEAD
 	if d.t != nil {
 		fmt.Println(d.t.changes)
 	}
@@ -526,14 +563,5 @@ func (d *Daemon) Stop() error {
 	if d.contentChan != nil {
 		close(d.contentChan)
 	}
-=======
-	fmt.Println(p.t.changes)
-	if p.sc != nil {
-		p.sc.Close()
-	}
-	close(p.exit)
-	close(p.structureChan)
-	close(p.contentChan)
->>>>>>> main
 	return nil
 }

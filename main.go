@@ -3,18 +3,15 @@
 package main
 
 import (
-<<<<<<< HEAD
 	"context"
 	"embed"
-	"encoding/json"
-=======
-	"bufio"
 	"fmt"
->>>>>>> main
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"net/http"
 	"strings"
 
 	"filosophy/daemon"
@@ -28,76 +25,52 @@ import (
 //go:embed all:frontend/build
 var assets embed.FS
 
-<<<<<<< HEAD
 // App struct holds the application state
 type App struct {
-	ctx        context.Context
-	sidecarCmd *exec.Cmd
-	daemon     *daemon.Daemon
-	baseDir    string
+	ctx    context.Context
+	engine *shared.Engine
+	daemon *daemon.Daemon
 }
-=======
-func main() {
-	// Initialize Engine with model and DB paths
-	cwd, err := os.Getwd()
-	if err != nil {
-		log.Fatal("cannot get working directory:", err)
-	}
-	dbPath := filepath.Join(cwd, "filosophy.db")
-	textModelPath := filepath.Join(cwd, "text")
-	imageModelPath := filepath.Join(cwd, "image")
-
-	sc, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Fatal("failed to initialize Engine:", err)
-	}
-	defer sc.Close()
-
-	index := len(os.Args) > 1 && os.Args[1] == "--index"
-	if index {
-		start := time.Now()
-		cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
->>>>>>> main
 
 // NewApp creates a new App instance
 func NewApp() *App {
 	return &App{}
 }
 
-<<<<<<< HEAD
 // startup is called when the Wails app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	// Determine base directory for watching (home/Downloads/test)
+	// Determine paths for Engine initialization
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("Failed to get working directory: %v", err)
+		cwd = "."
+	}
+	dbPath := filepath.Join(cwd, "filosophy.db")
+	textModelPath := filepath.Join(cwd, "text")
+	imageModelPath := filepath.Join(cwd, "image")
+
+	// Initialize the native Go Engine (replaces Python sidecar)
+	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+	if err != nil {
+		log.Printf("Failed to initialize Engine: %v", err)
+		return
+	}
+	a.engine = engine
+	log.Println("Engine initialized")
+
+	// Determine base directory for file-watching daemon
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Printf("Failed to get home directory: %v", err)
-		home = "C:/Users/Mahir"
+		home = cwd
 	}
-	a.baseDir = filepath.Join(home, "Downloads", "test")
-	// Ensure the directory exists
-	os.MkdirAll(a.baseDir, 0755)
+	baseDir := filepath.Join(home, "Downloads", "test")
+	os.MkdirAll(baseDir, 0755)
 
-	// Start Python sidecar
-	sidecarPath := "sidecar.py"
-	// Try to find sidecar in the current working directory
-	if _, err := os.Stat(sidecarPath); os.IsNotExist(err) {
-		// Try to find sidecar in project root
-		exeDir, _ := os.Getwd()
-		sidecarPath = filepath.Join(exeDir, "sidecar.py")
-	}
-	a.sidecarCmd = exec.Command("python", sidecarPath)
-	a.sidecarCmd.Stdout = os.Stdout
-	a.sidecarCmd.Stderr = os.Stderr
-	if err := a.sidecarCmd.Start(); err != nil {
-		log.Printf("Failed to start sidecar: %v", err)
-	} else {
-		log.Println("Sidecar started")
-	}
-
-	// Start file-watching daemon
-	a.daemon = daemon.NewDaemon(a.baseDir)
+	// Start file-watching daemon (shares the Engine, runs in background)
+	a.daemon = daemon.NewDaemon(baseDir, a.engine)
 	if err := a.daemon.Start(); err != nil {
 		log.Printf("Failed to start daemon: %v", err)
 	} else {
@@ -110,37 +83,41 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.daemon != nil {
 		a.daemon.Stop()
 	}
-	if a.sidecarCmd != nil {
-		a.sidecarCmd.Process.Kill()
-		a.sidecarCmd.Wait()
+	if a.engine != nil {
+		a.engine.Close()
 	}
 }
 
-// Search performs a search query via the Python sidecar and returns the list of file paths.
-func (a *App) Search(query string) []string {
-	queryJSON, err := json.Marshal(query)
-	if err != nil {
-		log.Println("Search marshal error:", err)
-		return nil
+// Search performs a search query via the native Go Engine.
+func (a *App) Search(query string) ([]shared.SearchResult, error) {
+	log.Printf("App.Search called with query: %s", query)
+	if a.engine == nil {
+		log.Printf("App.Search error: engine not initialized")
+		return nil, fmt.Errorf("engine not initialized")
 	}
-	resp, err := shared.Send(string(queryJSON), "search")
-	if err != nil {
-		log.Println("Search send error:", err)
-		return nil
+	res, err := a.engine.Search(query)
+	log.Printf("App.Search returned %d results, err: %v", len(res), err)
+	return res, err
+}
+
+// OpenFileNative opens a file using the system's default application.
+func (a *App) OpenFileNative(path string) error {
+	log.Printf("App.OpenFileNative called with path: %s", path)
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", "", path}
+	case "darwin":
+		cmd = "open"
+		args = []string{path}
+	default: // linux
+		cmd = "xdg-open"
+		args = []string{path}
 	}
-	// Parse response: sidecar returns a JSON list of strings.
-	var paths []string
-	if err := json.Unmarshal([]byte(resp), &paths); err != nil {
-		// fallback: split lines
-		lines := strings.Split(strings.TrimSpace(resp), "\n")
-		for _, line := range lines {
-			line = strings.Trim(line, `[]"'`)
-			if line != "" {
-				paths = append(paths, line)
-			}
-		}
-	}
-	return paths
+	return exec.Command(cmd, args...).Start()
 }
 
 func main() {
@@ -154,6 +131,7 @@ func main() {
 		Height: 768,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
+			Handler: &LocalFileHandler{},
 		},
 		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
 		OnStartup:        app.startup,
@@ -164,56 +142,47 @@ func main() {
 	})
 	if err != nil {
 		log.Fatal(err)
-=======
-		filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if info.IsDir() {
-				shared.ProcessDirectory(path, cfg)
-				return nil
-			}
-
-			// Acquire semaphore before spawning goroutine
-			sem <- struct{}{}
-
-			go func(path string) {
-				defer func() { <-sem }()
-				shared.ProcessFile(path, cfg)
-			}(path)
-
-			return nil
-		})
-
-		// Wait for all goroutines to finish by filling the semaphore
-		for i := 0; i < maxConcurrency; i++ {
-			sem <- struct{}{}
-		}
-
-		shared.DrainRemaining(cfg.Chunks, "text", sc)
-		shared.DrainRemaining(cfg.Images, "image", sc)
-		cfg.CleanupTempDir()
-		end := time.Now()
-		fmt.Println(end.Sub(start))
 	}
-	for {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Search: ")
-		query, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error:", err)
-			return
+}
+
+type LocalFileHandler struct {
+	http.Handler
+}
+
+func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Only intercept requests prefixed with /loadfile/
+	if strings.HasPrefix(r.URL.Path, "/loadfile/") {
+		// Extract the actual file path and decode it
+		filePath := strings.TrimPrefix(r.URL.Path, "/loadfile/")
+		
+		// Go's net/http automatically unescapes r.URL.Path.
+		// If the frontend used encodeURIComponent, the path here is already perfectly decoded.
+		// Calling url.PathUnescape again would erroneously double-decode characters (e.g. converting a literal "%20" in a filename into a space).
+		decodedPath := filePath
+
+		// Enforce MIME types to prevent iframe/browser rendering bugs
+		ext := strings.ToLower(filepath.Ext(decodedPath))
+		switch ext {
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".gif":
+			w.Header().Set("Content-Type", "image/gif")
+		case ".webp":
+			w.Header().Set("Content-Type", "image/webp")
+		case ".pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+		case ".txt", ".md", ".csv":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		}
-		query = strings.TrimSpace(query)
-		results, err := sc.Search(query)
-		if err != nil {
-			log.Println("search error:", err)
-			continue
-		}
-		for _, r := range results {
-			fmt.Printf("  %.4f  %s\n", r.Score, r.Path)
-		}
->>>>>>> main
+
+		// Serve the local file securely
+		http.ServeFile(w, r, decodedPath)
+		return
+	}
+	// Fallback for normal frontend assets
+	if h.Handler != nil {
+		h.Handler.ServeHTTP(w, r)
 	}
 }
