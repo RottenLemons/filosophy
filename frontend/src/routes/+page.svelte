@@ -17,11 +17,52 @@
   let searching = false;
 
   let isFilterOpen = false;
-  let filterType = 'PDF'; // Options: 'All', 'PDF', 'DOCX', 'TXT'
-  let filterDate = 'Last 30 Days'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
-  let filterSize = '> 1 MB'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '> 10 MB'
+  let filterType = 'All'; // Options: 'All', 'PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG', 'Other'
+  let filterDate = 'Anytime'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
+  let filterSize = 'Any'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '10 MB - 100 MB', '> 100 MB'
 
-  $: { filterType; filterDate; filterSize; debouncedSearch(); }
+  $: filteredFiles = files.filter(file => {
+    // 1. Type Match
+    const knownTypes = ['PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG'];
+    const type = getFileType(file.Path);
+    let matchType = false;
+    if (filterType === 'All') {
+      matchType = true;
+    } else if (filterType === 'Other') {
+      matchType = !knownTypes.includes(type);
+    } else {
+      matchType = type === filterType;
+    }
+
+    // 2. Size Match (file.Size is in bytes)
+    let matchSize = true;
+    const sizeMB = file.Size / (1024 * 1024);
+    if (filterSize === '< 1 MB') matchSize = sizeMB < 1;
+    else if (filterSize === '1 MB - 10 MB') matchSize = sizeMB >= 1 && sizeMB <= 10;
+    else if (filterSize === '10 MB - 100 MB') matchSize = sizeMB >= 10 && sizeMB <= 100;
+    else if (filterSize === '> 100 MB') matchSize = sizeMB > 100;
+
+    // 3. Date Match (file.Modified is ISO string)
+    let matchDate = true;
+    if (filterDate !== 'Anytime' && file.Modified) {
+      const modifiedDate = new Date(file.Modified);
+      const now = new Date();
+      if (filterDate === 'Last 7 Days') {
+        matchDate = (now.getTime() - modifiedDate.getTime()) <= 7 * 24 * 60 * 60 * 1000;
+      } else if (filterDate === 'Last 30 Days') {
+        matchDate = (now.getTime() - modifiedDate.getTime()) <= 30 * 24 * 60 * 60 * 1000;
+      } else if (filterDate === 'This Year') {
+        matchDate = modifiedDate.getFullYear() === now.getFullYear();
+      }
+    }
+
+    return matchType && matchSize && matchDate;
+  });
+
+  // Selection Fallback
+  $: if (selectedFile && !filteredFiles.find(f => f.Path === selectedFile.Path)) {
+    selectedFile = filteredFiles.length > 0 ? filteredFiles[0] : null;
+  }
 
   /** @param {HTMLElement} node */
   function clickOutside(node) {
@@ -198,7 +239,7 @@
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Type</span>
                     <div class="grid grid-cols-2 gap-1">
-                      {#each ['All', 'PDF', 'DOCX', 'TXT'] as type}
+                      {#each ['All', 'PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG', 'Other'] as type}
                         <button 
                           on:click={() => filterType = type}
                           class="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider transition-colors rounded-none
@@ -230,7 +271,7 @@
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Size</span>
                     <div class="flex flex-col gap-1">
-                      {#each ['Any', '< 1 MB', '1 MB - 10 MB', '> 10 MB'] as size}
+                      {#each ['Any', '< 1 MB', '1 MB - 10 MB', '10 MB - 100 MB', '> 100 MB'] as size}
                         <button 
                           on:click={() => filterSize = size}
                           class="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider transition-colors rounded-none
@@ -273,16 +314,16 @@
         
         <!-- Results List -->
         <div class="space-y-4 pt-4">
-          {#if files.length > 0}
+          {#if filteredFiles.length > 0}
             <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#222]">
-              <span>{files.length} Records Found</span>
+              <span>{filteredFiles.length} Records Found</span>
               <span>Sorted by relevance</span>
             </div>
           {/if}
           
-          {#if files.length > 0}
+          {#if filteredFiles.length > 0}
             <div class="flex flex-col gap-6 relative z-20">
-              {#each files as file, i (file.Path)}
+              {#each filteredFiles as file, i (file.Path)}
                 <!-- svelte-ignore a11y-click-events-have-key-events - Result Card -->
                 <!-- svelte-ignore a11y-no-static-element-interactions -->
                 <div 
