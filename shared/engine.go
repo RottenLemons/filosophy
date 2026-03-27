@@ -94,9 +94,8 @@ var (
 type Engine struct {
 	db                *sqvect.DB
 	sqlDB             *sql.DB // separate connection for the files table
-	textTok           *tokenizers.Tokenizer
+	staticEmb         *StaticEmbedder
 	clipTok           *tokenizers.Tokenizer
-	textSession       *ort.DynamicAdvancedSession
 	clipTextSession   *ort.DynamicAdvancedSession
 	clipVisionSession *ort.DynamicAdvancedSession
 	textCollectionID  int // cached collection ID for text embeddings
@@ -158,18 +157,22 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		return nil, fmt.Errorf("failed to initialize onnxruntime (dll=%s): %w", ortPath, err)
 	}
 
-	// Load tokenizers (daulet/tokenizers — CGO)
-	textTok, err := tokenizers.FromFile(filepath.Join(textModelPath, "tokenizer.json"))
+	// Load the static text embedder (reads model.safetensors + tokenizer.json directly,
+	// no ONNX inference needed for text).
+	staticEmb, err := LoadStaticEmbedder(
+		filepath.Join(textModelPath, "model.safetensors"),
+		filepath.Join(textModelPath, "tokenizer.json"),
+	)
 	if err != nil {
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
-		return nil, fmt.Errorf("failed to load text tokenizer: %w", err)
+		return nil, fmt.Errorf("failed to load static embedder: %w", err)
 	}
 
 	clipTok, err := tokenizers.FromFile(filepath.Join(imageModelPath, "tokenizer.json"))
 	if err != nil {
-		textTok.Close()
+		staticEmb.Close()
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
@@ -189,20 +192,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	// We are synchronizing inference with Engine.mu.Lock() inside IndexText/IndexImage,
 	// so it's safe to let ONNX use its default multi-threading across all cores.
 
-	// Create ONNX sessions (DynamicAdvancedSession allows variable input shapes)
-	textSession, err := ort.NewDynamicAdvancedSession(
-		filepath.Join(textModelPath, "model.onnx"),
-		[]string{"input_ids", "attention_mask"},
-		[]string{"sentence_embedding"},
-		opts,
-	)
-	if err != nil {
-		ort.DestroyEnvironment()
-		sqlDB.Close()
-		db.Close()
-		return nil, fmt.Errorf("failed to create text session: %w", err)
-	}
-
+	// Create ONNX sessions for CLIP only (text uses the static embedder).
 	clipTextSession, err := ort.NewDynamicAdvancedSession(
 		filepath.Join(imageModelPath, "text_model.onnx"),
 		[]string{"input_ids"},
@@ -210,7 +200,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		opts,
 	)
 	if err != nil {
-		textSession.Destroy()
+
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
@@ -220,7 +210,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	visionOpts, err := ort.NewSessionOptions()
 	if err != nil {
 		clipTextSession.Destroy()
-		textSession.Destroy()
+
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
@@ -239,7 +229,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	)
 	if err != nil {
 		clipTextSession.Destroy()
-		textSession.Destroy()
+
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
@@ -252,8 +242,8 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	if err != nil {
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
-		textSession.Destroy()
-		textTok.Close()
+
+		staticEmb.Close()
 		clipTok.Close()
 		ort.DestroyEnvironment()
 		sqlDB.Close()
@@ -264,8 +254,8 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	if err != nil {
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
-		textSession.Destroy()
-		textTok.Close()
+
+		staticEmb.Close()
 		clipTok.Close()
 		ort.DestroyEnvironment()
 		sqlDB.Close()
@@ -276,9 +266,8 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	return &Engine{
 		db:                db,
 		sqlDB:             sqlDB,
-		textTok:           textTok,
+		staticEmb:         staticEmb,
 		clipTok:           clipTok,
-		textSession:       textSession,
 		clipTextSession:   clipTextSession,
 		clipVisionSession: clipVisionSession,
 		textCollectionID:  textCol.ID,
@@ -299,13 +288,10 @@ func (s *Engine) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if s.textSession != nil {
-		if err := s.textSession.Destroy(); err != nil {
+	if s.staticEmb != nil {
+		if err := s.staticEmb.Close(); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if s.textTok != nil {
-		s.textTok.Close()
 	}
 	if s.clipTok != nil {
 		s.clipTok.Close()
@@ -337,31 +323,32 @@ func generateID() string {
 // Embedding helpers
 // ---------------------------------------------------------------------------
 
-type seqData struct {
-	Index int
-	IDs   []uint32
-}
 
 func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	batch := int64(len(texts))
 
-	cpu0 := getCPUTime()
 	t0 := time.Now()
-	seqs := make([]seqData, batch)
+	result := make([][]float32, len(texts))
 
-	// Use a worker pool based on CPU count to avoid 4000 goroutines fighting for CGO locks
+	// Worker pool: each goroutine calls StaticEmbedder.EmbedString (pure Go, no CGO lock).
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
-	jobs := make(chan int, batch)
-	for i := 0; i < int(batch); i++ {
+	jobs := make(chan int, len(texts))
+	for i := range texts {
 		jobs <- i
 	}
 	close(jobs)
+
+	type outcome struct {
+		idx int
+		emb []float32
+		err error
+	}
+	results := make(chan outcome, len(texts))
 
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
@@ -369,104 +356,33 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				ids, _ := s.textTok.Encode(texts[idx], true)
-				seqs[idx] = seqData{Index: idx, IDs: ids}
+				emb, err := s.staticEmb.EmbedString(texts[idx])
+				if err != nil {
+					// Shouldn't happen — EmbedString returns zero vec on empty input.
+					results <- outcome{idx: idx, err: err}
+					continue
+				}
+				// MRL model: truncate to textEmbedDim, then re-normalise.
+				if len(emb) > textEmbedDim {
+					emb = emb[:textEmbedDim]
+					normalize(emb)
+				}
+				results <- outcome{idx: idx, emb: emb}
 			}
 		}()
 	}
 	wg.Wait()
+	close(results)
 
-	tTok := time.Now()
-	log.Printf("  -> Tokenize: %v for %d texts (%s)", tTok.Sub(t0), len(texts), getStats(cpu0, t0))
-
-	// Sort sequences by length (shortest to longest) to minimize padding variance
-	sort.Slice(seqs, func(i, j int) bool {
-		return len(seqs[i].IDs) < len(seqs[j].IDs)
-	})
-
-	tSort := time.Now()
-
-	result := make([][]float32, batch)
-
-	// Process in sub-batches of 512
-	subBatchSize := int64(512)
-	for start := int64(0); start < batch; start += subBatchSize {
-		end := start + subBatchSize
-		if end > batch {
-			end = batch
+	for o := range results {
+		if o.err != nil {
+			log.Printf("embedText[%d]: %v", o.idx, o.err)
+			continue
 		}
-		currBatch := end - start
-
-		// Find max sequence length in this specific sub-batch
-		maxLen := 0
-		for i := start; i < end; i++ {
-			if len(seqs[i].IDs) > maxLen {
-				maxLen = len(seqs[i].IDs)
-			}
-		}
-		seqLen := int64(maxLen)
-
-		// Build flat padded tensors [currBatch, seqLen]
-		flatIDs := make([]int64, currBatch*seqLen)
-		flatMask := make([]int64, currBatch*seqLen)
-		for i := int64(0); i < currBatch; i++ {
-			seq := seqs[start+i]
-			off := i * seqLen
-			ids := uint32ToInt64(seq.IDs)
-			copy(flatIDs[off:off+seqLen], ids)
-			// Manually fill mask with 1s for the length of IDs (0s for padding already exist)
-			for k := int64(0); k < int64(len(ids)); k++ {
-				flatMask[off+k] = 1
-			}
-		}
-
-		inputIDs, err := ort.NewTensor(ort.NewShape(currBatch, seqLen), flatIDs)
-		if err != nil {
-			return nil, fmt.Errorf("text input_ids tensor: %w", err)
-		}
-
-		attnMask, err := ort.NewTensor(ort.NewShape(currBatch, seqLen), flatMask)
-		if err != nil {
-			inputIDs.Destroy()
-			return nil, fmt.Errorf("text attention_mask tensor: %w", err)
-		}
-
-		outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(currBatch, 1024))
-		if err != nil {
-			attnMask.Destroy()
-			inputIDs.Destroy()
-			return nil, fmt.Errorf("text output tensor: %w", err)
-		}
-
-		if err := s.textSession.Run(
-			[]ort.Value{inputIDs, attnMask},
-			[]ort.Value{outTensor},
-		); err != nil {
-			outTensor.Destroy()
-			attnMask.Destroy()
-			inputIDs.Destroy()
-			return nil, fmt.Errorf("text inference failed: %w", err)
-		}
-
-		// Extract per-sample embeddings, truncate to textEmbedDim, L2-normalize
-		data := outTensor.GetData()
-		for i := int64(0); i < currBatch; i++ {
-			emb := make([]float32, textEmbedDim)
-			copy(emb, data[i*1024:i*1024+int64(textEmbedDim)])
-			normalize(emb)
-			// Place back in original index
-			origIdx := seqs[start+i].Index
-			result[origIdx] = emb
-		}
-
-		outTensor.Destroy()
-		attnMask.Destroy()
-		inputIDs.Destroy()
+		result[o.idx] = o.emb
 	}
 
-	tInfer := time.Now()
-	log.Printf("  -> Text Sub-Batched ONNX: %v (%s)", tInfer.Sub(tSort), getStats(cpu0, tSort))
-
+	log.Printf("  -> Static embedText: %v for %d texts", time.Since(t0), len(texts))
 	return result, nil
 }
 
@@ -749,8 +665,8 @@ func getStats(startCPU int64, startTime time.Time) string {
 // Indexing
 // ---------------------------------------------------------------------------
 
-// upsertFiles inserts or updates file-level hashes.
-func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes []int64) error {
+// upsertFiles inserts or updates file-level hashes, mtimes, sizes, and marks the file as content-indexed.
+func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
 	if len(filePaths) == 0 {
 		return nil
 	}
@@ -760,15 +676,16 @@ func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx,
-		"INSERT INTO files(path, hash) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash")
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO files(path, hash, mtime, size, content_indexed) VALUES (?, ?, ?, ?, 1)
+		ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for i := range filePaths {
-		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i]); err != nil {
+		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i]); err != nil {
 			return err
 		}
 	}
@@ -778,7 +695,7 @@ func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes
 // IndexText generates text embeddings and stores them in the vector DB.
 // contents and paths must have the same length.
 // filePaths/fileHashes are optional file-level metadata for deduplication.
-func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes []int64) error {
+func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -795,7 +712,7 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 
 	// Upsert file hashes
 	tFiles := time.Now()
-	if err := s.upsertFiles(ctx, filePaths, fileHashes); err != nil {
+	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes); err != nil {
 		return fmt.Errorf("upsert files failed: %w", err)
 	}
 
@@ -829,7 +746,7 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 // IndexImage generates image embeddings from image file paths and stores them.
 // imagePaths are the filesystem paths to load images from.
 // paths are the logical paths stored as metadata.
-func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes []int64) error {
+func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -846,7 +763,7 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 
 	// Upsert file hashes
 	tFiles := time.Now()
-	if err := s.upsertFiles(ctx, filePaths, fileHashes); err != nil {
+	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes); err != nil {
 		return fmt.Errorf("upsert files failed: %w", err)
 	}
 
@@ -914,8 +831,11 @@ func (s *Engine) InitIndexTables() error {
 	ctx := context.Background()
 	if _, err := s.sqlDB.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS files (
-			path TEXT PRIMARY KEY,
-			hash INTEGER NOT NULL
+			path             TEXT    PRIMARY KEY,
+			hash             INTEGER NOT NULL DEFAULT 0,
+			mtime            INTEGER NOT NULL DEFAULT 0,
+			size             INTEGER NOT NULL DEFAULT 0,
+			content_indexed  INTEGER NOT NULL DEFAULT 0
 		);
 	`); err != nil {
 		return fmt.Errorf("failed to create index tables: %w", err)
@@ -959,6 +879,117 @@ func (s *Engine) InitIndexTables() error {
 		}
 	}
 	return nil
+}
+
+// IndexMetadata inserts file paths, mtimes, and sizes into the files table without
+// marking them as content-indexed, and populates paths_fts so path-based search
+// works immediately after Pass 1. Already-present rows are left untouched (INSERT OR IGNORE).
+func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	tx, err := s.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	filesStmt, err := tx.PrepareContext(ctx,
+		`INSERT OR IGNORE INTO files(path, hash, mtime, size, content_indexed) VALUES (?, 0, ?, ?, 0)`)
+	if err != nil {
+		return err
+	}
+	defer filesStmt.Close()
+
+	ftsStmt, err := tx.PrepareContext(ctx, `INSERT INTO paths_fts(path) VALUES (?)`)
+	if err != nil {
+		return err
+	}
+	defer ftsStmt.Close()
+
+	for i := range paths {
+		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i]); err != nil {
+			return err
+		}
+		if _, err := ftsStmt.ExecContext(ctx, paths[i]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PruneStale removes index entries for paths that no longer exist on disk.
+// livePaths is the complete set of current paths from a directory walk.
+func (s *Engine) PruneStale(livePaths []string) error {
+	liveSet := make(map[string]struct{}, len(livePaths))
+	for _, p := range livePaths {
+		liveSet[p] = struct{}{}
+	}
+
+	rows, err := s.sqlDB.QueryContext(context.Background(), `SELECT path FROM files`)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, ok := liveSet[p]; !ok {
+			stale = append(stale, p)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(stale) == 0 {
+		return nil
+	}
+	return s.DeletePaths(stale)
+}
+
+// UnindexedFiles returns all files that have not yet been content-indexed, ordered
+// by mtime descending so Pass 2 prioritises the most recently modified files first.
+func (s *Engine) UnindexedFiles() (paths []string, mtimes []int64, err error) {
+	rows, err := s.sqlDB.QueryContext(context.Background(),
+		`SELECT path, mtime FROM files WHERE content_indexed = 0 ORDER BY mtime DESC`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		var m int64
+		if err := rows.Scan(&p, &m); err != nil {
+			return nil, nil, err
+		}
+		paths = append(paths, p)
+		mtimes = append(mtimes, m)
+	}
+	return paths, mtimes, rows.Err()
+}
+
+// ResetContentIndex clears content_indexed/hashes and paths_fts, forcing a full
+// re-index on the next run. Called when --index is passed.
+func (s *Engine) ResetContentIndex() error {
+	ctx := context.Background()
+	tx, err := s.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM paths_fts`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------------------

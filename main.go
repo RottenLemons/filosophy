@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"net/http"
 	"strings"
+	"time"
 
 	"filosophy/daemon"
 	"filosophy/shared"
@@ -24,6 +25,78 @@ import (
 
 //go:embed all:frontend/build
 var assets embed.FS
+
+const maxConcurrency = 10
+
+func runPass1(sc *shared.Engine, dir string, pruneStale bool) {
+	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	defer cfg.CleanupTempDir()
+
+	var paths []string
+	var mtimes []int64
+	var sizes []int64
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		paths = append(paths, path)
+		mtimes = append(mtimes, info.ModTime().UnixNano())
+		sizes = append(sizes, info.Size())
+		return nil
+	})
+
+	if pruneStale {
+		if err := sc.PruneStale(paths); err != nil {
+			log.Println("pass1 prune error:", err)
+		}
+	}
+
+	if err := sc.IndexMetadata(paths, mtimes, sizes); err != nil {
+		log.Println("pass1 metadata index error:", err)
+	}
+
+	// Also index directory paths for path-based search
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		shared.ProcessDirectory(path, cfg)
+		return nil
+	})
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+}
+
+func runPass2(sc *shared.Engine) {
+	paths, _, err := sc.UnindexedFiles()
+	if err != nil {
+		log.Println("pass2 query error:", err)
+		return
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	start := time.Now()
+	cfg := shared.NewProcessorConfig(8096, 200, 50, sc)
+	defer cfg.CleanupTempDir()
+
+	sem := make(chan struct{}, maxConcurrency)
+	for _, path := range paths {
+		sem <- struct{}{}
+		go func(p string) {
+			defer func() { <-sem }()
+			shared.ProcessFile(p, cfg)
+		}(path)
+	}
+	for i := 0; i < maxConcurrency; i++ {
+		sem <- struct{}{}
+	}
+
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	shared.DrainRemaining(cfg.Images, "image", sc)
+	fmt.Printf("indexing complete (%v)\n", time.Since(start))
+}
 
 // App struct holds the application state
 type App struct {
@@ -51,6 +124,15 @@ func (a *App) startup(ctx context.Context) {
 	textModelPath := filepath.Join(cwd, "text")
 	imageModelPath := filepath.Join(cwd, "image")
 
+	// Redirect logs to file so background indexing doesn't pollute the search prompt.
+	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(lf)
+		// Leave the log file open for the lifetime of the app
+	}
+
+	_, dbMissing := os.Stat(dbPath)
+	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
+
 	// Initialize the native Go Engine (replaces Python sidecar)
 	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
 	if err != nil {
@@ -68,6 +150,21 @@ func (a *App) startup(ctx context.Context) {
 	}
 	baseDir := filepath.Join(home, "Downloads", "test")
 	os.MkdirAll(baseDir, 0755)
+
+	if forceIndex {
+		if err := a.engine.ResetContentIndex(); err != nil {
+			log.Println("reset index error:", err)
+		}
+	}
+
+	if forceIndex || os.IsNotExist(dbMissing) {
+		// First run or explicit re-index: Pass 1 (fast, makes search usable) then Pass 2 in background.
+		runPass1(a.engine, baseDir, forceIndex)
+		go runPass2(a.engine)
+	} else {
+		// DB exists: resume any incomplete Pass 2 work in background.
+		go runPass2(a.engine)
+	}
 
 	// Start file-watching daemon (shares the Engine, runs in background)
 	a.daemon = daemon.NewDaemon(baseDir, a.engine)
