@@ -36,6 +36,8 @@ func vipsThumbnailPath() string {
 type Metadata struct {
 	Content, Path string
 	Hash          int64
+	Mtime         int64
+	Size          int64
 }
 
 var imageExtensions = map[string]struct{}{
@@ -70,19 +72,23 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	// Deduplicate file-level hashes by path
 	var filePaths []string
 	var fileHashes []int64
+	var fileMtimes []int64
+	var fileSizes []int64
 	for _, item := range items {
 		if item.Hash == empty {
 			continue
 		}
 		filePaths = append(filePaths, item.Path)
 		fileHashes = append(fileHashes, item.Hash)
+		fileMtimes = append(fileMtimes, item.Mtime)
+		fileSizes = append(fileSizes, item.Size)
 	}
 
 	var err error
 	if mode == "image" {
-		err = sc.IndexImage(contents, paths, filePaths, fileHashes)
+		err = sc.IndexImage(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes)
 	} else {
-		err = sc.IndexText(contents, paths, filePaths, fileHashes)
+		err = sc.IndexText(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes)
 	}
 	if err != nil {
 		log.Printf("IndexBatch %s error: %v", mode, err)
@@ -101,11 +107,11 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 }
 
 // HandleChunk adds metadata to a channel and flushes when full
-func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash int64, mu *sync.Mutex) {
+func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size int64, mu *sync.Mutex) {
 	mu.Lock()
 	defer mu.Unlock()
 	select {
-	case chunks <- Metadata{content, path, hash}:
+	case chunks <- Metadata{content, path, hash, mtime, size}:
 	default:
 		var items []Metadata
 		for j := 0; j < cap(chunks); j++ {
@@ -115,7 +121,7 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 			default:
 			}
 		}
-		chunks <- Metadata{content, path, hash}
+		chunks <- Metadata{content, path, hash, mtime, size}
 		// IndexBatch shouldn't be under the same lock if we want to add more to channel
 		// but since we are limiting concurrency via maxConcurrency semaphore anyway,
 		// guarding the channel drain is safer.
@@ -145,7 +151,7 @@ type ProcessorConfig struct {
 // ProcessImage converts an image to PNG via vips, hashes the original raw bytes,
 // and queues it for indexing. The converted PNG path is passed as "content"
 // so hugot's RunWithImagePaths can load it.
-func ProcessImage(path string, cfg *ProcessorConfig) {
+func ProcessImage(path string, mtime, size int64, cfg *ProcessorConfig) {
 	// Hash original raw bytes for dedup
 	imBytes, err := os.ReadFile(path)
 	if err != nil {
@@ -164,14 +170,14 @@ func ProcessImage(path string, cfg *ProcessorConfig) {
 	}
 
 	// Content = converted JPEG path for hugot, Path = original path for metadata
-	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, cfg.Mu)
+	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, cfg.Mu)
 }
 
 // ProcessText extracts text from a file and adds chunks to the channel
-func ProcessText(path string, cfg *ProcessorConfig) {
+func ProcessText(path string, mtime, size int64, cfg *ProcessorConfig) {
 	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result.Content == "" {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, cfg.Mu)
 		return
 	}
 	hash := int64(xxhash.Sum64String(result.Content))
@@ -184,26 +190,35 @@ func ProcessText(path string, cfg *ProcessorConfig) {
 	first := true
 	for _, chunk := range splits {
 		if first {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, cfg.Mu)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, cfg.Mu)
 			first = false
 		} else {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, cfg.Mu)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, cfg.Mu)
 		}
 	}
 }
 
-// ProcessFile processes a single file (image or text) based on its type
+// ProcessFile processes a single file (image or text) based on its type.
+// It stats the file once to obtain mtime and size, both stored in the files
+// table to support resumability and daemon-driven updates.
 func ProcessFile(path string, cfg *ProcessorConfig) {
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Println("Failed to stat file:", err)
+		return
+	}
+	mtime := info.ModTime().UnixNano()
+	size := info.Size()
 	if IsImageFile(path) {
-		ProcessImage(path, cfg)
+		ProcessImage(path, mtime, size, cfg)
 	} else {
-		ProcessText(path, cfg)
+		ProcessText(path, mtime, size, cfg)
 	}
 }
 
 // ProcessDirectory adds directory path to the chunks channel
 func ProcessDirectory(path string, cfg *ProcessorConfig) {
-	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, cfg.Mu)
+	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, cfg.Mu)
 }
 
 // NewProcessorConfig creates a new ProcessorConfig with default settings.

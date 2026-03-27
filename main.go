@@ -16,8 +16,79 @@ import (
 
 var parentDir string = "C:/Users/Mahir/Downloads/test/"
 
+const maxConcurrency = 10
+
+func runPass1(sc *shared.Engine, pruneStale bool) {
+	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	defer cfg.CleanupTempDir()
+
+	var paths []string
+	var mtimes []int64
+	var sizes []int64
+
+	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		paths = append(paths, path)
+		mtimes = append(mtimes, info.ModTime().UnixNano())
+		sizes = append(sizes, info.Size())
+		return nil
+	})
+
+	if pruneStale {
+		if err := sc.PruneStale(paths); err != nil {
+			log.Println("pass1 prune error:", err)
+		}
+	}
+
+	if err := sc.IndexMetadata(paths, mtimes, sizes); err != nil {
+		log.Println("pass1 metadata index error:", err)
+	}
+
+	// Also index directory paths for path-based search
+	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		shared.ProcessDirectory(path, cfg)
+		return nil
+	})
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+}
+
+func runPass2(sc *shared.Engine) {
+	paths, _, err := sc.UnindexedFiles()
+	if err != nil {
+		log.Println("pass2 query error:", err)
+		return
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	start := time.Now()
+	cfg := shared.NewProcessorConfig(8096, 200, 50, sc)
+	defer cfg.CleanupTempDir()
+
+	sem := make(chan struct{}, maxConcurrency)
+	for _, path := range paths {
+		sem <- struct{}{}
+		go func(p string) {
+			defer func() { <-sem }()
+			shared.ProcessFile(p, cfg)
+		}(path)
+	}
+	for i := 0; i < maxConcurrency; i++ {
+		sem <- struct{}{}
+	}
+
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	shared.DrainRemaining(cfg.Images, "image", sc)
+	fmt.Printf("indexing complete (%v)\n", time.Since(start))
+}
+
 func main() {
-	// Initialize Engine with model and DB paths
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal("cannot get working directory:", err)
@@ -26,53 +97,36 @@ func main() {
 	textModelPath := filepath.Join(cwd, "text")
 	imageModelPath := filepath.Join(cwd, "image")
 
+	// Redirect logs to file so background indexing doesn't pollute the search prompt.
+	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(lf)
+		defer lf.Close()
+	}
+
+	_, dbMissing := os.Stat(dbPath)
+	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
+
 	sc, err := shared.New(dbPath, textModelPath, imageModelPath)
 	if err != nil {
 		log.Fatal("failed to initialize Engine:", err)
 	}
 	defer sc.Close()
 
-	index := len(os.Args) > 1 && os.Args[1] == "--index"
-	if index {
-		start := time.Now()
-		cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
-
-		// Semaphore to limit concurrent CGO calls (extractous and vips are not thread-safe)
-		maxConcurrency := 10
-		sem := make(chan struct{}, maxConcurrency)
-
-		filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if info.IsDir() {
-				shared.ProcessDirectory(path, cfg)
-				return nil
-			}
-
-			// Acquire semaphore before spawning goroutine
-			sem <- struct{}{}
-
-			go func(path string) {
-				defer func() { <-sem }()
-				shared.ProcessFile(path, cfg)
-			}(path)
-
-			return nil
-		})
-
-		// Wait for all goroutines to finish by filling the semaphore
-		for i := 0; i < maxConcurrency; i++ {
-			sem <- struct{}{}
+	if forceIndex {
+		if err := sc.ResetContentIndex(); err != nil {
+			log.Println("reset index error:", err)
 		}
-
-		shared.DrainRemaining(cfg.Chunks, "text", sc)
-		shared.DrainRemaining(cfg.Images, "image", sc)
-		cfg.CleanupTempDir()
-		end := time.Now()
-		fmt.Println(end.Sub(start))
 	}
+
+	if forceIndex || os.IsNotExist(dbMissing) {
+		// First run or explicit re-index: Pass 1 (fast, makes search usable) then Pass 2 in background.
+		runPass1(sc, forceIndex)
+		go runPass2(sc)
+	} else {
+		// DB exists: resume any incomplete Pass 2 work in background.
+		go runPass2(sc)
+	}
+
 	for {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("Search: ")
