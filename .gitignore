@@ -68,16 +68,13 @@ Thumbs.db
 
 # Jupyter notebooks
 test.ipynb
-<<<<<<< HEAD
 .ipynb_checkpoints/
 
 # Miscellaneous
 .aider*
 *.txt
 check_dll.py
-=======
-*.bin
-.claude/**
-kreuzberg-ffi/**
+.claude/
 .indexed
->>>>>>> main
+reranker.onnx
+tokenizer.json

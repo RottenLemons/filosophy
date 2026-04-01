@@ -26,7 +26,10 @@ import (
 //go:embed all:frontend/build
 var assets embed.FS
 
-const maxConcurrency = 10
+// maxConcurrency limits background indexing goroutines. Keeping this low ensures
+// search goroutines can acquire the HNSW read lock between consecutive batch inserts.
+// With 10+ goroutines all queueing for HNSW.Lock(), search RLock starves indefinitely.
+const maxConcurrency = 3
 
 func runPass1(sc *shared.Engine, dir string, pruneStale bool) {
 	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
