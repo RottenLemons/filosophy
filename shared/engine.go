@@ -49,6 +49,11 @@ const (
 	clipCtxLen    = 77  // CLIP text context_length
 	visionSize    = 256 // CLIP vision input size
 
+	// rerankerTopN is how many results from the RRF stage are passed to the
+	// cross-encoder reranker. Everything beyond this position is returned as-is.
+	rerankerTopN    = 20
+	rerankerMaxToks = 8192 // jina-reranker-turbo context length
+
 	// rrfK is the Reciprocal Rank Fusion constant. Larger values reduce the
 	// penalty gap between adjacent ranks, smoothing signal contributions.
 	rrfK = 60.0
@@ -98,8 +103,10 @@ type Engine struct {
 	clipTok           *tokenizers.Tokenizer
 	clipTextSession   *ort.DynamicAdvancedSession
 	clipVisionSession *ort.DynamicAdvancedSession
-	textCollectionID  int // cached collection ID for text embeddings
-	imageCollectionID int // cached collection ID for image embeddings
+	rerankerSession   *ort.DynamicAdvancedSession // ms-marco cross-encoder, nil if absent
+	rerankerTok       *tokenizers.Tokenizer       // WordPiece tokenizer for reranker
+	textCollectionID  int                         // cached collection ID for text embeddings
+	imageCollectionID int                         // cached collection ID for image embeddings
 	mu                sync.Mutex
 }
 
@@ -137,6 +144,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 			log.Printf("pragma warning: %v", err)
 		}
 	}
+	// Allow parallel SQLite readers across goroutines (WAL supports concurrent reads).
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
 
 	ctx := context.Background()
 
@@ -263,6 +273,40 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		return nil, fmt.Errorf("failed to get image collection: %w", err)
 	}
 
+	// Load the cross-encoder reranker (optional — search still works without it).
+	// Expects reranker.onnx and tokenizer.json next to the running executable.
+	var rerankerSession *ort.DynamicAdvancedSession
+	var rerankerTok *tokenizers.Tokenizer
+	rerankerOnnx, rerankerTokPath := findReranker()
+	if rerankerOnnx != "" && rerankerTokPath != "" {
+		rtok, err := tokenizers.FromFile(rerankerTokPath)
+		if err != nil {
+			log.Printf("reranker tokenizer load warning (reranking disabled): %v", err)
+		} else {
+			ropts, err := ort.NewSessionOptions()
+			if err != nil {
+				rtok.Close()
+				log.Printf("reranker session opts warning (reranking disabled): %v", err)
+			} else {
+				defer ropts.Destroy()
+				rsess, err := ort.NewDynamicAdvancedSession(
+					rerankerOnnx,
+					[]string{"input_ids", "attention_mask"},
+					[]string{"logits"},
+					ropts,
+				)
+				if err != nil {
+					rtok.Close()
+					log.Printf("reranker session load warning (reranking disabled): %v", err)
+				} else {
+					rerankerSession = rsess
+					rerankerTok = rtok
+					log.Printf("reranker loaded: %s", rerankerOnnx)
+				}
+			}
+		}
+	}
+
 	return &Engine{
 		db:                db,
 		sqlDB:             sqlDB,
@@ -270,6 +314,8 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		clipTok:           clipTok,
 		clipTextSession:   clipTextSession,
 		clipVisionSession: clipVisionSession,
+		rerankerSession:   rerankerSession,
+		rerankerTok:       rerankerTok,
 		textCollectionID:  textCol.ID,
 		imageCollectionID: imageCol.ID,
 	}, nil
@@ -295,6 +341,14 @@ func (s *Engine) Close() error {
 	}
 	if s.clipTok != nil {
 		s.clipTok.Close()
+	}
+	if s.rerankerSession != nil {
+		if err := s.rerankerSession.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.rerankerTok != nil {
+		s.rerankerTok.Close()
 	}
 	if err := ort.DestroyEnvironment(); err != nil {
 		errs = append(errs, err)
@@ -322,7 +376,6 @@ func generateID() string {
 // ---------------------------------------------------------------------------
 // Embedding helpers
 // ---------------------------------------------------------------------------
-
 
 func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
@@ -402,9 +455,15 @@ func (s *Engine) embedClipText(texts []string) ([][]float32, error) {
 		if len(ids64) > clipCtxLen {
 			ids64 = ids64[:clipCtxLen]
 		}
-		seqLen := int64(len(ids64))
+		// CLIP positional embeddings have a fixed size of clipCtxLen (77).
+		// The Add node requires input_ids to match that length exactly — pad with zeros.
+		if len(ids64) < clipCtxLen {
+			padded := make([]int64, clipCtxLen)
+			copy(padded, ids64)
+			ids64 = padded
+		}
 
-		inputIDs, err := ort.NewTensor(ort.NewShape(1, seqLen), ids64)
+		inputIDs, err := ort.NewTensor(ort.NewShape(1, clipCtxLen), ids64)
 		if err != nil {
 			return nil, fmt.Errorf("clip text input_ids tensor: %w", err)
 		}
@@ -992,7 +1051,8 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 
-	// Vector search both collections, capped at 200 to reduce noise
+	// Vector search both collections. Images are capped lower than text: they add
+	// semantic coverage but shouldn't flood rankings for text-heavy queries.
 	textResults, err := s.db.Vector().Search(ctx, textQueryVec, core.SearchOptions{
 		Collection: textCollection,
 		TopK:       200,
@@ -1003,43 +1063,68 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	imageResults, err := s.db.Vector().Search(ctx, imageQueryVec, core.SearchOptions{
 		Collection: imageCollection,
-		TopK:       200,
+		TopK:       50,
 	})
 	if err != nil {
 		log.Printf("image search error: %v", err)
 	}
 
-	scores := map[string]float64{}
+	// Phase 1: run independent scoring signals in parallel, each writing to its own map.
+	// Path FTS, content FTS, and vector results have no inter-dependencies.
+	const numSigGroups = 3
+	sigCh := make(chan map[string]float64, numSigGroups)
+	var sigWg sync.WaitGroup
 
-	// Signal 1: Path FTS5 exact word OR (3x)
-	s.addPathFTSScores(ctx, query, scores, 3.0)
-	// Signal 2: Path FTS5 ALL words AND — boosts paths containing every query word (4x)
-	s.addPathFTSAllWords(ctx, query, scores, 4.0)
-	// Signal 3: Path FTS5 full-word prefix OR (1.5x)
-	s.addPathFTSPrefixScores(ctx, query, scores, 1.5)
-	// Signal 4: Path FTS5 3-char anchor AND — "alb"* "cam"* (1.0x)
-	s.addPathFTSShortPrefixScores(ctx, query, scores, 1.0)
+	// Group A: path FTS signals (4 queries on paths_fts)
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		s.addPathFTSScores(ctx, query, m, 3.0)
+		s.addPathFTSAllWords(ctx, query, m, 4.0)
+		s.addPathFTSPrefixScores(ctx, query, m, 1.5)
+		s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
+		sigCh <- m
+	}()
 
-	// Signal 5: Text vector RRF
-	for i, res := range textResults {
-		scores[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+	// Group B: content FTS signals; fuzzy only runs when exact search finds few docs.
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		s.addContentFTSPhraseRRF(ctx, query, m)
+		s.addContentFTSRRF(ctx, query, m)
+		if len(m) < 5 {
+			s.addContentFTSFuzzyRRF(ctx, query, m)
+		}
+		sigCh <- m
+	}()
+
+	// Group C: vector result iteration (in-memory, no I/O)
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		for i, res := range textResults {
+			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+		}
+		for i, res := range imageResults {
+			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+		}
+		sigCh <- m
+	}()
+
+	go func() { sigWg.Wait(); close(sigCh) }()
+
+	scores := make(map[string]float64)
+	for m := range sigCh {
+		for path, score := range m {
+			scores[path] += score
+		}
 	}
-	// Signal 6: Content phrase match — "Albert Camus" adjacent in text (2.5x)
-	s.addContentFTSPhraseRRF(ctx, query, scores)
-	// Signal 7: Content FTS5 exact keyword OR RRF
-	s.addContentFTSRRF(ctx, query, scores)
-	// Signal 8: Content FTS5 3-char prefix fuzzy RRF (0.8x)
-	s.addContentFTSFuzzyRRF(ctx, query, scores)
 
-	// Signal 9: Image vector RRF (1.1x)
-	for i, res := range imageResults {
-		path := res.Metadata["path"]
-		scores[path] += 1.1 / (rrfK + float64(i+1))
-	}
-
-	// Signal 10: Filename word-set match + URL-decode + multi-word coverage bonus
+	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
 	addFilenameBoosts(query, scores)
-	// Signal 11: Word-level Levenshtein fuzzy path boost
 	addFuzzyPathBoosts(query, scores)
 
 	results := make([]SearchResult, 0, len(scores))
@@ -1047,6 +1132,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		results = append(results, SearchResult{Path: path, Score: score})
 	}
 	sortResults(results)
+	results = s.rerank(query, results)
 
 	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return results, nil
@@ -1074,23 +1160,53 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("text search failed: %w", err)
 	}
 
-	scores := map[string]float64{}
+	// Phase 1: parallel scoring signals.
+	tsSigCh := make(chan map[string]float64, 3)
+	var tsSigWg sync.WaitGroup
 
-	// Path FTS5 exact OR (3x) + ALL-words AND (4x) + full-word prefix (1.5x) + 3-char anchor (1.0x)
-	s.addPathFTSScores(ctx, query, scores, 3.0)
-	s.addPathFTSAllWords(ctx, query, scores, 4.0)
-	s.addPathFTSPrefixScores(ctx, query, scores, 1.5)
-	s.addPathFTSShortPrefixScores(ctx, query, scores, 1.0)
+	tsSigWg.Add(1)
+	go func() {
+		defer tsSigWg.Done()
+		m := make(map[string]float64)
+		s.addPathFTSScores(ctx, query, m, 3.0)
+		s.addPathFTSAllWords(ctx, query, m, 4.0)
+		s.addPathFTSPrefixScores(ctx, query, m, 1.5)
+		s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
+		tsSigCh <- m
+	}()
 
-	// Text vector RRF + content phrase (2.5x) + exact keyword + fuzzy prefix
-	for i, res := range results {
-		scores[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+	tsSigWg.Add(1)
+	go func() {
+		defer tsSigWg.Done()
+		m := make(map[string]float64)
+		s.addContentFTSPhraseRRF(ctx, query, m)
+		s.addContentFTSRRF(ctx, query, m)
+		if len(m) < 5 {
+			s.addContentFTSFuzzyRRF(ctx, query, m)
+		}
+		tsSigCh <- m
+	}()
+
+	tsSigWg.Add(1)
+	go func() {
+		defer tsSigWg.Done()
+		m := make(map[string]float64)
+		for i, res := range results {
+			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+		}
+		tsSigCh <- m
+	}()
+
+	go func() { tsSigWg.Wait(); close(tsSigCh) }()
+
+	scores := make(map[string]float64)
+	for m := range tsSigCh {
+		for path, score := range m {
+			scores[path] += score
+		}
 	}
-	s.addContentFTSPhraseRRF(ctx, query, scores)
-	s.addContentFTSRRF(ctx, query, scores)
-	s.addContentFTSFuzzyRRF(ctx, query, scores)
 
-	// Filename word-set match + URL-decode + multi-word coverage bonus + Levenshtein fuzzy
+	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
 	addFilenameBoosts(query, scores)
 	addFuzzyPathBoosts(query, scores)
 
@@ -1099,6 +1215,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		out = append(out, SearchResult{Path: path, Score: score})
 	}
 	sortResults(out)
+	out = s.rerank(query, out)
 
 	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return out, nil
@@ -1399,7 +1516,7 @@ func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
 		WHERE chunks_fts MATCH ?
 		ORDER BY bm25(chunks_fts)
-		LIMIT 1000
+		LIMIT 400
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts search warning: %v", err)
@@ -1465,7 +1582,7 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
 		WHERE chunks_fts MATCH ?
 		ORDER BY bm25(chunks_fts)
-		LIMIT 500
+		LIMIT 100
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts fuzzy search warning: %v", err)
@@ -1734,11 +1851,243 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 	}
 }
 
+// buildFTSQuery returns an FTS5 keyword OR query for the given text, e.g.
+// "albert camus" → `"albert" OR "camus"`. Used to fetch the most relevant
+// chunk per document for the reranker.
+func buildFTSQuery(query string) string {
+	words := strings.Fields(query)
+	quoted := make([]string, 0, len(words))
+	for _, w := range words {
+		if w != "" {
+			quoted = append(quoted, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
+		}
+	}
+	if len(quoted) == 0 {
+		return `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
+	}
+	return strings.Join(quoted, " OR ")
+}
+
+// rerank re-scores the top rerankerTopN text results using the cross-encoder.
+// Images are partitioned out before reranking (cross-encoder needs text) and
+// re-inserted after by their original RRF rank, so they compete fairly with
+// reranked text rather than being stranded at the bottom by score-range mismatch.
+// No-ops if the reranker session was not loaded.
+func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
+	if s.rerankerSession == nil || len(results) == 0 {
+		return results
+	}
+
+	n := len(results)
+	if n > rerankerTopN {
+		n = rerankerTopN
+	}
+	top := results[:n]
+	rest := results[n:]
+
+	// Fetch the most query-relevant text chunk per document using BM25.
+	// Using the longest chunk (previous approach) caused truncation to cut off key terms.
+	// BM25 match ensures the chunk passed to the cross-encoder actually contains
+	// query-relevant content. Images will produce no rows here.
+	// The filename is prepended so the reranker can use it as a signal for files
+	// where the name is the primary identifier (e.g. "Albert Camus.jpg", "invoice_2024.pdf").
+	docText := make(map[string]string, n)
+	ftsQuery := buildFTSQuery(query)
+	for _, r := range top {
+		if _, ok := docText[r.Path]; ok {
+			continue
+		}
+		basename := filepath.Base(r.Path)
+		if decoded, err := url.PathUnescape(basename); err == nil {
+			basename = decoded
+		}
+		var content string
+		err := s.sqlDB.QueryRowContext(context.Background(), `
+			SELECT content FROM chunks_fts
+			JOIN embeddings e ON chunks_fts.rowid = e.rowid
+			WHERE chunks_fts MATCH ?
+			  AND json_extract(e.metadata, '$.path') = ?
+			  AND length(content) > 0
+			ORDER BY bm25(chunks_fts)
+			LIMIT 1
+		`, ftsQuery, r.Path).Scan(&content)
+		if err != nil {
+			// No FTS match — fall back to any non-empty chunk.
+			s.sqlDB.QueryRowContext(context.Background(), `
+				SELECT content FROM embeddings
+				WHERE json_extract(metadata, '$.path') = ?
+				  AND length(content) > 0
+				LIMIT 1
+			`, r.Path).Scan(&content)
+		}
+		// Always include filename so the model sees it even for images/empty files.
+		docText[r.Path] = "Filename: " + basename + "\n" + content
+	}
+
+	// Partition: image files are held aside at their original rank and re-inserted
+	// after reranking. Mixing image RRF scores (~0.016) with cross-encoder logits
+	// (~-8 to +8) in the same sort would always sink images to the bottom.
+	// All files (including images) get a docText entry with at least the filename,
+	// so the partition is based on file type, not docText presence.
+	type withRank struct {
+		result   SearchResult
+		origRank int
+	}
+	var textItems []withRank
+	var nonTextItems []withRank
+	for i, r := range top {
+		if IsImageFile(r.Path) {
+			nonTextItems = append(nonTextItems, withRank{r, i})
+		} else {
+			textItems = append(textItems, withRank{r, i})
+		}
+	}
+
+	// Run cross-encoder on text items.
+	type scored struct {
+		result SearchResult
+		score  float32
+	}
+	rerankedText := make([]scored, 0, len(textItems))
+
+	qEnc := s.rerankerTok.EncodeWithOptions(query, false)
+	qIDs := qEnc.IDs
+
+	for _, item := range textItems {
+		text := docText[item.result.Path]
+
+		// Build <s> query </s></s> document </s> (RoBERTa pair format).
+		// jina-reranker-turbo uses XLM-RoBERTa tokenizer: <s>=0, </s>=2, no token_type_ids.
+		dEnc := s.rerankerTok.EncodeWithOptions(text, false)
+		dIDs := dEnc.IDs
+
+		total := 1 + len(qIDs) + 2 + len(dIDs) + 1
+		ids64 := make([]int64, 0, total)
+		mask64 := make([]int64, 0, total)
+
+		push := func(id int64) {
+			ids64 = append(ids64, id)
+			mask64 = append(mask64, 1)
+		}
+
+		push(0) // <s>
+		for _, id := range qIDs {
+			push(int64(id))
+		}
+		push(2) // </s>
+		push(2) // </s> (RoBERTa double separator between segments)
+		for _, id := range dIDs {
+			push(int64(id))
+		}
+		push(2) // </s>
+
+		if len(ids64) > rerankerMaxToks {
+			ids64 = ids64[:rerankerMaxToks]
+			mask64 = mask64[:rerankerMaxToks]
+		}
+		seqLen := int64(len(ids64))
+
+		shape := ort.NewShape(1, seqLen)
+		tIDs, err1 := ort.NewTensor(shape, ids64)
+		tMask, err2 := ort.NewTensor(shape, mask64)
+		tOut, err3 := ort.NewEmptyTensor[float32](ort.NewShape(1, 1))
+		if err1 != nil || err2 != nil || err3 != nil {
+			if tIDs != nil {
+				tIDs.Destroy()
+			}
+			if tMask != nil {
+				tMask.Destroy()
+			}
+			if tOut != nil {
+				tOut.Destroy()
+			}
+			rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
+			continue
+		}
+
+		err := s.rerankerSession.Run(
+			[]ort.Value{tIDs, tMask},
+			[]ort.Value{tOut},
+		)
+		logit := tOut.GetData()[0]
+		tIDs.Destroy()
+		tMask.Destroy()
+		tOut.Destroy()
+
+		if err != nil {
+			log.Printf("reranker inference warning for %s: %v", item.result.Path, err)
+			rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
+			continue
+		}
+		r := item.result
+		r.Score = float64(logit)
+		rerankedText = append(rerankedText, scored{r, logit})
+	}
+
+	sort.Slice(rerankedText, func(i, j int) bool {
+		return rerankedText[i].score > rerankedText[j].score
+	})
+
+	// Merge reranked text and non-text back together.
+	// Non-text items re-enter at their original rank positions so that a highly
+	// relevant image (rank 2 by RRF) doesn't fall below all text results.
+	textIdx := 0
+	nonIdx := 0
+	out := make([]SearchResult, 0, len(results))
+	for i := 0; i < n; i++ {
+		// If the next non-text item originally held this rank, insert it now.
+		if nonIdx < len(nonTextItems) && nonTextItems[nonIdx].origRank == i {
+			out = append(out, nonTextItems[nonIdx].result)
+			nonIdx++
+		} else if textIdx < len(rerankedText) {
+			out = append(out, rerankedText[textIdx].result)
+			textIdx++
+		}
+	}
+	// Flush any remaining items (shouldn't happen but guards against off-by-one).
+	for ; textIdx < len(rerankedText); textIdx++ {
+		out = append(out, rerankedText[textIdx].result)
+	}
+	for ; nonIdx < len(nonTextItems); nonIdx++ {
+		out = append(out, nonTextItems[nonIdx].result)
+	}
+	out = append(out, rest...)
+	return out
+}
+
 // sortResults sorts SearchResults by score descending.
 func sortResults(results []SearchResult) {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Score > results[j].Score
 	})
+}
+
+// findReranker locates reranker.onnx and its tokenizer.json by checking next to
+// the executable then the current working directory. Returns empty strings if absent.
+func findReranker() (onnxPath, tokPath string) {
+	const onnxName = "reranker.onnx"
+	const tokName = "tokenizer.json"
+
+	dirs := []string{}
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, cwd)
+	}
+
+	for _, dir := range dirs {
+		op := filepath.Join(dir, onnxName)
+		tp := filepath.Join(dir, tokName)
+		if _, err := os.Stat(op); err != nil {
+			continue
+		}
+		if _, err := os.Stat(tp); err != nil {
+			continue
+		}
+		return op, tp
+	}
+	return "", ""
 }
 
 // findOnnxRuntime locates onnxruntime.dll by checking:

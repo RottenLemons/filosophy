@@ -11,3 +11,5 @@ test.ipynb
 .claude/**
 kreuzberg-ffi/**
 .indexed
+reranker.onnx
+tokenizer.json

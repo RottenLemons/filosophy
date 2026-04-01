@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -126,6 +127,10 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 		// but since we are limiting concurrency via maxConcurrency semaphore anyway,
 		// guarding the channel drain is safer.
 		IndexBatch(items, mode, sc)
+		// Yield after releasing the HNSW write lock so search goroutines can acquire
+		// RLock between consecutive batch flushes. Without this, back-to-back flushes
+		// from competing goroutines starve search (RLock blocks when writers are queued).
+		runtime.Gosched()
 	}
 }
 
