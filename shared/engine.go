@@ -51,8 +51,9 @@ const (
 
 	// rerankerTopN is how many results from the RRF stage are passed to the
 	// cross-encoder reranker. Everything beyond this position is returned as-is.
-	rerankerTopN    = 20
-	rerankerMaxToks = 8192 // jina-reranker-turbo context length
+	rerankerTopN        = 20
+	rerankerMaxToks     = 8192 // jina-reranker-turbo context length
+	snippetWindowChars  = 800  // bytes per extracted window ≈ 200 subword tokens
 
 	// rrfK is the Reciprocal Rank Fusion constant. Larger values reduce the
 	// penalty gap between adjacent ranks, smoothing signal contributions.
@@ -1868,6 +1869,63 @@ func buildFTSQuery(query string) string {
 	return strings.Join(quoted, " OR ")
 }
 
+// extractSnippets returns up to maxWindows windows of snippetWindowChars bytes from
+// content, each centered on a cluster of query-word occurrences. When no query term
+// is found the beginning of the content is returned. Overlapping windows are skipped.
+func extractSnippets(content, query string, maxWindows int) []string {
+	if len(content) == 0 || maxWindows <= 0 {
+		return nil
+	}
+	if len(content) <= snippetWindowChars {
+		return []string{content}
+	}
+	lc := strings.ToLower(content)
+	var positions []int
+	for _, word := range strings.Fields(strings.ToLower(query)) {
+		if len(word) < 2 {
+			continue
+		}
+		off := 0
+		for {
+			idx := strings.Index(lc[off:], word)
+			if idx < 0 {
+				break
+			}
+			positions = append(positions, off+idx)
+			off += idx + len(word)
+		}
+	}
+	if len(positions) == 0 {
+		return []string{content[:snippetWindowChars]}
+	}
+	sort.Ints(positions)
+	var out []string
+	covered := -1
+	for _, pos := range positions {
+		if pos < covered {
+			continue
+		}
+		start := pos - snippetWindowChars/2
+		if start < 0 {
+			start = 0
+		}
+		end := start + snippetWindowChars
+		if end > len(content) {
+			end = len(content)
+			start = end - snippetWindowChars
+			if start < 0 {
+				start = 0
+			}
+		}
+		out = append(out, content[start:end])
+		covered = end
+		if len(out) >= maxWindows {
+			break
+		}
+	}
+	return out
+}
+
 // rerank re-scores the top rerankerTopN text results using the cross-encoder.
 // Images are partitioned out before reranking (cross-encoder needs text) and
 // re-inserted after by their original RRF rank, so they compete fairly with
@@ -1885,44 +1943,66 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 	top := results[:n]
 	rest := results[n:]
 
-	// Fetch the most query-relevant text chunk per document using BM25.
-	// Using the longest chunk (previous approach) caused truncation to cut off key terms.
-	// BM25 match ensures the chunk passed to the cross-encoder actually contains
-	// query-relevant content. Images will produce no rows here.
-	// The filename is prepended so the reranker can use it as a signal for files
-	// where the name is the primary identifier (e.g. "Albert Camus.jpg", "invoice_2024.pdf").
-	docText := make(map[string]string, n)
-	ftsQuery := buildFTSQuery(query)
+	// Fetch up to 3 BM25-ranked snippets per document across all top-N paths in one query.
+	// snippet() extracts a ~64-token window around the actual match inside each chunk,
+	// so the reranker sees the relevant excerpt rather than an arbitrary prefix.
+	// Multiple snippets per doc cover spread-out occurrences; we take the max reranker
+	// score across snippets as the document score.
+	const maxSnippetsPerDoc = 3
+	docSnippets := make(map[string][]string, n) // path → ordered snippets
+	basenames := make(map[string]string, n)
+
+	// Build path → decoded basename map and collect unique paths.
+	paths := make([]string, 0, n)
+	seen := make(map[string]bool, n)
 	for _, r := range top {
-		if _, ok := docText[r.Path]; ok {
+		if seen[r.Path] {
 			continue
 		}
-		basename := filepath.Base(r.Path)
-		if decoded, err := url.PathUnescape(basename); err == nil {
-			basename = decoded
+		seen[r.Path] = true
+		paths = append(paths, r.Path)
+		base := filepath.Base(r.Path)
+		if decoded, err := url.PathUnescape(base); err == nil {
+			base = decoded
 		}
-		var content string
-		err := s.sqlDB.QueryRowContext(context.Background(), `
-			SELECT content FROM chunks_fts
-			JOIN embeddings e ON chunks_fts.rowid = e.rowid
-			WHERE chunks_fts MATCH ?
-			  AND json_extract(e.metadata, '$.path') = ?
-			  AND length(content) > 0
-			ORDER BY bm25(chunks_fts)
-			LIMIT 1
-		`, ftsQuery, r.Path).Scan(&content)
-		if err != nil {
-			// No FTS match — fall back to any non-empty chunk.
-			s.sqlDB.QueryRowContext(context.Background(), `
-				SELECT content FROM embeddings
-				WHERE json_extract(metadata, '$.path') = ?
-				  AND length(content) > 0
-				LIMIT 1
-			`, r.Path).Scan(&content)
-		}
-		// Always include filename so the model sees it even for images/empty files.
-		docText[r.Path] = "Filename: " + basename + "\n" + content
+		basenames[r.Path] = base
 	}
+
+	ftsQuery := buildFTSQuery(query)
+	placeholders := strings.Repeat("?,", len(paths))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, 1+len(paths))
+	args = append(args, ftsQuery)
+	for _, p := range paths {
+		args = append(args, p)
+	}
+	// Fetch up to maxSnippetsPerDoc best BM25 chunks per path; extractSnippets will then
+	// find all query-term positions within each chunk and extract 800-char windows around
+	// them, covering spread-out occurrences without truncating to an arbitrary prefix.
+	rows, err := s.sqlDB.QueryContext(context.Background(), `
+		SELECT json_extract(e.metadata, '$.path'), content
+		FROM chunks_fts
+		JOIN embeddings e ON chunks_fts.rowid = e.rowid
+		WHERE chunks_fts MATCH ?
+		  AND json_extract(e.metadata, '$.path') IN (`+placeholders+`)
+		  AND length(content) > 0
+		ORDER BY bm25(chunks_fts)
+		LIMIT ?
+	`, append(args, len(paths)*maxSnippetsPerDoc)...)
+	if err == nil {
+		for rows.Next() {
+			var path, content string
+			if rows.Scan(&path, &content) == nil {
+				remaining := maxSnippetsPerDoc - len(docSnippets[path])
+				if remaining > 0 {
+					windows := extractSnippets(content, query, remaining)
+					docSnippets[path] = append(docSnippets[path], windows...)
+				}
+			}
+		}
+		rows.Close()
+	}
+	// Fallback for paths with no FTS match (images, empty files): use filename only.
 
 	// Partition: image files are held aside at their original rank and re-inserted
 	// after reranking. Mixing image RRF scores (~0.016) with cross-encoder logits
@@ -1943,7 +2023,9 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 		}
 	}
 
-	// Run cross-encoder on text items.
+	// Encode all (query, snippet) pairs across all text items into a single batch.
+	// Each document may have up to maxSnippetsPerDoc snippets; we run them all through
+	// the reranker and take the max logit as the document score.
 	type scored struct {
 		result SearchResult
 		score  float32
@@ -1953,44 +2035,74 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 	qEnc := s.rerankerTok.EncodeWithOptions(query, false)
 	qIDs := qEnc.IDs
 
-	for _, item := range textItems {
-		text := docText[item.result.Path]
+	type pairTokens struct {
+		ids  []int64
+		mask []int64
+	}
+	// pairs holds one entry per (doc, snippet); pairDoc maps pair index → textItems index.
+	pairs := make([]pairTokens, 0, len(textItems)*maxSnippetsPerDoc)
+	pairDoc := make([]int, 0, len(textItems)*maxSnippetsPerDoc)
 
-		// Build <s> query </s></s> document </s> (RoBERTa pair format).
-		// jina-reranker-turbo uses XLM-RoBERTa tokenizer: <s>=0, </s>=2, no token_type_ids.
+	encodePair := func(text string) pairTokens {
 		dEnc := s.rerankerTok.EncodeWithOptions(text, false)
 		dIDs := dEnc.IDs
-
 		total := 1 + len(qIDs) + 2 + len(dIDs) + 1
 		ids64 := make([]int64, 0, total)
 		mask64 := make([]int64, 0, total)
-
-		push := func(id int64) {
-			ids64 = append(ids64, id)
-			mask64 = append(mask64, 1)
-		}
-
+		push := func(id int64) { ids64 = append(ids64, id); mask64 = append(mask64, 1) }
 		push(0) // <s>
 		for _, id := range qIDs {
 			push(int64(id))
 		}
 		push(2) // </s>
-		push(2) // </s> (RoBERTa double separator between segments)
+		push(2) // </s> (RoBERTa double separator)
 		for _, id := range dIDs {
 			push(int64(id))
 		}
 		push(2) // </s>
-
 		if len(ids64) > rerankerMaxToks {
 			ids64 = ids64[:rerankerMaxToks]
 			mask64 = mask64[:rerankerMaxToks]
 		}
-		seqLen := int64(len(ids64))
+		return pairTokens{ids64, mask64}
+	}
 
-		shape := ort.NewShape(1, seqLen)
-		tIDs, err1 := ort.NewTensor(shape, ids64)
-		tMask, err2 := ort.NewTensor(shape, mask64)
-		tOut, err3 := ort.NewEmptyTensor[float32](ort.NewShape(1, 1))
+	for i, item := range textItems {
+		snippets := docSnippets[item.result.Path]
+		if len(snippets) == 0 {
+			// No FTS match (e.g. directory, empty file): use filename as sole snippet.
+			snippets = []string{"Filename: " + basenames[item.result.Path]}
+		}
+		log.Printf("reranker [%s] %d snippet(s):", basenames[item.result.Path], len(snippets))
+		for si, snip := range snippets {
+			log.Printf("  snippet[%d]: %s", si, snip)
+			pairs = append(pairs, encodePair("Filename: "+basenames[item.result.Path]+"\n"+snip))
+			pairDoc = append(pairDoc, i)
+		}
+	}
+
+	if len(pairs) > 0 {
+		// Find max sequence length for zero-padding. Snippets are short (~64 FTS tokens
+		// ≈ 400 chars ≈ 100 subword tokens) so variance across pairs is low.
+		maxSeqLen := 0
+		for _, p := range pairs {
+			if len(p.ids) > maxSeqLen {
+				maxSeqLen = len(p.ids)
+			}
+		}
+
+		nPairs := len(pairs)
+		flatIDs := make([]int64, nPairs*maxSeqLen)
+		flatMask := make([]int64, nPairs*maxSeqLen)
+		for i, p := range pairs {
+			copy(flatIDs[i*maxSeqLen:], p.ids)
+			copy(flatMask[i*maxSeqLen:], p.mask)
+		}
+
+		shape := ort.NewShape(int64(nPairs), int64(maxSeqLen))
+		tIDs, err1 := ort.NewTensor(shape, flatIDs)
+		tMask, err2 := ort.NewTensor(shape, flatMask)
+		tOut, err3 := ort.NewEmptyTensor[float32](ort.NewShape(int64(nPairs), 1))
 		if err1 != nil || err2 != nil || err3 != nil {
 			if tIDs != nil {
 				tIDs.Destroy()
@@ -2001,27 +2113,60 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 			if tOut != nil {
 				tOut.Destroy()
 			}
-			rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
-			continue
-		}
+			for _, item := range textItems {
+				rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
+			}
+		} else {
+			runErr := s.rerankerSession.Run(
+				[]ort.Value{tIDs, tMask},
+				[]ort.Value{tOut},
+			)
+			logits := tOut.GetData() // []float32 of length nPairs
+			tIDs.Destroy()
+			tMask.Destroy()
+			tOut.Destroy()
 
-		err := s.rerankerSession.Run(
-			[]ort.Value{tIDs, tMask},
-			[]ort.Value{tOut},
-		)
-		logit := tOut.GetData()[0]
-		tIDs.Destroy()
-		tMask.Destroy()
-		tOut.Destroy()
-
-		if err != nil {
-			log.Printf("reranker inference warning for %s: %v", item.result.Path, err)
-			rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
-			continue
+			if runErr != nil {
+				log.Printf("reranker batch inference warning: %v", runErr)
+				for _, item := range textItems {
+					rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
+				}
+			} else {
+				// Aggregate per-document: take the max logit across all its snippets.
+				docMax := make([]float32, len(textItems))
+				for i := range docMax {
+					docMax[i] = -1e9
+				}
+				for pi, logit := range logits {
+					di := pairDoc[pi]
+					if logit > docMax[di] {
+						docMax[di] = logit
+					}
+				}
+				// Blend sigmoid(reranker logit) with normalised RRF score.
+				// Pure reranker score fails when the extracted snippet doesn't contain
+				// the full query context (e.g. Algiers.txt snippet missing "camus"):
+				// the reranker scores it low even though RRF ranked it high.
+				// sigmoid maps logits to [0,1]; RRF is normalised to [0,1] by maxRRF.
+				// 50/50 blend lets a strong RRF signal preserve rank for files where
+				// the snippet underrepresents relevance.
+				maxRRF := 1e-9
+				for _, item := range textItems {
+					if item.result.Score > maxRRF {
+						maxRRF = item.result.Score
+					}
+				}
+				for i, item := range textItems {
+					rerankerProb := 1.0 / (1.0 + math.Exp(float64(-docMax[i]))) // sigmoid → [0,1]
+					rrfNorm := item.result.Score / maxRRF                         // normalised RRF → [0,1]
+					blended := float32(0.5*rerankerProb + 0.5*rrfNorm)
+					r := item.result
+					r.Score = float64(blended)
+					log.Printf("reranker score %.4f (logit=%.4f rrf=%.4f)  %s", blended, docMax[i], item.result.Score, item.result.Path)
+					rerankedText = append(rerankedText, scored{r, blended})
+				}
+			}
 		}
-		r := item.result
-		r.Score = float64(logit)
-		rerankedText = append(rerankedText, scored{r, logit})
 	}
 
 	sort.Slice(rerankedText, func(i, j int) bool {
@@ -2052,6 +2197,13 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 		out = append(out, nonTextItems[nonIdx].result)
 	}
 	out = append(out, rest...)
+	log.Printf("reranker final order:")
+	for i, r := range out {
+		if i >= rerankerTopN {
+			break
+		}
+		log.Printf("  #%d  %.4f  %s", i+1, r.Score, r.Path)
+	}
 	return out
 }
 
