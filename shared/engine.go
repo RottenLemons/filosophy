@@ -726,6 +726,8 @@ func getStats(startCPU int64, startTime time.Time) string {
 // ---------------------------------------------------------------------------
 
 // upsertFiles inserts or updates file-level hashes, mtimes, sizes, and marks the file as content-indexed.
+// ext/ctime/atime are populated on insert; ctime is intentionally not overwritten on conflict
+// (creation time doesn't change), while atime and ext are updated to stay current.
 func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
 	if len(filePaths) == 0 {
 		return nil
@@ -737,15 +739,21 @@ func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(path, hash, mtime, size, content_indexed) VALUES (?, ?, ?, ?, 1)
-		ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1`)
+		INSERT INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
+		VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1,
+			ext=excluded.ext, atime=excluded.atime`)
+	// ctime is intentionally omitted from the UPDATE: creation time never changes.
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for i := range filePaths {
-		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i]); err != nil {
+		ext := strings.ToLower(filepath.Ext(filePaths[i]))
+		ctime, atime := fileExtraTimes(filePaths[i])
+		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i], ext, ctime, atime); err != nil {
 			return err
 		}
 	}
@@ -891,16 +899,21 @@ func (s *Engine) InitIndexTables() error {
 			hash             INTEGER NOT NULL DEFAULT 0,
 			mtime            INTEGER NOT NULL DEFAULT 0,
 			size             INTEGER NOT NULL DEFAULT 0,
-			content_indexed  INTEGER NOT NULL DEFAULT 0
+			content_indexed  INTEGER NOT NULL DEFAULT 0,
+			ext              TEXT    NOT NULL DEFAULT '',
+			ctime            INTEGER NOT NULL DEFAULT 0,
+			atime            INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE VIRTUAL TABLE IF NOT EXISTS paths_fts USING fts5(path);
 	`); err != nil {
 		return fmt.Errorf("failed to create index tables: %w", err)
 	}
+
 	return nil
 }
 
-// IndexMetadata inserts file paths, mtimes, and sizes into the files table without
+// IndexMetadata inserts file paths, mtimes, sizes, and file-system metadata
+// (extension, creation time, last-access time) into the files table without
 // marking them as content-indexed, and populates paths_fts so path-based search
 // works immediately after Pass 1. Already-present rows are left untouched (INSERT OR IGNORE).
 func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
@@ -914,8 +927,9 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
 	}
 	defer tx.Rollback()
 
-	filesStmt, err := tx.PrepareContext(ctx,
-		`INSERT OR IGNORE INTO files(path, hash, mtime, size, content_indexed) VALUES (?, 0, ?, ?, 0)`)
+	filesStmt, err := tx.PrepareContext(ctx, `
+		INSERT OR IGNORE INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
+		VALUES (?, 0, ?, ?, 0, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -928,7 +942,9 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
 	defer ftsStmt.Close()
 
 	for i := range paths {
-		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i]); err != nil {
+		ext := strings.ToLower(filepath.Ext(paths[i]))
+		ctime, atime := fileExtraTimes(paths[i])
+		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i], ext, ctime, atime); err != nil {
 			return err
 		}
 		if _, err := ftsStmt.ExecContext(ctx, paths[i]); err != nil {
@@ -1035,6 +1051,9 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	t0 := time.Now()
 	ctx := context.Background()
 
+	pq := ParseQuery(query)
+	query = pq.Text
+
 	// Encode query with text model
 	textEmbs, err := s.embedText([]string{query})
 	if err != nil {
@@ -1134,6 +1153,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	sortResults(results)
 	results = s.rerank(query, results)
+	results = s.applyFilters(results, pq)
 
 	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return results, nil
@@ -1145,6 +1165,9 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	cpu0 := getCPUTime()
 	t0 := time.Now()
 	ctx := context.Background()
+
+	pq := ParseQuery(query)
+	query = pq.Text
 
 	embs, err := s.embedText([]string{query})
 	if err != nil {
@@ -1217,6 +1240,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	}
 	sortResults(out)
 	out = s.rerank(query, out)
+	out = s.applyFilters(out, pq)
 
 	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return out, nil
