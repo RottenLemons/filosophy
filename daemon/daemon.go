@@ -320,7 +320,7 @@ func (d *Daemon) flush() {
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
 		fmt.Println("[FLUSH] indexing:", addPaths)
-		cfg := shared.NewProcessorConfig(8096, 100, 50, d.sc)
+		cfg := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
 
 		for _, path := range addPaths {
 			info, err := os.Stat(path)
@@ -485,68 +485,10 @@ func (d *Daemon) run() {
 		}
 	}()
 
-	// Perform initial crawl asynchronously so watch loops continue running
-	go func() {
-		start := time.Now()
-		cfg := shared.NewProcessorConfig(8096, 4000, 100, d.sc)
-		fmt.Println("[DAEMON] Starting initial indexing crawl...")
-		maxConcurrency := 4
-		sem := make(chan struct{}, maxConcurrency)
-
-		filepath.Walk(d.baseDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if info.IsDir() {
-				if shouldFilterFolder(info.Name()) {
-					return filepath.SkipDir
-				}
-				shared.ProcessDirectory(path, cfg)
-				return nil
-			}
-
-			if shouldFilterPath(path) {
-				return nil
-			}
-
-			if isFileTooLarge(path) {
-				return nil
-			}
-
-			d.t.mu.Lock()
-			cachedHash, _ := d.t.getHash(path)
-			d.t.mu.Unlock()
-
-			currentHash, err := hashFile(path)
-			if err != nil || (cachedHash != 0 && cachedHash == currentHash) {
-				return nil
-			}
-
-			d.t.mu.Lock()
-			d.t.hashes[path] = currentHash
-			d.t.mu.Unlock()
-
-			sem <- struct{}{}
-
-			go func(path string) {
-				defer func() { <-sem }()
-				shared.ProcessFile(path, cfg)
-			}(path)
-
-			return nil
-		})
-
-		for i := 0; i < maxConcurrency; i++ {
-			sem <- struct{}{}
-		}
-
-		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
-		shared.DrainRemaining(cfg.Images, "image", d.sc)
-		cfg.CleanupTempDir()
-		end := time.Now()
-		fmt.Println("[DAEMON] Initial indexing complete in", end.Sub(start))
-	}()
+	// The initial indexing crawl was historically performed here. It has been entirely ripped out
+	// because `main.go` already triggers a structured 2-pass crawl via `runPass1` and `runPass2` before
+	// the Daemon boots up! Performing it here was duplicating work 1:1 and causing huge lock contention.
+	fmt.Println("[DAEMON] Initial crawl bypassed (delegated to main.go pipeline)")
 
 	<-d.exit
 }
@@ -558,10 +500,10 @@ func (d *Daemon) Stop() error {
 	}
 	close(d.exit)
 	if d.structureChan != nil {
-		close(d.structureChan)
+		notify.Stop(d.structureChan)
 	}
 	if d.contentChan != nil {
-		close(d.contentChan)
+		notify.Stop(d.contentChan)
 	}
 	return nil
 }

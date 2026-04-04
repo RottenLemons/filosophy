@@ -140,6 +140,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		"PRAGMA temp_store=MEMORY",
 		"PRAGMA mmap_size=536870912",
 		"PRAGMA cache_size=-200000",
+		"PRAGMA busy_timeout=10000",
 	} {
 		if _, err := sqlDB.Exec(pragma); err != nil {
 			log.Printf("pragma warning: %v", err)
@@ -911,6 +912,12 @@ func (s *Engine) InitIndexTables() error {
 	`); err != nil {
 		return fmt.Errorf("failed to create index tables: %w", err)
 	}
+
+	// Auto-migrate schema backfill for old DBs
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ext TEXT NOT NULL DEFAULT ''")
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0")
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN atime INTEGER NOT NULL DEFAULT 0")
+
 
 	var exists int
 	s.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paths_fts'").Scan(&exists)

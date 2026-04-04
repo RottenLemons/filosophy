@@ -1,11 +1,12 @@
 <script>
-  import { slide } from 'svelte/transition';
+  import { slide, fade } from 'svelte/transition';
   import SearchIcon from "carbon-icons-svelte/lib/Search.svelte";
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
+  import Indexer from '$lib/components/Indexer.svelte';
 
   /** @type {string} */
   let searchQuery = "";
@@ -17,6 +18,41 @@
   let searching = false;
 
   let isFilterOpen = false;
+  
+  const loadingMessages = [
+    "Searching for Untitled_final_FINAL_v3.pdf...",
+    "Attempting to decipher your file naming conventions...",
+    "Judging the contents of your Downloads folder...",
+    "Translating your typos into machine logic...",
+    "Interrogating the local language model...",
+    "Melting your CPU to find a single PDF...",
+    "Coercing the vector database...",
+    "Going exactly as fast as your RAM currently allows...",
+    "Forcing the neural network to read your documents...",
+    "Doing actual math. Hold on..."
+  ];
+  let currentMessageIndex = 0;
+  /** @type {any} */
+  let loadingInterval;
+
+  $: {
+    if (searching) {
+      if (!loadingInterval) {
+        currentMessageIndex = Math.floor(Math.random() * loadingMessages.length);
+        loadingInterval = setInterval(() => {
+          let nextIndex;
+          do {
+            nextIndex = Math.floor(Math.random() * loadingMessages.length);
+          } while (nextIndex === currentMessageIndex);
+          currentMessageIndex = nextIndex;
+        }, 1800);
+      }
+    } else {
+      clearInterval(loadingInterval);
+      loadingInterval = null;
+    }
+  }
+
   let filterType = 'All'; // Options: 'All', 'PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG', 'Other'
   let filterDate = 'Anytime'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
   let filterSize = 'Any'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '10 MB - 100 MB', '> 100 MB'
@@ -209,6 +245,9 @@
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#222] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
+        <!-- Indexer Section -->
+        <Indexer />
+
         <!-- Search Section -->
         <div class="space-y-4">
           <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#222] pb-3 transition-colors focus-within:border-blue-500">
@@ -360,6 +399,19 @@
                 </div>
               {/each}
             </div>
+          {:else if searching}
+            <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-8">
+              <svg class="animate-spin" style="animation-duration: 6s;" width="80" height="80" viewBox="0 0 80 80" fill="none" stroke="#757575" stroke-width="8" stroke-linecap="square">
+                <circle cx="40" cy="40" r="30" stroke-dasharray="140 48"></circle>
+              </svg>
+              <div class="h-8 relative w-full flex justify-center">
+                {#key currentMessageIndex}
+                  <span transition:fade={{duration: 600}} class="absolute text-[18px] text-[#acabab] text-center tracking-wide" style="font-family: 'Inter', sans-serif;">
+                    {loadingMessages[currentMessageIndex]}
+                  </span>
+                {/key}
+              </div>
+            </div>
           {:else if searchQuery.trim() !== ''}
              <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#222] border-dashed">No relevant documents found.</div>
           {/if}
@@ -404,14 +456,14 @@
             </div>
           </header>
           
-          <div class="flex-1 w-full h-full font-serif text-lg leading-relaxed text-slate-700 dark:text-gray-300 bg-white dark:bg-[#111] shadow-inner p-8 overflow-y-auto">
+          <div class="flex-1 w-full h-full font-serif text-lg leading-relaxed text-slate-700 dark:text-gray-100 bg-white dark:bg-[#111] shadow-inner p-8 overflow-y-auto">
             {#if getFileCategory(selectedFile.Path) === 'image'}
               <div class="w-full h-full flex items-center justify-center bg-[#FAF9F6] dark:bg-[#111]">
                 <!-- svelte-ignore a11y-missing-attribute -->
                 <img src={"/loadfile/" + encodeURIComponent(selectedFile.Path)} class="w-full h-full object-contain shadow-sm" />
               </div>
             {:else if getFileCategory(selectedFile.Path) === 'text'}
-              <div class="max-w-prose mx-auto font-serif text-slate-800 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">
+              <div class="max-w-prose mx-auto font-serif text-slate-800 dark:text-gray-100 leading-relaxed whitespace-pre-wrap">
                 {textContent}
               </div>
             {:else if getFileCategory(selectedFile.Path) === 'pdf'}
