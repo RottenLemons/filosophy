@@ -5,9 +5,15 @@ package main
 import (
 	"context"
 	"embed"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"filosophy/daemon"
@@ -16,97 +22,23 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 //go:embed all:frontend/build
 var assets embed.FS
 
-var parentDir string = "C:/Users/Mahir/Downloads/test/"
-
 // maxConcurrency limits background indexing goroutines. Keeping this low ensures
 // search goroutines can acquire the HNSW read lock between consecutive batch inserts.
 // With 10+ goroutines all queueing for HNSW.Lock(), search RLock starves indefinitely.
-const maxConcurrency = 3
+var maxConcurrency = runtime.NumCPU()
 
-// App holds application state exposed to the Wails frontend.
-type App struct {
-	ctx    context.Context
-	sc     *shared.Engine
-	daemon *daemon.Daemon
-}
-
-func NewApp() *App {
-	return &App{}
-}
-
-// startup is called by Wails when the app starts. It initialises the engine,
-// kicks off background indexing, and starts the file-watcher daemon.
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		log.Fatal("cannot get working directory:", err)
+func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale bool) {
+	if ctx != nil {
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Scanning directory...")
+		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
 	}
 
-	// Redirect logs to file so background work does not pollute anything.
-	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		log.SetOutput(lf)
-	}
-
-	dbPath := filepath.Join(cwd, "filosophy.db")
-	textModelPath := filepath.Join(cwd, "text")
-	imageModelPath := filepath.Join(cwd, "image")
-
-	sc, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Fatal("failed to initialize Engine:", err)
-	}
-	a.sc = sc
-
-	_, dbMissing := os.Stat(dbPath)
-	if os.IsNotExist(dbMissing) {
-		runPass1(sc, false)
-		go runPass2(sc)
-	} else {
-		go runPass2(sc)
-	}
-
-	a.daemon = daemon.NewDaemon(parentDir)
-	if err := a.daemon.Start(); err != nil {
-		log.Println("daemon start error:", err)
-	}
-}
-
-// shutdown is called by Wails when the app closes.
-func (a *App) shutdown(ctx context.Context) {
-	if a.daemon != nil {
-		a.daemon.Stop()
-	}
-	if a.sc != nil {
-		a.sc.Close()
-	}
-}
-
-// Search is exposed to the frontend via window.go.main.App.Search.
-// Returns a slice of matching file paths ordered by relevance.
-func (a *App) Search(query string) []string {
-	if a.sc == nil || query == "" {
-		return nil
-	}
-	results, err := a.sc.Search(query)
-	if err != nil {
-		log.Println("search error:", err)
-		return nil
-	}
-	paths := make([]string, len(results))
-	for i, r := range results {
-		paths[i] = r.Path
-	}
-	return paths
-}
-
-func runPass1(sc *shared.Engine, pruneStale bool) {
 	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
 	defer cfg.CleanupTempDir()
 
@@ -114,7 +46,12 @@ func runPass1(sc *shared.Engine, pruneStale bool) {
 	var mtimes []int64
 	var sizes []int64
 
-	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		select {
+		case <-ctx.Done():
+			return filepath.SkipDir
+		default:
+		}
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -124,55 +61,377 @@ func runPass1(sc *shared.Engine, pruneStale bool) {
 		return nil
 	})
 
+	if ctx.Err() != nil {
+		return
+	}
+
 	if pruneStale {
+		if ctx != nil {
+			wailsruntime.EventsEmit(ctx, "indexing_status", "Pruning stale files...")
+		}
 		if err := sc.PruneStale(paths); err != nil {
 			log.Println("pass1 prune error:", err)
 		}
 	}
 
+	if ctx != nil {
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing metadata...")
+	}
 	if err := sc.IndexMetadata(paths, mtimes, sizes); err != nil {
 		log.Println("pass1 metadata index error:", err)
 	}
 
-	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+	if ctx != nil {
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Processing directories...")
+	}
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		select {
+		case <-ctx.Done():
+			return filepath.SkipDir
+		default:
+		}
 		if err != nil || !info.IsDir() {
 			return nil
 		}
 		shared.ProcessDirectory(path, cfg)
 		return nil
 	})
+
+	if ctx.Err() != nil {
+		return
+	}
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 }
 
-func runPass2(sc *shared.Engine) {
+func runPass2(ctx context.Context, sc *shared.Engine) {
 	paths, _, err := sc.UnindexedFiles()
 	if err != nil {
 		log.Println("pass2 query error:", err)
+		if ctx != nil {
+			wailsruntime.EventsEmit(ctx, "indexing_status", "Error querying unindexed files")
+		}
 		return
 	}
-	if len(paths) == 0 {
+
+	total := len(paths)
+	if total == 0 {
+		if ctx != nil {
+			wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing complete.")
+			wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
+		}
 		return
+	}
+
+	if ctx != nil {
+		wailsruntime.EventsEmit(ctx, "indexing_status", "CALCULATING ETA...")
+		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
 	}
 
 	start := time.Now()
-	cfg := shared.NewProcessorConfig(8096, 200, 50, sc)
+	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
 	defer cfg.CleanupTempDir()
+
+	var processed int32
+
+	doneChan := make(chan struct{})
+	if ctx != nil {
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+
+			var lastETA string
+			var lastETATime time.Time
+
+			for {
+				select {
+				case <-doneChan:
+					return
+				case <-ticker.C:
+					done := atomic.LoadInt32(&processed)
+					progressPct := int((float64(done) / float64(total)) * 100)
+
+					var statusMsg string
+					elapsed := time.Since(start).Seconds()
+
+					if done > 5 && elapsed > 0 {
+						if time.Since(lastETATime) > 2*time.Second || lastETA == "" {
+							itemsPerSec := float64(done) / elapsed
+							remaining := float64(total-int(done)) / itemsPerSec
+							if remaining > 0 {
+								etaDur := time.Duration(remaining) * time.Second
+								lastETA = fmt.Sprintf("ETA %s", etaDur.Round(time.Second).String())
+							} else {
+								lastETA = ""
+							}
+							lastETATime = time.Now()
+						}
+						if lastETA != "" {
+							statusMsg = fmt.Sprintf("%d%% - %s", progressPct, lastETA)
+						} else {
+							statusMsg = fmt.Sprintf("%d%%", progressPct)
+						}
+					} else {
+						statusMsg = fmt.Sprintf("%d%%", progressPct)
+					}
+
+					wailsruntime.EventsEmit(ctx, "indexing_progress", progressPct)
+					wailsruntime.EventsEmit(ctx, "indexing_status", statusMsg)
+				}
+			}
+		}()
+	}
 
 	sem := make(chan struct{}, maxConcurrency)
 	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			if ctx != nil {
+				close(doneChan)
+			}
+			return
+		default:
+		}
 		sem <- struct{}{}
 		go func(p string) {
 			defer func() { <-sem }()
 			shared.ProcessFile(p, cfg)
+			atomic.AddInt32(&processed, 1)
 		}(path)
 	}
 	for i := 0; i < maxConcurrency; i++ {
 		sem <- struct{}{}
 	}
 
+	if ctx != nil {
+		close(doneChan)
+	}
+
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 	shared.DrainRemaining(cfg.Images, "image", sc)
-	log.Printf("indexing complete (%v)\n", time.Since(start))
+	fmt.Printf("indexing complete (%v)\n", time.Since(start))
+
+	if ctx != nil {
+		wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing complete.")
+	}
+}
+
+// App struct holds the application state
+type App struct {
+	ctx           context.Context
+	engine        *shared.Engine
+	daemon        *daemon.Daemon
+	isIndexing    atomic.Bool
+	indexerCancel context.CancelFunc
+}
+
+// NewApp creates a new App instance
+func NewApp() *App {
+	return &App{}
+}
+
+// startup is called when the Wails app starts
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("Failed to get working directory: %v", err)
+		cwd = "."
+	}
+	dbPath := filepath.Join(cwd, "filosophy.db")
+	textModelPath := filepath.Join(cwd, "text")
+	imageModelPath := filepath.Join(cwd, "image")
+
+	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(lf)
+	}
+
+	_, dbMissing := os.Stat(dbPath)
+	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
+
+	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+	if err != nil {
+		log.Printf("Failed to initialize Engine: %v", err)
+		return
+	}
+	a.engine = engine
+	log.Println("Engine initialized")
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Failed to get home directory: %v", err)
+		home = cwd
+	}
+
+	lastPathFile := filepath.Join(cwd, "filosophy_path.txt")
+	baseDir := home
+	if content, err := os.ReadFile(lastPathFile); err == nil && len(content) > 0 {
+		baseDir = strings.TrimSpace(string(content))
+	} else {
+		baseDir = filepath.Join(home, "Downloads")
+	}
+
+	os.MkdirAll(baseDir, 0755)
+
+	if forceIndex {
+		if err := a.engine.ResetContentIndex(); err != nil {
+			log.Println("reset index error:", err)
+		}
+	}
+
+	idxCtx, cancel := context.WithCancel(a.ctx)
+	a.indexerCancel = cancel
+
+	if forceIndex || os.IsNotExist(dbMissing) {
+		runPass1(idxCtx, a.engine, baseDir, forceIndex)
+		go runPass2(idxCtx, a.engine)
+	} else if _, err := os.ReadFile(lastPathFile); err == nil {
+		go func() {
+			select {
+			case <-time.After(5 * time.Second):
+			case <-idxCtx.Done():
+				return
+			}
+			log.Println("[startup] Running silent catch-up scan for new files...")
+			runPass1(idxCtx, a.engine, baseDir, false)
+			runPass2(idxCtx, a.engine)
+			log.Println("[startup] Silent catch-up complete.")
+		}()
+	}
+
+	if _, err := os.ReadFile(lastPathFile); err == nil {
+		a.daemon = daemon.NewDaemon(baseDir, a.engine)
+		if err := a.daemon.Start(); err != nil {
+			log.Printf("Failed to start daemon: %v", err)
+		} else {
+			log.Println("Daemon started")
+		}
+	}
+}
+
+// shutdown is called when the Wails app stops
+func (a *App) shutdown(ctx context.Context) {
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
+	if a.engine != nil {
+		a.engine.Close()
+	}
+}
+
+// Search performs a search query via the native Go Engine.
+func (a *App) Search(query string) ([]shared.SearchResult, error) {
+	log.Printf("App.Search called with query: %s", query)
+	if a.engine == nil {
+		log.Printf("App.Search error: engine not initialized")
+		return nil, fmt.Errorf("engine not initialized")
+	}
+	res, err := a.engine.Search(query)
+	log.Printf("App.Search returned %d results, err: %v", len(res), err)
+	return res, err
+}
+
+// OpenFileNative opens a file using the system default application.
+func (a *App) OpenFileNative(path string) error {
+	log.Printf("App.OpenFileNative called with path: %s", path)
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", "", path}
+	case "darwin":
+		cmd = "open"
+		args = []string{path}
+	default:
+		cmd = "xdg-open"
+		args = []string{path}
+	}
+	return exec.Command(cmd, args...).Start()
+}
+
+// SelectDirectory opens the native OS folder picker and returns the selected path.
+func (a *App) SelectDirectory() string {
+	log.Println("SelectDirectory called")
+	dir, err := wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
+		Title: "Select Folder to Index",
+	})
+	if err != nil {
+		log.Printf("SelectDirectory error: %v", err)
+		return ""
+	}
+	return dir
+}
+
+// GetLastDirectory returns the persistently stored directory path, or the default if empty.
+func (a *App) GetLastDirectory() string {
+	cwd, _ := os.Getwd()
+	content, err := os.ReadFile(filepath.Join(cwd, "filosophy_path.txt"))
+	if err == nil && len(content) > 0 {
+		return strings.TrimSpace(string(content))
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Downloads")
+}
+
+// StartIndexing kicks off a full re-index of the given directory, emitting progress to the frontend.
+func (a *App) StartIndexing(directoryPath string) {
+	if a.engine == nil {
+		log.Printf("StartIndexing ignored: engine is still initializing")
+		if a.ctx != nil {
+			wailsruntime.EventsEmit(a.ctx, "indexing_status", "System is still warming up. Please wait a few seconds and try again.")
+		}
+		return
+	}
+
+	if !a.isIndexing.CompareAndSwap(false, true) {
+		log.Printf("StartIndexing ignored: indexing already in progress")
+		return
+	}
+
+	if a.indexerCancel != nil {
+		a.indexerCancel()
+	}
+
+	idxCtx, cancel := context.WithCancel(a.ctx)
+	a.indexerCancel = cancel
+
+	cwd, _ := os.Getwd()
+	os.WriteFile(filepath.Join(cwd, "filosophy_path.txt"), []byte(directoryPath), 0644)
+
+	log.Printf("StartIndexing called for: %s", directoryPath)
+	go func() {
+		defer a.isIndexing.Store(false)
+
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Stopping old daemon...")
+		if a.daemon != nil {
+			a.daemon.Stop()
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Resetting index...")
+		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 0)
+		if err := a.engine.ResetContentIndex(); err != nil {
+			log.Println("reset index error:", err)
+		}
+
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Phase 1: Metadata Fast-Pass...")
+		runPass1(idxCtx, a.engine, directoryPath, true)
+
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Phase 2: Deep Vector Extraction...")
+		runPass2(idxCtx, a.engine)
+
+		a.daemon = daemon.NewDaemon(directoryPath, a.engine)
+		if err := a.daemon.Start(); err != nil {
+			log.Printf("Failed to restart daemon: %v", err)
+		} else {
+			log.Printf("Daemon successfully restarted for path: %s", directoryPath)
+		}
+
+		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 100)
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Indexing complete.")
+	}()
 }
 
 func main() {
@@ -183,7 +442,8 @@ func main() {
 		Width:  1280,
 		Height: 800,
 		AssetServer: &assetserver.Options{
-			Assets: assets,
+			Assets:  assets,
+			Handler: &LocalFileHandler{},
 		},
 		OnStartup:  app.startup,
 		OnShutdown: app.shutdown,
@@ -193,5 +453,39 @@ func main() {
 	})
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+// LocalFileHandler serves local files for the frontend via /loadfile/ prefix.
+type LocalFileHandler struct {
+	http.Handler
+}
+
+func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/loadfile/") {
+		filePath := strings.TrimPrefix(r.URL.Path, "/loadfile/")
+		decodedPath := filePath
+
+		ext := strings.ToLower(filepath.Ext(decodedPath))
+		switch ext {
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".gif":
+			w.Header().Set("Content-Type", "image/gif")
+		case ".webp":
+			w.Header().Set("Content-Type", "image/webp")
+		case ".pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+		case ".txt", ".md", ".csv":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		}
+
+		http.ServeFile(w, r, decodedPath)
+		return
+	}
+	if h.Handler != nil {
+		h.Handler.ServeHTTP(w, r)
 	}
 }

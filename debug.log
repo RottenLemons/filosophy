@@ -1,0 +1,12 @@
+Request URL: http://localhost:34115/loadfile/C%3A%5CUsers%5Clqyau%5CDownloads%5Ctest%5CAlbert%2520Camus.jpg
+URL Path: /loadfile/C:\Users\lqyau\Downloads\test\Albert%20Camus.jpg
+Extracted FilePath: C:\Users\lqyau\Downloads\test\Albert%20Camus.jpg
+Decoded Path: C:\Users\lqyau\Downloads\test\Albert Camus.jpg
+Stat Error: GetFileAttributesEx C:\Users\lqyau\Downloads\test\Albert Camus.jpg: The system cannot find the file specified.
+--------
+Request URL: http://localhost:34115/loadfile/C%3A%5CUsers%5Clqyau%5CDownloads%5Ctest%5CAlbert%20Camus.txt
+URL Path: /loadfile/C:\Users\lqyau\Downloads\test\Albert Camus.txt
+Extracted FilePath: C:\Users\lqyau\Downloads\test\Albert Camus.txt
+Decoded Path: C:\Users\lqyau\Downloads\test\Albert Camus.txt
+File Exists! Size: 34818
+--------

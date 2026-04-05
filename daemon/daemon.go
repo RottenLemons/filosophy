@@ -27,18 +27,20 @@ const (
 
 // shouldFilterPath returns true if the path should be ignored for content changes
 func shouldFilterPath(path string) bool {
-	parts := strings.Split(path, "\\")
-	if len(parts) < 4 {
-		return true
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	for _, part := range parts {
+		name := strings.ToLower(part)
+		if name == "appdata" || strings.HasPrefix(part, ".") || strings.HasPrefix(name, "ntuser") || name == "node_modules" || name == "vendor" {
+			return true
+		}
 	}
-	name := parts[3]
-	// Filter out AppData, hidden files (starting with .), and ntuser.dat
-	return name == "AppData" || strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "ntuser.dat")
+	return false
 }
 
 // shouldFilterFolder returns true if the folder should be skipped
 func shouldFilterFolder(name string) bool {
-	return name == "AppData" || strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "ntuser")
+	lowerName := strings.ToLower(name)
+	return lowerName == "appdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(lowerName, "ntuser") || lowerName == "node_modules" || lowerName == "vendor"
 }
 
 // isFileTooLarge returns true if file is larger than 100MB
@@ -216,6 +218,8 @@ func (t *tracker) drain() map[string]*fileChanges {
 	return result
 }
 
+// Daemon watches a directory for file changes and indexes them using the shared Engine.
+// It runs in the background and does not interfere with search or indexing from the main app.
 type Daemon struct {
 	t                          *tracker
 	sc                         *shared.Engine
@@ -225,9 +229,13 @@ type Daemon struct {
 	baseDir                    string
 }
 
-func NewDaemon(baseDir string) *Daemon {
+// NewDaemon creates a new Daemon linked to the given Engine.
+// The daemon shares the Engine with the main App — it watches for file changes
+// and indexes them in the background without interfering with search operations.
+func NewDaemon(baseDir string, engine *shared.Engine) *Daemon {
 	return &Daemon{
 		baseDir: baseDir,
+		sc:      engine,
 		exit:    make(chan struct{}),
 	}
 }
@@ -312,7 +320,7 @@ func (d *Daemon) flush() {
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
 		fmt.Println("[FLUSH] indexing:", addPaths)
-		cfg := shared.NewProcessorConfig(8096, 100, 50, d.sc)
+		cfg := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
 
 		for _, path := range addPaths {
 			info, err := os.Stat(path)
@@ -346,22 +354,12 @@ func (d *Daemon) Start() error {
 }
 
 func (d *Daemon) run() {
-	// DB lives in the project root (parent of daemon/)
-	// Use Getwd instead of Executable — go run compiles to a temp dir
+	// DB path for the tracker — derive from Engine's working directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal("cannot get working directory:", err)
 	}
-	dbPath := filepath.Join(cwd, "..", "filosophy.db")
-	textModelPath := filepath.Join(cwd, "..", "text")
-	imageModelPath := filepath.Join(cwd, "..", "image")
-
-	// Initialize Engine
-	sc, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Fatal("failed to initialize Engine:", err)
-	}
-	d.sc = sc
+	dbPath := filepath.Join(cwd, "filosophy.db")
 
 	// Do work here
 	d.t = &tracker{
@@ -473,8 +471,8 @@ func (d *Daemon) run() {
 			}
 		}
 	}()
-	// Flush every 5 minutes regardless of action count
-	ticker := time.NewTicker(1 * time.Minute)
+	// Flush every 30 minutes regardless of action count
+	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 	go func() {
 		for range ticker.C {
@@ -487,6 +485,11 @@ func (d *Daemon) run() {
 		}
 	}()
 
+	// The initial indexing crawl was historically performed here. It has been entirely ripped out
+	// because `main.go` already triggers a structured 2-pass crawl via `runPass1` and `runPass2` before
+	// the Daemon boots up! Performing it here was duplicating work 1:1 and causing huge lock contention.
+	fmt.Println("[DAEMON] Initial crawl bypassed (delegated to main.go pipeline)")
+
 	<-d.exit
 }
 
@@ -497,10 +500,10 @@ func (d *Daemon) Stop() error {
 	}
 	close(d.exit)
 	if d.structureChan != nil {
-		close(d.structureChan)
+		notify.Stop(d.structureChan)
 	}
 	if d.contentChan != nil {
-		close(d.contentChan)
+		notify.Stop(d.contentChan)
 	}
 	return nil
 }

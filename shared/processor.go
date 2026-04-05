@@ -111,9 +111,9 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 // HandleChunk adds metadata to a channel and flushes when full
 func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size int64, mu *sync.Mutex) {
 	mu.Lock()
-	defer mu.Unlock()
 	select {
 	case chunks <- Metadata{content, path, hash, mtime, size}:
+		mu.Unlock()
 	default:
 		var items []Metadata
 		for j := 0; j < cap(chunks); j++ {
@@ -124,9 +124,11 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 			}
 		}
 		chunks <- Metadata{content, path, hash, mtime, size}
-		// IndexBatch shouldn't be under the same lock if we want to add more to channel
-		// but since we are limiting concurrency via maxConcurrency semaphore anyway,
-		// guarding the channel drain is safer.
+		mu.Unlock()
+		
+		// Run batch indexing outside the Mutex! This permits the other N worker threads
+		// to continue extracting PDFs and resizing images into the now-empty chunks channel
+		// concurrently while the ONNX Engine performs the heavy inference pipeline.
 		IndexBatch(items, mode, sc)
 		// Yield after releasing the HNSW write lock so search goroutines can acquire
 		// RLock between consecutive batch flushes. Without this, back-to-back flushes
@@ -182,8 +184,7 @@ func ProcessImage(path string, mtime, size int64, cfg *ProcessorConfig) {
 // ProcessText extracts text from a file and adds chunks to the channel
 func ProcessText(path string, mtime, size int64, cfg *ProcessorConfig) {
 	result, err := kreuzberg.ExtractFileSync(path, nil)
-
-	if err != nil || result.Content == "" {
+	if err != nil || result == nil || result.Content == "" {
 		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, cfg.Mu)
 		return
 	}

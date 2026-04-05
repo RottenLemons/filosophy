@@ -1,5 +1,7 @@
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
 @import "tailwindcss";
+@config "../tailwind.config.js";
+
+@variant dark (&:where(.dark, .dark *));
 
 @theme {
   --color-md-background: #FFFBFE;
@@ -38,6 +40,6 @@
 
 @layer base {
   body {
-    @apply bg-md-background text-md-on-background font-sans antialiased m-0 p-0 overflow-x-hidden;
+    @apply bg-md-background text-md-on-background dark:bg-black dark:text-gray-100 font-sans antialiased m-0 p-0 overflow-x-hidden;
   }
 }

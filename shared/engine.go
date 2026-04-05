@@ -140,6 +140,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		"PRAGMA temp_store=MEMORY",
 		"PRAGMA mmap_size=536870912",
 		"PRAGMA cache_size=-200000",
+		"PRAGMA busy_timeout=10000",
 	} {
 		if _, err := sqlDB.Exec(pragma); err != nil {
 			log.Printf("pragma warning: %v", err)
@@ -887,7 +888,7 @@ func (s *Engine) IndexPathsFTS(paths []string) {
 		log.Printf("paths_fts: failed to begin tx: %v", err)
 		return
 	}
-	stmt, err := tx.PrepareContext(ctx, "INSERT INTO paths_fts(path) VALUES (?)")
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)")
 	if err != nil {
 		tx.Rollback()
 		log.Printf("paths_fts: failed to prepare stmt: %v", err)
@@ -895,7 +896,11 @@ func (s *Engine) IndexPathsFTS(paths []string) {
 	}
 	defer stmt.Close()
 	for _, p := range paths {
-		if _, err := stmt.ExecContext(ctx, p); err != nil {
+		decoded := p
+		if d, err := url.PathUnescape(p); err == nil {
+			decoded = d
+		}
+		if _, err := stmt.ExecContext(ctx, decoded, p); err != nil {
 			log.Printf("paths_fts insert warning: %v", err)
 		}
 	}
@@ -917,11 +922,53 @@ func (s *Engine) InitIndexTables() error {
 			ctime            INTEGER NOT NULL DEFAULT 0,
 			atime            INTEGER NOT NULL DEFAULT 0
 		);
-		CREATE VIRTUAL TABLE IF NOT EXISTS paths_fts USING fts5(path);
 	`); err != nil {
 		return fmt.Errorf("failed to create index tables: %w", err)
 	}
 
+	// Auto-migrate schema backfill for old DBs
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ext TEXT NOT NULL DEFAULT ''")
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0")
+	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN atime INTEGER NOT NULL DEFAULT 0")
+
+
+	var exists int
+	s.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paths_fts'").Scan(&exists)
+	if exists == 1 {
+		var hasSearchable int
+		s.sqlDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('paths_fts') WHERE name='searchable'").Scan(&hasSearchable)
+		if hasSearchable == 0 {
+			if _, err := s.sqlDB.ExecContext(ctx, `
+				DROP TABLE paths_fts;
+				CREATE VIRTUAL TABLE paths_fts USING fts5(searchable, path UNINDEXED);
+			`); err != nil {
+				return err
+			}
+			rows, err := s.sqlDB.QueryContext(ctx, "SELECT path FROM files")
+			if err == nil {
+				defer rows.Close()
+				tx, _ := s.sqlDB.BeginTx(ctx, nil)
+				stmt, _ := tx.PrepareContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)")
+				for rows.Next() {
+					var p string
+					rows.Scan(&p)
+					decoded := p
+					if d, err := url.PathUnescape(p); err == nil {
+						decoded = d
+					}
+					stmt.ExecContext(ctx, decoded, p)
+				}
+				stmt.Close()
+				tx.Commit()
+			}
+		}
+	} else {
+		if _, err := s.sqlDB.ExecContext(ctx, `
+			CREATE VIRTUAL TABLE paths_fts USING fts5(searchable, path UNINDEXED);
+		`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1046,8 +1093,10 @@ func (s *Engine) ResetContentIndex() error {
 
 // SearchResult holds a search result path.
 type SearchResult struct {
-	Path  string
-	Score float64
+	Path     string
+	Score    float64
+	Size     int64
+	Modified string
 }
 
 // Search performs a combined text + image search over both collections.
@@ -1162,7 +1211,18 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	results := make([]SearchResult, 0, len(scores))
 	for path, score := range scores {
-		results = append(results, SearchResult{Path: path, Score: score})
+		var size int64
+		var mod string
+		if info, err := os.Stat(path); err == nil {
+			size = info.Size()
+			mod = info.ModTime().Format(time.RFC3339)
+		}
+		results = append(results, SearchResult{
+			Path:     path,
+			Score:    score,
+			Size:     size,
+			Modified: mod,
+		})
 	}
 	sortResults(results)
 	results = s.rerank(query, results)
@@ -1249,7 +1309,18 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 
 	out := make([]SearchResult, 0, len(scores))
 	for path, score := range scores {
-		out = append(out, SearchResult{Path: path, Score: score})
+		var size int64
+		var mod string
+		if info, err := os.Stat(path); err == nil {
+			size = info.Size()
+			mod = info.ModTime().Format(time.RFC3339)
+		}
+		out = append(out, SearchResult{
+			Path:     path,
+			Score:    score,
+			Size:     size,
+			Modified: mod,
+		})
 	}
 	sortResults(out)
 	out = s.rerank(query, out)
@@ -1288,7 +1359,20 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 			continue
 		}
 		seen[path] = true
-		out = append(out, SearchResult{Path: path, Score: res.Score})
+
+		var size int64
+		var mod string
+		if info, err := os.Stat(path); err == nil {
+			size = info.Size()
+			mod = info.ModTime().Format(time.RFC3339)
+		}
+
+		out = append(out, SearchResult{
+			Path:     path,
+			Score:    res.Score,
+			Size:     size,
+			Modified: mod,
+		})
 	}
 
 	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
@@ -1372,7 +1456,11 @@ func (s *Engine) RenamePaths(oldPaths, newPaths []string) error {
 		}
 		// Update paths FTS5 (delete old, insert new)
 		tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", oldPath)
-		tx.ExecContext(ctx, "INSERT INTO paths_fts(path) VALUES (?)", newPath)
+		decoded := newPath
+		if d, err := url.PathUnescape(newPath); err == nil {
+			decoded = d
+		}
+		tx.ExecContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)", decoded, newPath)
 	}
 
 	return tx.Commit()
