@@ -2,11 +2,6 @@
 package daemon
 
 import (
-<<<<<<< HEAD
-	"encoding/json"
-=======
-	"flag"
->>>>>>> main
 	"fmt"
 	"log"
 	"os"
@@ -223,6 +218,7 @@ func (t *tracker) drain() map[string]*fileChanges {
 
 type Daemon struct {
 	t                          *tracker
+	sc                         *shared.Engine
 	flushMu                    sync.Mutex
 	exit                       chan struct{}
 	structureChan, contentChan chan notify.EventInfo
@@ -288,7 +284,7 @@ func (d *Daemon) flush() {
 	// 1. Delete all references for removed/modified files
 	if len(deletePaths) > 0 {
 		fmt.Println("[FLUSH] deleting:", deletePaths)
-		if err := p.sc.DeletePaths(deletePaths); err != nil {
+		if err := d.sc.DeletePaths(deletePaths); err != nil {
 			log.Println("flush delete error:", err)
 		}
 		// Clear cached hashes so big-file handler won't re-trigger
@@ -308,7 +304,7 @@ func (d *Daemon) flush() {
 			oldPaths[i] = pair[0]
 			newPaths[i] = pair[1]
 		}
-		if err := p.sc.RenamePaths(oldPaths, newPaths); err != nil {
+		if err := d.sc.RenamePaths(oldPaths, newPaths); err != nil {
 			log.Println("flush rename error:", err)
 		}
 	}
@@ -316,7 +312,7 @@ func (d *Daemon) flush() {
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
 		fmt.Println("[FLUSH] indexing:", addPaths)
-		cfg := shared.NewProcessorConfig(8096, 100, 50, p.sc)
+		cfg := shared.NewProcessorConfig(8096, 100, 50, d.sc)
 
 		for _, path := range addPaths {
 			info, err := os.Stat(path)
@@ -331,33 +327,14 @@ func (d *Daemon) flush() {
 			}
 		}
 
-		shared.DrainRemaining(cfg.Chunks, "text", p.sc)
-		shared.DrainRemaining(cfg.Images, "image", p.sc)
+		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
+		shared.DrainRemaining(cfg.Images, "image", d.sc)
 		cfg.CleanupTempDir()
 	}
 	fmt.Println("[FLUSH] done")
 }
 
-<<<<<<< HEAD
 func (d *Daemon) Start() error {
-=======
-type program struct {
-	t                          *tracker
-	sc                         *shared.Engine
-	flushMu                    sync.Mutex
-	exit                       chan struct{}
-	structureChan, contentChan chan notify.EventInfo
-	baseDir                    string
-}
-
-func (p *program) Start(s service.Service) error {
-	var err error
-	p.baseDir, err = "C:/Users/Mahir/Downloads/test/", nil //os.UserHomeDir()
-	if err != nil {
-		log.Fatal(err)
-	}
-	p.exit = make(chan struct{})
->>>>>>> main
 	// Channel for structure changes (create, delete, rename) - ALL files
 	d.structureChan = make(chan notify.EventInfo, 500)
 	// Channel for content changes - filtered files only
@@ -384,7 +361,7 @@ func (d *Daemon) run() {
 	if err != nil {
 		log.Fatal("failed to initialize Engine:", err)
 	}
-	p.sc = sc
+	d.sc = sc
 
 	// Do work here
 	d.t = &tracker{
@@ -515,7 +492,6 @@ func (d *Daemon) run() {
 
 func (d *Daemon) Stop() error {
 	// Stop should not block. Return with a few seconds.
-<<<<<<< HEAD
 	if d.t != nil {
 		fmt.Println(d.t.changes)
 	}
@@ -526,14 +502,5 @@ func (d *Daemon) Stop() error {
 	if d.contentChan != nil {
 		close(d.contentChan)
 	}
-=======
-	fmt.Println(p.t.changes)
-	if p.sc != nil {
-		p.sc.Close()
-	}
-	close(p.exit)
-	close(p.structureChan)
-	close(p.contentChan)
->>>>>>> main
 	return nil
 }

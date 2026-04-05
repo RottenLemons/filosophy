@@ -3,19 +3,12 @@
 package main
 
 import (
-<<<<<<< HEAD
 	"context"
 	"embed"
-	"encoding/json"
-=======
-	"bufio"
-	"fmt"
->>>>>>> main
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	"time"
 
 	"filosophy/daemon"
 	"filosophy/shared"
@@ -28,21 +21,39 @@ import (
 //go:embed all:frontend/build
 var assets embed.FS
 
-<<<<<<< HEAD
-// App struct holds the application state
+var parentDir string = "C:/Users/Mahir/Downloads/test/"
+
+// maxConcurrency limits background indexing goroutines. Keeping this low ensures
+// search goroutines can acquire the HNSW read lock between consecutive batch inserts.
+// With 10+ goroutines all queueing for HNSW.Lock(), search RLock starves indefinitely.
+const maxConcurrency = 3
+
+// App holds application state exposed to the Wails frontend.
 type App struct {
-	ctx        context.Context
-	sidecarCmd *exec.Cmd
-	daemon     *daemon.Daemon
-	baseDir    string
+	ctx    context.Context
+	sc     *shared.Engine
+	daemon *daemon.Daemon
 }
-=======
-func main() {
-	// Initialize Engine with model and DB paths
+
+func NewApp() *App {
+	return &App{}
+}
+
+// startup is called by Wails when the app starts. It initialises the engine,
+// kicks off background indexing, and starts the file-watcher daemon.
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal("cannot get working directory:", err)
 	}
+
+	// Redirect logs to file so background work does not pollute anything.
+	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(lf)
+	}
+
 	dbPath := filepath.Join(cwd, "filosophy.db")
 	textModelPath := filepath.Join(cwd, "text")
 	imageModelPath := filepath.Join(cwd, "image")
@@ -51,169 +62,136 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to initialize Engine:", err)
 	}
-	defer sc.Close()
+	a.sc = sc
 
-	index := len(os.Args) > 1 && os.Args[1] == "--index"
-	if index {
-		start := time.Now()
-		cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
->>>>>>> main
-
-// NewApp creates a new App instance
-func NewApp() *App {
-	return &App{}
-}
-
-<<<<<<< HEAD
-// startup is called when the Wails app starts
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-
-	// Determine base directory for watching (home/Downloads/test)
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Printf("Failed to get home directory: %v", err)
-		home = "C:/Users/Mahir"
-	}
-	a.baseDir = filepath.Join(home, "Downloads", "test")
-	// Ensure the directory exists
-	os.MkdirAll(a.baseDir, 0755)
-
-	// Start Python sidecar
-	sidecarPath := "sidecar.py"
-	// Try to find sidecar in the current working directory
-	if _, err := os.Stat(sidecarPath); os.IsNotExist(err) {
-		// Try to find sidecar in project root
-		exeDir, _ := os.Getwd()
-		sidecarPath = filepath.Join(exeDir, "sidecar.py")
-	}
-	a.sidecarCmd = exec.Command("python", sidecarPath)
-	a.sidecarCmd.Stdout = os.Stdout
-	a.sidecarCmd.Stderr = os.Stderr
-	if err := a.sidecarCmd.Start(); err != nil {
-		log.Printf("Failed to start sidecar: %v", err)
+	_, dbMissing := os.Stat(dbPath)
+	if os.IsNotExist(dbMissing) {
+		runPass1(sc, false)
+		go runPass2(sc)
 	} else {
-		log.Println("Sidecar started")
+		go runPass2(sc)
 	}
 
-	// Start file-watching daemon
-	a.daemon = daemon.NewDaemon(a.baseDir)
+	a.daemon = daemon.NewDaemon(parentDir)
 	if err := a.daemon.Start(); err != nil {
-		log.Printf("Failed to start daemon: %v", err)
-	} else {
-		log.Println("Daemon started")
+		log.Println("daemon start error:", err)
 	}
 }
 
-// shutdown is called when the Wails app stops
+// shutdown is called by Wails when the app closes.
 func (a *App) shutdown(ctx context.Context) {
 	if a.daemon != nil {
 		a.daemon.Stop()
 	}
-	if a.sidecarCmd != nil {
-		a.sidecarCmd.Process.Kill()
-		a.sidecarCmd.Wait()
+	if a.sc != nil {
+		a.sc.Close()
 	}
 }
 
-// Search performs a search query via the Python sidecar and returns the list of file paths.
+// Search is exposed to the frontend via window.go.main.App.Search.
+// Returns a slice of matching file paths ordered by relevance.
 func (a *App) Search(query string) []string {
-	queryJSON, err := json.Marshal(query)
-	if err != nil {
-		log.Println("Search marshal error:", err)
+	if a.sc == nil || query == "" {
 		return nil
 	}
-	resp, err := shared.Send(string(queryJSON), "search")
+	results, err := a.sc.Search(query)
 	if err != nil {
-		log.Println("Search send error:", err)
+		log.Println("search error:", err)
 		return nil
 	}
-	// Parse response: sidecar returns a JSON list of strings.
-	var paths []string
-	if err := json.Unmarshal([]byte(resp), &paths); err != nil {
-		// fallback: split lines
-		lines := strings.Split(strings.TrimSpace(resp), "\n")
-		for _, line := range lines {
-			line = strings.Trim(line, `[]"'`)
-			if line != "" {
-				paths = append(paths, line)
-			}
-		}
+	paths := make([]string, len(results))
+	for i, r := range results {
+		paths[i] = r.Path
 	}
 	return paths
 }
 
+func runPass1(sc *shared.Engine, pruneStale bool) {
+	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	defer cfg.CleanupTempDir()
+
+	var paths []string
+	var mtimes []int64
+	var sizes []int64
+
+	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		paths = append(paths, path)
+		mtimes = append(mtimes, info.ModTime().UnixNano())
+		sizes = append(sizes, info.Size())
+		return nil
+	})
+
+	if pruneStale {
+		if err := sc.PruneStale(paths); err != nil {
+			log.Println("pass1 prune error:", err)
+		}
+	}
+
+	if err := sc.IndexMetadata(paths, mtimes, sizes); err != nil {
+		log.Println("pass1 metadata index error:", err)
+	}
+
+	filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		shared.ProcessDirectory(path, cfg)
+		return nil
+	})
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+}
+
+func runPass2(sc *shared.Engine) {
+	paths, _, err := sc.UnindexedFiles()
+	if err != nil {
+		log.Println("pass2 query error:", err)
+		return
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	start := time.Now()
+	cfg := shared.NewProcessorConfig(8096, 200, 50, sc)
+	defer cfg.CleanupTempDir()
+
+	sem := make(chan struct{}, maxConcurrency)
+	for _, path := range paths {
+		sem <- struct{}{}
+		go func(p string) {
+			defer func() { <-sem }()
+			shared.ProcessFile(p, cfg)
+		}(path)
+	}
+	for i := 0; i < maxConcurrency; i++ {
+		sem <- struct{}{}
+	}
+
+	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	shared.DrainRemaining(cfg.Images, "image", sc)
+	log.Printf("indexing complete (%v)\n", time.Since(start))
+}
+
 func main() {
-	// Create an instance of the App
 	app := NewApp()
 
-	// Application options
 	err := wails.Run(&options.App{
 		Title:  "Filosophy",
-		Width:  1024,
-		Height: 768,
+		Width:  1280,
+		Height: 800,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
 		Bind: []interface{}{
 			app,
 		},
 	})
 	if err != nil {
 		log.Fatal(err)
-=======
-		filepath.Walk(parentDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if info.IsDir() {
-				shared.ProcessDirectory(path, cfg)
-				return nil
-			}
-
-			// Acquire semaphore before spawning goroutine
-			sem <- struct{}{}
-
-			go func(path string) {
-				defer func() { <-sem }()
-				shared.ProcessFile(path, cfg)
-			}(path)
-
-			return nil
-		})
-
-		// Wait for all goroutines to finish by filling the semaphore
-		for i := 0; i < maxConcurrency; i++ {
-			sem <- struct{}{}
-		}
-
-		shared.DrainRemaining(cfg.Chunks, "text", sc)
-		shared.DrainRemaining(cfg.Images, "image", sc)
-		cfg.CleanupTempDir()
-		end := time.Now()
-		fmt.Println(end.Sub(start))
-	}
-	for {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Search: ")
-		query, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error:", err)
-			return
-		}
-		query = strings.TrimSpace(query)
-		results, err := sc.Search(query)
-		if err != nil {
-			log.Println("search error:", err)
-			continue
-		}
-		for _, r := range results {
-			fmt.Printf("  %.4f  %s\n", r.Score, r.Path)
-		}
->>>>>>> main
 	}
 }

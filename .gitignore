@@ -77,6 +77,10 @@ test.ipynb
 check_dll.py
 =======
 *.bin
+.claude/**
 kreuzberg-ffi/**
 .indexed
+reranker.onnx
+tokenizer.json
+*.dll
 >>>>>>> main
