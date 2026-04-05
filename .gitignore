@@ -13,3 +13,4 @@ kreuzberg-ffi/**
 .indexed
 reranker.onnx
 tokenizer.json
+*.dll

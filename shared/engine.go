@@ -162,6 +162,10 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	// Initialize ONNX Runtime
 	ortPath := findOnnxRuntime()
 	ort.SetSharedLibraryPath(ortPath)
+	useGPU := hasCUDAProvider()
+	if useGPU {
+		log.Printf("CUDA provider DLL found — GPU acceleration will be attempted")
+	}
 	if err := ort.InitializeEnvironment(); err != nil {
 		sqlDB.Close()
 		db.Close()
@@ -202,6 +206,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 
 	// We are synchronizing inference with Engine.mu.Lock() inside IndexText/IndexImage,
 	// so it's safe to let ONNX use its default multi-threading across all cores.
+	if useGPU && tryAppendCUDA(opts) {
+		log.Printf("CLIP text session: CUDA GPU enabled")
+	}
 
 	// Create ONNX sessions for CLIP only (text uses the static embedder).
 	clipTextSession, err := ort.NewDynamicAdvancedSession(
@@ -231,6 +238,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 
 	// Vision models are large, allow ONNX to use its default multi-threading
 	// because Go is NOT actually processing them concurrently (IndexBatch is guarded by a Mutex).
+	if useGPU && tryAppendCUDA(visionOpts) {
+		log.Printf("CLIP vision session: CUDA GPU enabled")
+	}
 
 	clipVisionSession, err := ort.NewDynamicAdvancedSession(
 		filepath.Join(imageModelPath, "vision_model.onnx"),
@@ -290,6 +300,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 				log.Printf("reranker session opts warning (reranking disabled): %v", err)
 			} else {
 				defer ropts.Destroy()
+				if useGPU && tryAppendCUDA(ropts) {
+					log.Printf("reranker session: CUDA GPU enabled")
+				}
 				rsess, err := ort.NewDynamicAdvancedSession(
 					rerankerOnnx,
 					[]string{"input_ids", "attention_mask"},
@@ -2291,4 +2304,39 @@ func findOnnxRuntime() string {
 
 	// Fallback: let the OS search PATH
 	return dllName
+}
+
+// hasCUDAProvider returns true if onnxruntime_providers_cuda.dll is present
+// alongside the main ONNX Runtime DLL, indicating GPU inference may be available.
+func hasCUDAProvider() bool {
+	const dllName = "onnxruntime_providers_cuda.dll"
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), dllName)
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		p := filepath.Join(cwd, dllName)
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// tryAppendCUDA attempts to register the CUDA execution provider on opts.
+// Returns true on success; on any error it logs and leaves opts unchanged (CPU fallback).
+func tryAppendCUDA(opts *ort.SessionOptions) bool {
+	cudaOpts, err := ort.NewCUDAProviderOptions()
+	if err != nil {
+		log.Printf("CUDA provider options unavailable: %v", err)
+		return false
+	}
+	defer cudaOpts.Destroy()
+	if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
+		log.Printf("CUDA EP append failed (falling back to CPU): %v", err)
+		return false
+	}
+	return true
 }
