@@ -12,26 +12,101 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"filosophy/daemon"
 	"filosophy/shared"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows"
 )
 
 //go:embed all:frontend/build
 var assets embed.FS
 
-// maxConcurrency limits background indexing goroutines. Keeping this low ensures
-// search goroutines can acquire the HNSW read lock between consecutive batch inserts.
-// With 10+ goroutines all queueing for HNSW.Lock(), search RLock starves indefinitely.
 var maxConcurrency = runtime.NumCPU()
+
+const daemonPidFile = "filosophy-daemon.pid"
+
+// isDaemonRunning checks whether a previously launched daemon process is still alive.
+func isDaemonRunning(cwd string) bool {
+	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return false
+	}
+	return code == 259 // STILL_ACTIVE
+}
+
+// stopDaemonProcess kills the daemon process recorded in the PID file.
+func stopDaemonProcess(cwd string) {
+	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	if proc, err := os.FindProcess(pid); err == nil {
+		proc.Kill()
+	}
+	os.Remove(filepath.Join(cwd, daemonPidFile))
+}
+
+// launchDaemon starts filosophy-daemon.exe as a detached process.
+// The daemon keeps running after the UI closes.
+func launchDaemon(cwd string) {
+	if isDaemonRunning(cwd) {
+		log.Println("daemon already running, skipping launch")
+		return
+	}
+
+	// Prefer a pre-built binary next to our own executable.
+	exe, _ := os.Executable()
+	daemonExe := filepath.Join(filepath.Dir(exe), "filosophy-daemon.exe")
+	if _, err := os.Stat(daemonExe); err != nil {
+		// Dev fallback: go run (blocks briefly, but detaches immediately below).
+		daemonExe = ""
+	}
+
+	var cmd *exec.Cmd
+	if daemonExe != "" {
+		cmd = exec.Command(daemonExe)
+	} else {
+		cmd = exec.Command("go", "run", "./cmd/daemon")
+	}
+	cmd.Dir = cwd
+	// CREATE_NEW_PROCESS_GROUP ensures the daemon is not in our job object
+	// so it survives after the Wails app exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("failed to launch daemon: %v", err)
+		return
+	}
+	log.Printf("daemon launched (pid %d)", cmd.Process.Pid)
+	cmd.Process.Release() // detach: we no longer own this process
+}
 
 func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale bool) {
 	if ctx != nil {
@@ -53,6 +128,13 @@ func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale boo
 		default:
 		}
 		if err != nil || info.IsDir() {
+			return nil
+		}
+		if isJunkFile(info.Name()) {
+			return nil
+		}
+		// AppData, Program Files etc. are path-indexed by runSystemPathIndex — skip content indexing.
+		if isContentSkipped(path) {
 			return nil
 		}
 		paths = append(paths, path)
@@ -216,21 +298,142 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	}
 }
 
+// systemPathSkipDirs are directories skipped even for path-only indexing —
+// either unreadable, transient, or contain no useful paths whatsoever.
+var systemPathSkipDirs = map[string]bool{
+	"$recycle.bin":              true,
+	"system volume information": true,
+	"$windows.~bt":              true, // Windows upgrade leftovers
+	"$windows.~ws":              true,
+	"recovery":                  true,
+	"perflogs":                  true,
+}
+
+// junkExtensions are file extensions excluded from both path and content indexing.
+var junkExtensions = map[string]bool{
+	".tmp": true, ".temp": true, ".log": true, ".etl": true,
+	".dmp": true, ".mdmp": true, // crash dumps
+	".pf":  true, ".sdf": true, // prefetch / SQL CE
+	".db-wal": true, ".db-shm": true, // SQLite write-ahead logs
+}
+
+// junkFileNames are exact filenames (lowercased) excluded from both path and content indexing.
+var junkFileNames = map[string]bool{
+	"ntuser.dat":     true,
+	"ntuser.dat.log": true,
+	"ntuser.ini":     true,
+	"desktop.ini":    true,
+	"thumbs.db":      true,
+	"hiberfil.sys":   true,
+	"pagefile.sys":   true,
+	"swapfile.sys":   true,
+	"usrclass.dat":   true,
+}
+
+// isJunkFile returns true if the file should be excluded everywhere (path and content).
+func isJunkFile(name string) bool {
+	lower := strings.ToLower(name)
+	if junkFileNames[lower] {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	return junkExtensions[ext]
+}
+
+// contentSkipPrefixes are path substrings that should be path-indexed only,
+// never content-indexed. Files under these dirs appear in path search but
+// pass 2 (vector/text extraction) never touches them.
+var contentSkipPrefixes = []string{
+	`\appdata\`,
+	`/appdata/`,
+	`\program files\`,
+	`/program files/`,
+	`\program files (x86)\`,
+	`/program files (x86)/`,
+	`\programdata\`,
+	`/programdata/`,
+}
+
+// isContentSkipped returns true if the path should be path-indexed only (no content extraction).
+func isContentSkipped(path string) bool {
+	lower := strings.ToLower(path)
+	for _, prefix := range contentSkipPrefixes {
+		if strings.Contains(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// availableDrives returns root paths for all drive letters present on the system.
+func availableDrives() []string {
+	var drives []string
+	for _, letter := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+		root := string(letter) + ":\\"
+		if _, err := os.Stat(root); err == nil {
+			drives = append(drives, root)
+		}
+	}
+	return drives
+}
+
+// runSystemPathIndex walks all drives and adds every file/directory path into
+// paths_fts only (not the files table). This enables path-based search across
+// the whole system without triggering content indexing in pass 2.
+func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
+	log.Println("[sysindex] Starting system-wide path index...")
+	const batchSize = 2000
+	batch := make([]string, 0, batchSize)
+
+	flush := func() {
+		if len(batch) > 0 {
+			sc.IndexPathsFTS(batch)
+			batch = batch[:0]
+		}
+	}
+
+	for _, root := range availableDrives() {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return filepath.SkipAll
+			default:
+			}
+			if info.IsDir() {
+				if systemPathSkipDirs[strings.ToLower(info.Name())] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isJunkFile(info.Name()) {
+				return nil
+			}
+			batch = append(batch, path)
+			if len(batch) >= batchSize {
+				flush()
+			}
+			return nil
+		})
+	}
+	flush()
+	log.Println("[sysindex] System-wide path index complete.")
+}
+
 // App struct holds the application state
 type App struct {
 	ctx           context.Context
 	engine        *shared.Engine
-	daemon        *daemon.Daemon
 	isIndexing    atomic.Bool
 	indexerCancel context.CancelFunc
 }
 
-// NewApp creates a new App instance
 func NewApp() *App {
 	return &App{}
 }
 
-// startup is called when the Wails app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
@@ -271,7 +474,6 @@ func (a *App) startup(ctx context.Context) {
 	} else {
 		baseDir = filepath.Join(home, "Downloads")
 	}
-
 	os.MkdirAll(baseDir, 0755)
 
 	if forceIndex {
@@ -284,47 +486,37 @@ func (a *App) startup(ctx context.Context) {
 	a.indexerCancel = cancel
 
 	if forceIndex || os.IsNotExist(dbMissing) {
+		// First run or explicit re-index:
+		// - Pass 1: content metadata for baseDir only
+		// - Pass 2: content indexing for baseDir only (background)
+		// - System path index: all drives, path-only, in background (does not block search)
 		runPass1(idxCtx, a.engine, baseDir, forceIndex)
-		go runPass2(idxCtx, a.engine)
-	} else if _, err := os.ReadFile(lastPathFile); err == nil {
 		go func() {
-			select {
-			case <-time.After(5 * time.Second):
-			case <-idxCtx.Done():
-				return
-			}
-			log.Println("[startup] Running silent catch-up scan for new files...")
-			runPass1(idxCtx, a.engine, baseDir, false)
 			runPass2(idxCtx, a.engine)
-			log.Println("[startup] Silent catch-up complete.")
+			launchDaemon(cwd)
 		}()
-	}
-
-	if _, err := os.ReadFile(lastPathFile); err == nil {
-		a.daemon = daemon.NewDaemon(baseDir, a.engine)
-		if err := a.daemon.Start(); err != nil {
-			log.Printf("Failed to start daemon: %v", err)
-		} else {
-			log.Println("Daemon started")
-		}
+		go runSystemPathIndex(idxCtx, a.engine)
+	} else {
+		// Normal startup: engine is ready, daemon should already be running.
+		// Do NOT scan again — the daemon tracked changes while we were closed.
+		launchDaemon(cwd)
 	}
 }
 
-// shutdown is called when the Wails app stops
+// shutdown is called when the Wails app closes.
+// We deliberately do NOT stop the daemon — it keeps running in the background.
 func (a *App) shutdown(ctx context.Context) {
-	if a.daemon != nil {
-		a.daemon.Stop()
+	if a.indexerCancel != nil {
+		a.indexerCancel()
 	}
 	if a.engine != nil {
 		a.engine.Close()
 	}
 }
 
-// Search performs a search query via the native Go Engine.
 func (a *App) Search(query string) ([]shared.SearchResult, error) {
 	log.Printf("App.Search called with query: %s", query)
 	if a.engine == nil {
-		log.Printf("App.Search error: engine not initialized")
 		return nil, fmt.Errorf("engine not initialized")
 	}
 	res, err := a.engine.Search(query)
@@ -332,7 +524,6 @@ func (a *App) Search(query string) ([]shared.SearchResult, error) {
 	return res, err
 }
 
-// OpenFileNative opens a file using the system default application.
 func (a *App) OpenFileNative(path string) error {
 	log.Printf("App.OpenFileNative called with path: %s", path)
 	var cmd string
@@ -351,7 +542,6 @@ func (a *App) OpenFileNative(path string) error {
 	return exec.Command(cmd, args...).Start()
 }
 
-// SelectDirectory opens the native OS folder picker and returns the selected path.
 func (a *App) SelectDirectory() string {
 	log.Println("SelectDirectory called")
 	dir, err := wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
@@ -364,7 +554,6 @@ func (a *App) SelectDirectory() string {
 	return dir
 }
 
-// GetLastDirectory returns the persistently stored directory path, or the default if empty.
 func (a *App) GetLastDirectory() string {
 	cwd, _ := os.Getwd()
 	content, err := os.ReadFile(filepath.Join(cwd, "filosophy_path.txt"))
@@ -375,10 +564,9 @@ func (a *App) GetLastDirectory() string {
 	return filepath.Join(home, "Downloads")
 }
 
-// StartIndexing kicks off a full re-index of the given directory, emitting progress to the frontend.
+// StartIndexing re-indexes a new directory, then relaunches the daemon on it.
 func (a *App) StartIndexing(directoryPath string) {
 	if a.engine == nil {
-		log.Printf("StartIndexing ignored: engine is still initializing")
 		if a.ctx != nil {
 			wailsruntime.EventsEmit(a.ctx, "indexing_status", "System is still warming up. Please wait a few seconds and try again.")
 		}
@@ -386,7 +574,6 @@ func (a *App) StartIndexing(directoryPath string) {
 	}
 
 	if !a.isIndexing.CompareAndSwap(false, true) {
-		log.Printf("StartIndexing ignored: indexing already in progress")
 		return
 	}
 
@@ -404,11 +591,9 @@ func (a *App) StartIndexing(directoryPath string) {
 	go func() {
 		defer a.isIndexing.Store(false)
 
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Stopping old daemon...")
-		if a.daemon != nil {
-			a.daemon.Stop()
-			time.Sleep(500 * time.Millisecond)
-		}
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Stopping daemon...")
+		stopDaemonProcess(cwd)
+		time.Sleep(300 * time.Millisecond)
 
 		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Resetting index...")
 		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 0)
@@ -422,15 +607,11 @@ func (a *App) StartIndexing(directoryPath string) {
 		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Phase 2: Deep Vector Extraction...")
 		runPass2(idxCtx, a.engine)
 
-		a.daemon = daemon.NewDaemon(directoryPath, a.engine)
-		if err := a.daemon.Start(); err != nil {
-			log.Printf("Failed to restart daemon: %v", err)
-		} else {
-			log.Printf("Daemon successfully restarted for path: %s", directoryPath)
-		}
-
 		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 100)
 		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Indexing complete.")
+
+		go runSystemPathIndex(idxCtx, a.engine)
+		launchDaemon(cwd)
 	}()
 }
 
