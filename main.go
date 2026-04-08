@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 
 	"filosophy/shared"
 
+	"github.com/syncthing/notify"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -33,6 +36,119 @@ var assets embed.FS
 var maxConcurrency = runtime.NumCPU()
 
 const daemonPidFile = "filosophy-daemon.pid"
+const appPidFile = "filosophy-app.pid"
+const excludedConfigFile = "filosophy_excluded.json"
+
+// FolderState describes a directory and whether it is content-indexed.
+type FolderState struct {
+	Name        string `json:"Name"`
+	Path        string `json:"Path"`
+	Indexed     bool   `json:"Indexed"`
+	HasChildren bool   `json:"HasChildren"`
+}
+
+// getHomeSubdirs returns the names of all non-hidden, non-system direct subdirectories
+// of the home directory. Hidden (dot) folders and AppData are excluded from the list.
+func getHomeSubdirs(home string) []string {
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return nil
+	}
+	skip := map[string]bool{
+		"appdata": true,
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if skip[strings.ToLower(name)] {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// loadExcluded reads the set of excluded absolute paths (lowercased).
+// The config stores full paths so nested subdirs can be excluded individually.
+func loadExcluded(cwd string) map[string]bool {
+	data, _ := os.ReadFile(filepath.Join(cwd, excludedConfigFile))
+	var paths []string
+	json.Unmarshal(data, &paths)
+	m := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		m[strings.ToLower(p)] = true
+	}
+	return m
+}
+
+// saveExcluded persists the set of excluded absolute paths.
+func saveExcluded(cwd string, excluded map[string]bool) error {
+	paths := make([]string, 0, len(excluded))
+	for p := range excluded {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	data, _ := json.Marshal(paths)
+	return os.WriteFile(filepath.Join(cwd, excludedConfigFile), data, 0644)
+}
+
+// isPathExcluded returns true if the given path or any of its ancestors is in the excluded set.
+func isPathExcluded(path string, excluded map[string]bool) bool {
+	lower := strings.ToLower(filepath.ToSlash(path))
+	for excl := range excluded {
+		excl = strings.ToLower(filepath.ToSlash(excl))
+		if lower == excl || strings.HasPrefix(lower, excl+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSubdirs returns true if path contains at least one non-hidden subdirectory.
+func hasSubdirs(path string) bool {
+	entries, _ := os.ReadDir(path)
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// makeFolderState builds a FolderState for a given directory.
+func makeFolderState(name, path string, excluded map[string]bool) FolderState {
+	return FolderState{
+		Name:        name,
+		Path:        path,
+		Indexed:     !isPathExcluded(path, excluded),
+		HasChildren: hasSubdirs(path),
+	}
+}
+
+// getContentDirs returns the absolute paths of home subdirectories that are
+// not excluded. These are passed to pass1/pass2 for content indexing.
+func getContentDirs(home, cwd string) []string {
+	subdirs := getHomeSubdirs(home)
+	excluded := loadExcluded(cwd)
+	var dirs []string
+	for _, name := range subdirs {
+		p := filepath.Join(home, name)
+		if !isPathExcluded(p, excluded) {
+			dirs = append(dirs, p)
+		}
+	}
+	if len(dirs) == 0 {
+		dirs = []string{home}
+	}
+	return dirs
+}
 
 // isDaemonRunning checks whether a previously launched daemon process is still alive.
 func isDaemonRunning(cwd string) bool {
@@ -73,18 +189,15 @@ func stopDaemonProcess(cwd string) {
 }
 
 // launchDaemon starts filosophy-daemon.exe as a detached process.
-// The daemon keeps running after the UI closes.
 func launchDaemon(cwd string) {
 	if isDaemonRunning(cwd) {
 		log.Println("daemon already running, skipping launch")
 		return
 	}
 
-	// Prefer a pre-built binary next to our own executable.
 	exe, _ := os.Executable()
 	daemonExe := filepath.Join(filepath.Dir(exe), "filosophy-daemon.exe")
 	if _, err := os.Stat(daemonExe); err != nil {
-		// Dev fallback: go run (blocks briefly, but detaches immediately below).
 		daemonExe = ""
 	}
 
@@ -95,8 +208,6 @@ func launchDaemon(cwd string) {
 		cmd = exec.Command("go", "run", "./cmd/daemon")
 	}
 	cmd.Dir = cwd
-	// CREATE_NEW_PROCESS_GROUP ensures the daemon is not in our job object
-	// so it survives after the Wails app exits.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
@@ -105,12 +216,12 @@ func launchDaemon(cwd string) {
 		return
 	}
 	log.Printf("daemon launched (pid %d)", cmd.Process.Pid)
-	cmd.Process.Release() // detach: we no longer own this process
+	cmd.Process.Release()
 }
 
-func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale bool) {
+func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded map[string]bool, pruneStale bool) {
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Scanning directory...")
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Scanning directories...")
 		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
 	}
 
@@ -121,30 +232,37 @@ func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale boo
 	var mtimes []int64
 	var sizes []int64
 
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		select {
-		case <-ctx.Done():
-			return filepath.SkipDir
-		default:
-		}
-		if err != nil || info.IsDir() {
+	for _, dir := range dirs {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			select {
+			case <-ctx.Done():
+				return filepath.SkipDir
+			default:
+			}
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				// Skip user-excluded subdirs (but not the root dir itself).
+				if path != dir && excluded != nil && isPathExcluded(path, excluded) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isJunkFile(info.Name()) {
+				return nil
+			}
+			if isContentSkipped(path) {
+				return nil
+			}
+			paths = append(paths, path)
+			mtimes = append(mtimes, info.ModTime().UnixNano())
+			sizes = append(sizes, info.Size())
 			return nil
+		})
+		if ctx.Err() != nil {
+			return
 		}
-		if isJunkFile(info.Name()) {
-			return nil
-		}
-		// AppData, Program Files etc. are path-indexed by runSystemPathIndex — skip content indexing.
-		if isContentSkipped(path) {
-			return nil
-		}
-		paths = append(paths, path)
-		mtimes = append(mtimes, info.ModTime().UnixNano())
-		sizes = append(sizes, info.Size())
-		return nil
-	})
-
-	if ctx.Err() != nil {
-		return
 	}
 
 	if pruneStale {
@@ -166,18 +284,26 @@ func runPass1(ctx context.Context, sc *shared.Engine, dir string, pruneStale boo
 	if ctx != nil {
 		wailsruntime.EventsEmit(ctx, "indexing_status", "Processing directories...")
 	}
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		select {
-		case <-ctx.Done():
-			return filepath.SkipDir
-		default:
-		}
-		if err != nil || !info.IsDir() {
+	for _, dir := range dirs {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			select {
+			case <-ctx.Done():
+				return filepath.SkipDir
+			default:
+			}
+			if err != nil || !info.IsDir() {
+				return nil
+			}
+			if path != dir && excluded != nil && isPathExcluded(path, excluded) {
+				return filepath.SkipDir
+			}
+			shared.ProcessDirectory(path, cfg)
 			return nil
+		})
+		if ctx.Err() != nil {
+			return
 		}
-		shared.ProcessDirectory(path, cfg)
-		return nil
-	})
+	}
 
 	if ctx.Err() != nil {
 		return
@@ -298,26 +424,22 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	}
 }
 
-// systemPathSkipDirs are directories skipped even for path-only indexing —
-// either unreadable, transient, or contain no useful paths whatsoever.
 var systemPathSkipDirs = map[string]bool{
 	"$recycle.bin":              true,
 	"system volume information": true,
-	"$windows.~bt":              true, // Windows upgrade leftovers
+	"$windows.~bt":              true,
 	"$windows.~ws":              true,
 	"recovery":                  true,
 	"perflogs":                  true,
 }
 
-// junkExtensions are file extensions excluded from both path and content indexing.
 var junkExtensions = map[string]bool{
 	".tmp": true, ".temp": true, ".log": true, ".etl": true,
-	".dmp": true, ".mdmp": true, // crash dumps
-	".pf":  true, ".sdf": true, // prefetch / SQL CE
-	".db-wal": true, ".db-shm": true, // SQLite write-ahead logs
+	".dmp": true, ".mdmp": true,
+	".pf":  true, ".sdf": true,
+	".db-wal": true, ".db-shm": true,
 }
 
-// junkFileNames are exact filenames (lowercased) excluded from both path and content indexing.
 var junkFileNames = map[string]bool{
 	"ntuser.dat":     true,
 	"ntuser.dat.log": true,
@@ -330,7 +452,6 @@ var junkFileNames = map[string]bool{
 	"usrclass.dat":   true,
 }
 
-// isJunkFile returns true if the file should be excluded everywhere (path and content).
 func isJunkFile(name string) bool {
 	lower := strings.ToLower(name)
 	if junkFileNames[lower] {
@@ -340,9 +461,6 @@ func isJunkFile(name string) bool {
 	return junkExtensions[ext]
 }
 
-// contentSkipPrefixes are path substrings that should be path-indexed only,
-// never content-indexed. Files under these dirs appear in path search but
-// pass 2 (vector/text extraction) never touches them.
 var contentSkipPrefixes = []string{
 	`\appdata\`,
 	`/appdata/`,
@@ -354,7 +472,6 @@ var contentSkipPrefixes = []string{
 	`/programdata/`,
 }
 
-// isContentSkipped returns true if the path should be path-indexed only (no content extraction).
 func isContentSkipped(path string) bool {
 	lower := strings.ToLower(path)
 	for _, prefix := range contentSkipPrefixes {
@@ -365,7 +482,6 @@ func isContentSkipped(path string) bool {
 	return false
 }
 
-// availableDrives returns root paths for all drive letters present on the system.
 func availableDrives() []string {
 	var drives []string
 	for _, letter := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
@@ -377,9 +493,6 @@ func availableDrives() []string {
 	return drives
 }
 
-// runSystemPathIndex walks all drives and adds every file/directory path into
-// paths_fts only (not the files table). This enables path-based search across
-// the whole system without triggering content indexing in pass 2.
 func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 	log.Println("[sysindex] Starting system-wide path index...")
 	const batchSize = 2000
@@ -428,6 +541,9 @@ type App struct {
 	engine        *shared.Engine
 	isIndexing    atomic.Bool
 	indexerCancel context.CancelFunc
+	cwd           string
+	home          string
+	homeWatchStop chan struct{}
 }
 
 func NewApp() *App {
@@ -442,6 +558,8 @@ func (a *App) startup(ctx context.Context) {
 		log.Printf("Failed to get working directory: %v", err)
 		cwd = "."
 	}
+	a.cwd = cwd
+
 	dbPath := filepath.Join(cwd, "filosophy.db")
 	textModelPath := filepath.Join(cwd, "text")
 	imageModelPath := filepath.Join(cwd, "image")
@@ -449,6 +567,17 @@ func (a *App) startup(ctx context.Context) {
 	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 		log.SetOutput(lf)
 	}
+
+	// Write app PID so the daemon's tray "Exit" can close us too.
+	os.WriteFile(filepath.Join(cwd, appPidFile), []byte(strconv.Itoa(os.Getpid())), 0644)
+
+	// Set home early so GetHomeFolders() works even if engine init is slow/fails.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Failed to get home directory: %v", err)
+		home = cwd
+	}
+	a.home = home
 
 	_, dbMissing := os.Stat(dbPath)
 	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
@@ -461,20 +590,10 @@ func (a *App) startup(ctx context.Context) {
 	a.engine = engine
 	log.Println("Engine initialized")
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Printf("Failed to get home directory: %v", err)
-		home = cwd
+	dirs := getContentDirs(home, cwd)
+	for _, d := range dirs {
+		os.MkdirAll(d, 0755)
 	}
-
-	lastPathFile := filepath.Join(cwd, "filosophy_path.txt")
-	baseDir := home
-	if content, err := os.ReadFile(lastPathFile); err == nil && len(content) > 0 {
-		baseDir = strings.TrimSpace(string(content))
-	} else {
-		baseDir = filepath.Join(home, "Downloads")
-	}
-	os.MkdirAll(baseDir, 0755)
 
 	if forceIndex {
 		if err := a.engine.ResetContentIndex(); err != nil {
@@ -486,26 +605,55 @@ func (a *App) startup(ctx context.Context) {
 	a.indexerCancel = cancel
 
 	if forceIndex || os.IsNotExist(dbMissing) {
-		// First run or explicit re-index:
-		// - Pass 1: content metadata for baseDir only
-		// - Pass 2: content indexing for baseDir only (background)
-		// - System path index: all drives, path-only, in background (does not block search)
-		runPass1(idxCtx, a.engine, baseDir, forceIndex)
+		runPass1(idxCtx, a.engine, dirs, loadExcluded(cwd), forceIndex)
 		go func() {
 			runPass2(idxCtx, a.engine)
 			launchDaemon(cwd)
 		}()
 		go runSystemPathIndex(idxCtx, a.engine)
 	} else {
-		// Normal startup: engine is ready, daemon should already be running.
-		// Do NOT scan again — the daemon tracked changes while we were closed.
 		launchDaemon(cwd)
+	}
+
+	// Watch home dir top level so the frontend can react to new/deleted folders.
+	a.homeWatchStop = make(chan struct{})
+	go a.watchHomeFolders()
+}
+
+// watchHomeFolders watches the home directory for top-level folder
+// creation/deletion and emits home_folders_changed so the UI updates.
+func (a *App) watchHomeFolders() {
+	ch := make(chan notify.EventInfo, 64)
+	// Non-recursive watch on home dir root only.
+	if err := notify.Watch(a.home, ch,
+		notify.FileNotifyChangeDirName,
+	); err != nil {
+		log.Println("home folder watcher error:", err)
+		return
+	}
+	defer notify.Stop(ch)
+
+	for {
+		select {
+		case <-a.homeWatchStop:
+			return
+		case ei, ok := <-ch:
+			if !ok {
+				return
+			}
+			// Only care about direct children (top-level dirs).
+			if filepath.Dir(ei.Path()) == a.home {
+				wailsruntime.EventsEmit(a.ctx, "home_folders_changed")
+			}
+		}
 	}
 }
 
-// shutdown is called when the Wails app closes.
-// We deliberately do NOT stop the daemon — it keeps running in the background.
 func (a *App) shutdown(ctx context.Context) {
+	os.Remove(filepath.Join(a.cwd, appPidFile))
+	if a.homeWatchStop != nil {
+		close(a.homeWatchStop)
+	}
 	if a.indexerCancel != nil {
 		a.indexerCancel()
 	}
@@ -542,77 +690,89 @@ func (a *App) OpenFileNative(path string) error {
 	return exec.Command(cmd, args...).Start()
 }
 
-func (a *App) SelectDirectory() string {
-	log.Println("SelectDirectory called")
-	dir, err := wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
-		Title: "Select Folder to Index",
-	})
+// GetHomeFolders returns the top-level home subdirectories with their indexing state.
+func (a *App) GetHomeFolders() []FolderState {
+	subdirs := getHomeSubdirs(a.home)
+	excluded := loadExcluded(a.cwd)
+	result := make([]FolderState, 0, len(subdirs))
+	for _, name := range subdirs {
+		p := filepath.Join(a.home, name)
+		result = append(result, makeFolderState(name, p, excluded))
+	}
+	return result
+}
+
+// GetFolderChildren returns the immediate non-hidden subdirectories of path
+// with their current indexing state. Used to lazily expand the folder tree.
+func (a *App) GetFolderChildren(path string) []FolderState {
+	entries, err := os.ReadDir(path)
 	if err != nil {
-		log.Printf("SelectDirectory error: %v", err)
-		return ""
+		return nil
 	}
-	return dir
-}
-
-func (a *App) GetLastDirectory() string {
-	cwd, _ := os.Getwd()
-	content, err := os.ReadFile(filepath.Join(cwd, "filosophy_path.txt"))
-	if err == nil && len(content) > 0 {
-		return strings.TrimSpace(string(content))
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Downloads")
-}
-
-// StartIndexing re-indexes a new directory, then relaunches the daemon on it.
-func (a *App) StartIndexing(directoryPath string) {
-	if a.engine == nil {
-		if a.ctx != nil {
-			wailsruntime.EventsEmit(a.ctx, "indexing_status", "System is still warming up. Please wait a few seconds and try again.")
+	excluded := loadExcluded(a.cwd)
+	var result []FolderState
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
 		}
-		return
+		childPath := filepath.Join(path, e.Name())
+		result = append(result, makeFolderState(e.Name(), childPath, excluded))
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
+}
+
+// SetFolderIndexed enables or disables content indexing for a directory (full path).
+// Enabling triggers a background pass1+pass2 for that directory.
+// Disabling updates the config and restarts the daemon.
+func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
+	excluded := loadExcluded(a.cwd)
+	lower := strings.ToLower(folderPath)
+	if indexed {
+		delete(excluded, lower)
+	} else {
+		excluded[lower] = true
+	}
+	if err := saveExcluded(a.cwd, excluded); err != nil {
+		return err
 	}
 
+	// Restart daemon with updated dir list.
+	stopDaemonProcess(a.cwd)
+
+	if !indexed {
+		// Just disable — restart daemon and done.
+		launchDaemon(a.cwd)
+		return nil
+	}
+
+	// Folder was enabled — index it in the background.
 	if !a.isIndexing.CompareAndSwap(false, true) {
-		return
+		// Another index run is in progress; daemon will be relaunched when it finishes.
+		go func() {
+			for a.isIndexing.Load() {
+				time.Sleep(200 * time.Millisecond)
+			}
+			launchDaemon(a.cwd)
+		}()
+		return nil
 	}
 
 	if a.indexerCancel != nil {
 		a.indexerCancel()
 	}
-
 	idxCtx, cancel := context.WithCancel(a.ctx)
 	a.indexerCancel = cancel
+	dir := folderPath
 
-	cwd, _ := os.Getwd()
-	os.WriteFile(filepath.Join(cwd, "filosophy_path.txt"), []byte(directoryPath), 0644)
-
-	log.Printf("StartIndexing called for: %s", directoryPath)
 	go func() {
 		defer a.isIndexing.Store(false)
-
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Stopping daemon...")
-		stopDaemonProcess(cwd)
-		time.Sleep(300 * time.Millisecond)
-
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Resetting index...")
-		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 0)
-		if err := a.engine.ResetContentIndex(); err != nil {
-			log.Println("reset index error:", err)
-		}
-
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Phase 1: Metadata Fast-Pass...")
-		runPass1(idxCtx, a.engine, directoryPath, true)
-
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Phase 2: Deep Vector Extraction...")
+		runPass1(idxCtx, a.engine, []string{dir}, loadExcluded(a.cwd), false)
 		runPass2(idxCtx, a.engine)
-
-		wailsruntime.EventsEmit(a.ctx, "indexing_progress", 100)
-		wailsruntime.EventsEmit(a.ctx, "indexing_status", "Indexing complete.")
-
-		go runSystemPathIndex(idxCtx, a.engine)
-		launchDaemon(cwd)
+		launchDaemon(a.cwd)
 	}()
+
+	return nil
 }
 
 func main() {

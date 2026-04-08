@@ -218,7 +218,7 @@ func (t *tracker) drain() map[string]*fileChanges {
 	return result
 }
 
-// Daemon watches a directory for file changes and indexes them using the shared Engine.
+// Daemon watches a set of directories for file changes and indexes them using the shared Engine.
 // It runs in the background and does not interfere with search or indexing from the main app.
 type Daemon struct {
 	t                          *tracker
@@ -226,18 +226,29 @@ type Daemon struct {
 	flushMu                    sync.Mutex
 	exit                       chan struct{}
 	structureChan, contentChan chan notify.EventInfo
-	baseDir                    string
+	baseDirs                   []string
 }
 
 // NewDaemon creates a new Daemon linked to the given Engine.
 // The daemon shares the Engine with the main App — it watches for file changes
 // and indexes them in the background without interfering with search operations.
-func NewDaemon(baseDir string, engine *shared.Engine) *Daemon {
+func NewDaemon(baseDirs []string, engine *shared.Engine) *Daemon {
 	return &Daemon{
-		baseDir: baseDir,
-		sc:      engine,
-		exit:    make(chan struct{}),
+		baseDirs: baseDirs,
+		sc:       engine,
+		exit:     make(chan struct{}),
 	}
+}
+
+// isDirectChild returns true if path is a direct child of any of the watched base directories.
+func (d *Daemon) isDirectChild(path string) bool {
+	parent := filepath.Dir(path)
+	for _, base := range d.baseDirs {
+		if parent == base {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Daemon) flush() {
@@ -368,45 +379,43 @@ func (d *Daemon) run() {
 		dbPath:  dbPath,
 		prev:    sentinel{},
 	}
-	if err := notify.Watch(d.baseDir, d.structureChan, structureEventMask); err != nil {
-		fmt.Println("Error watching structure:", err)
-		return
+	// Watch all configured base directories.
+	for _, baseDir := range d.baseDirs {
+		if err := notify.Watch(baseDir, d.structureChan, structureEventMask); err != nil {
+			fmt.Println("Error watching structure for", baseDir, ":", err)
+			continue
+		}
+		entries, err := os.ReadDir(baseDir)
+		if err != nil {
+			fmt.Println("Error reading base directory:", baseDir, err)
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if shouldFilterFolder(name) {
+				continue
+			}
+			watchPath := filepath.Join(baseDir, name, "...")
+			if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
+				fmt.Println("Error watching content for", name, ":", err)
+				continue
+			}
+			if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
+				fmt.Println("Error watching structure for", name, ":", err)
+				continue
+			}
+			fmt.Println("Watching:", watchPath)
+		}
+		if err := notify.Watch(baseDir, d.contentChan, contentEventMask); err != nil {
+			fmt.Println("Error watching base directory content:", err)
+		} else {
+			fmt.Println("Watching base:", baseDir)
+		}
 	}
 	defer notify.Stop(d.structureChan)
-	entries, err := os.ReadDir(d.baseDir)
-	if err != nil {
-		fmt.Println("Error reading base directory:", err)
-		return
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if shouldFilterFolder(name) {
-			continue
-		}
-
-		// Set up recursive watch for this folder
-		watchPath := filepath.Join(d.baseDir, name, "...")
-		if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
-			fmt.Println("Error watching content for", name, ":", err)
-			continue
-		}
-		if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
-			fmt.Println("Error watching structure for", name, ":", err)
-			continue
-		}
-		fmt.Println("Watching:", watchPath)
-	}
-
-	// Also watch the base directory itself (non-recursive) for content changes
-	if err := notify.Watch(d.baseDir, d.contentChan, contentEventMask); err != nil {
-		fmt.Println("Error watching base directory content:", err)
-	} else {
-		fmt.Println("Watching base:", d.baseDir)
-	}
 	defer notify.Stop(d.contentChan)
 
 	// Goroutine for structure changes (create, delete, rename) - no filtering
@@ -419,13 +428,13 @@ func (d *Daemon) run() {
 
 			fmt.Println("[STRUCTURE]", ei.Event(), ei.Path(), ei.Sys())
 
-			// Auto-watch new top-level folders in the user's home directory
+			// Auto-watch new top-level folders inside any watched base directory.
 			if (ei.Event() == notify.FileActionAdded || ei.Event() == notify.FileActionRenamedNewName) &&
-				filepath.Dir(ei.Path()) == d.baseDir {
+				d.isDirectChild(ei.Path()) {
 				name := filepath.Base(ei.Path())
 				if !shouldFilterFolder(name) {
 					if info, err := os.Stat(ei.Path()); err == nil && info.IsDir() {
-						watchPath := filepath.Join(d.baseDir, name, "...")
+						watchPath := filepath.Join(filepath.Dir(ei.Path()), name, "...")
 						if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
 							fmt.Println("Error watching content for new folder", name, ":", err)
 						}

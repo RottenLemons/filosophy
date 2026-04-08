@@ -163,9 +163,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	// Initialize ONNX Runtime
 	ortPath := findOnnxRuntime()
 	ort.SetSharedLibraryPath(ortPath)
-	useGPU := hasCUDAProvider()
+	useGPU := hasCUDAProvider() && cudaRuntimeReady()
 	if useGPU {
-		log.Printf("CUDA provider DLL found — GPU acceleration will be attempted")
+		log.Printf("CUDA runtime verified — GPU acceleration enabled")
 	}
 	if err := ort.InitializeEnvironment(); err != nil {
 		sqlDB.Close()
@@ -882,6 +882,8 @@ func (s *Engine) IndexPathsFTS(paths []string) {
 	if len(paths) == 0 {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ctx := context.Background()
 	tx, err := s.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
@@ -980,6 +982,8 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
 	if len(paths) == 0 {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ctx := context.Background()
 	tx, err := s.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
@@ -2411,6 +2415,21 @@ func hasCUDAProvider() bool {
 		}
 	}
 	return false
+}
+
+// cudaRuntimeReady probes whether the CUDA 13 runtime DLLs are actually
+// loadable. ORT's CUDA EP requires cublasLt64_13.dll; if it is absent the
+// provider DLL fails to load and ORT prints an internal error for every
+// session. We check once here so we can skip the EP entirely when CUDA is
+// installed but the runtime is not.
+func cudaRuntimeReady() bool {
+	dll, err := syscall.LoadDLL("cublasLt64_13.dll")
+	if err != nil {
+		log.Printf("CUDA runtime not available (cublasLt64_13.dll missing) — using CPU. Install CUDA 13 to enable GPU.")
+		return false
+	}
+	dll.Release()
+	return true
 }
 
 // tryAppendCUDA attempts to register the CUDA execution provider on opts.

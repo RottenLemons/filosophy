@@ -230,7 +230,7 @@
   }
 </script>
 
-<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-black text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
+<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
   <ThemeToggle />
   
   <!-- Header -->
@@ -238,11 +238,11 @@
     <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
   </header>
 
-  <main class="flex-1 flex overflow-hidden dark:bg-[#0a0a0a]">
+  <main class="flex-1 flex overflow-hidden">
     
     <!-- Main Search Content (Left Column) -->
     <!-- flex-1 ensures it fills all available space when sidebar is unmounted -->
-    <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#222] transition-all duration-300">
+    <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
         <!-- Indexer Section -->
@@ -250,7 +250,7 @@
 
         <!-- Search Section -->
         <div class="space-y-4">
-          <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#222] pb-3 transition-colors focus-within:border-blue-500">
+          <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#2a2a2a] pb-3 transition-colors focus-within:border-blue-500">
             <div class="text-gray-400">
               <SearchIcon size={24} />
             </div>
@@ -265,7 +265,7 @@
             <div class="relative" use:clickOutside on:click_outside={() => isFilterOpen = false}>
               <button 
                 on:click={() => isFilterOpen = !isFilterOpen}
-                class="flex items-center gap-2 px-3 py-1.5 border border-gray-300 dark:border-[#222] hover:border-gray-400 text-gray-600 dark:text-gray-400 transition-colors text-[10px] font-semibold uppercase tracking-widest disabled:opacity-50 rounded-none bg-white dark:bg-[#111]" 
+                class="flex items-center gap-2 px-3 py-1.5 border border-gray-300 dark:border-[#2a2a2a] hover:border-gray-400 text-gray-600 dark:text-gray-400 transition-colors text-[10px] font-semibold uppercase tracking-widest disabled:opacity-50 rounded-none bg-white dark:bg-[#111]" 
                 disabled={searching}
               >
                 <span>Filter</span>
@@ -273,7 +273,7 @@
               </button>
 
               {#if isFilterOpen}
-                <div class="absolute right-0 top-full mt-2 w-72 bg-white dark:bg-[#0a0a0a] border border-gray-200 dark:border-[#333] shadow-xl z-50 rounded-none p-4 flex flex-col gap-6" transition:slide={{ duration: 150 }}>
+                <div class="absolute right-0 top-full mt-2 w-72 bg-white dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-xl z-50 rounded-none p-4 flex flex-col gap-6" transition:slide={{ duration: 150 }}>
                   <!-- Type Filter -->
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Type</span>
@@ -336,13 +336,13 @@
                 </div>
               {/if}
               {#if filterDate !== 'Anytime'}
-                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#222] rounded-none">
+                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none">
                   <span class="text-[9px] font-bold uppercase tracking-widest">Date</span>
                   <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterDate}</span>
                 </div>
               {/if}
               {#if filterSize !== 'Any'}
-                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#222] rounded-none">
+                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none">
                   <span class="text-[9px] font-bold uppercase tracking-widest">Size</span>
                   <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterSize}</span>
                 </div>
@@ -354,7 +354,7 @@
         <!-- Results List -->
         <div class="space-y-4 pt-4">
           {#if filteredFiles.length > 0}
-            <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#222]">
+            <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#2a2a2a]">
               <span>{filteredFiles.length} Records Found</span>
               <span>Sorted by relevance</span>
             </div>
@@ -367,7 +367,7 @@
                 <!-- svelte-ignore a11y-no-static-element-interactions -->
                 <div 
                   class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm
-                         {selectedFile === file ? 'bg-blue-50 border-blue-600 dark:bg-[#111] dark:border-l-white' : 'border-transparent hover:shadow hover:border-gray-200 dark:hover:border-[#222] hover:bg-white dark:hover:bg-[#111]'}"
+                         {selectedFile === file ? 'bg-blue-50 border-blue-600 dark:bg-[#1a1a1a] dark:border-l-gray-400' : 'border-transparent hover:shadow hover:border-gray-200 dark:hover:border-[#2a2a2a] hover:bg-white dark:hover:bg-[#1a1a1a]'}"
                   on:click={() => selectedFile = file}
                   on:dblclick={() => OpenFileNative(file.Path)}
                   style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 15}ms; opacity: 0; transform: translateY(10px);"
@@ -413,7 +413,7 @@
               </div>
             </div>
           {:else if searchQuery.trim() !== ''}
-             <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#222] border-dashed">No relevant documents found.</div>
+             <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">No relevant documents found.</div>
           {/if}
         </div>
       </div>
@@ -424,7 +424,7 @@
     {#if selectedFile}
       <aside 
         transition:slide={{ axis: 'x', duration: 400 }}
-        class="w-[40%] min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-white flex flex-col z-30 shadow-2xl relative overflow-hidden"
+        class="w-[40%] min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col z-30 shadow-2xl relative overflow-hidden"
       >
         <div class="flex-1 overflow-y-auto p-12 space-y-10 scrollbar-custom">
           <header class="space-y-6 relative">
@@ -440,7 +440,7 @@
             <div class="font-bold text-[9px] text-blue-600 dark:text-gray-300 uppercase tracking-widest">Key Match Found</div>
             <h2 class="text-4xl font-serif text-slate-900 dark:text-gray-100 font-bold leading-tight pr-12">{getFileName(selectedFile.Path)}</h2>
             
-            <div class="grid grid-cols-3 gap-6 border-y border-gray-200 dark:border-[#222] py-6">
+            <div class="grid grid-cols-3 gap-6 border-y border-gray-200 dark:border-[#2a2a2a] py-6">
               <div class="space-y-1">
                 <div class="text-[8px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Type</div>
                 <div class="text-xs text-slate-800 dark:text-gray-100 font-semibold uppercase">{getFileType(selectedFile.Path)}</div>
