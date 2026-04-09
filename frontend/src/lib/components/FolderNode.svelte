@@ -10,11 +10,17 @@
   /** @type {number} */
   export let depth = 0;
   export let searchTerm = "";
+  
+  // Task 3: Cascade prop
+  export let parentExcluded = false;
 
   let isExpanded = false;
   /** @type {FolderState[] | null} */
   let children = null;
   let loading = false;
+
+  // Task 3: Combined exclusion state
+  $: isGloballyExcluded = parentExcluded || !folder.Indexed;
 
   $: isVisible = !searchTerm || 
                  folder.Name.toLowerCase().includes(searchTerm.toLowerCase()) || 
@@ -51,7 +57,7 @@
 
 {#if isVisible}
   <div class="node" style="--depth: {depth}">
-    <div class="row">
+    <div class="row {isGloballyExcluded ? 'opacity-40 grayscale-[0.5]' : 'opacity-100'} transition-all duration-300">
       <!-- Expand toggle -->
       <div class="expand-col">
         {#if folder.HasChildren}
@@ -64,7 +70,7 @@
       <!-- Icon -->
       <div class="folder-icon">
         {#if isExpanded}
-          <FolderOpen size={14} class="text-blue-500" />
+          <FolderOpen size={14} class={isGloballyExcluded ? 'text-gray-400' : 'text-blue-500'} />
         {:else}
           <Folder size={14} class="text-gray-400 dark:text-gray-500" />
         {/if}
@@ -76,9 +82,15 @@
           type="checkbox"
           class="folder-checkbox"
           checked={folder.Indexed}
+          disabled={parentExcluded}
           on:change={onCheckbox}
         />
-        <span class="folder-name" title={folder.Path}>{folder.Name}</span>
+        <span class="folder-name" title={folder.Path}>
+          {folder.Name}
+          {#if parentExcluded}
+            <span class="text-[8px] italic ml-2 opacity-60">(Excluded by parent)</span>
+          {/if}
+        </span>
       </label>
     </div>
 
@@ -89,7 +101,8 @@
           <div class="loading-hint">Loading subdirectories...</div>
         {:else if children && children.length > 0}
           {#each children as child (child.Path)}
-            <svelte:self folder={child} depth={depth + 1} {searchTerm} />
+            <!-- Task 3: Recursive cascade -->
+            <svelte:self folder={child} depth={depth + 1} {searchTerm} parentExcluded={isGloballyExcluded} />
           {/each}
         {:else}
           <div class="empty-hint">Empty directory</div>
@@ -114,10 +127,10 @@
     border-radius: 4px;
     transition: background 0.15s ease;
   }
-  .row:hover {
+  .row:hover:not(.opacity-40) {
     background: rgba(0, 0, 0, 0.03);
   }
-  :global(.dark) .row:hover {
+  :global(.dark) .row:hover:not(.opacity-40) {
     background: rgba(255, 255, 255, 0.04);
   }
 
@@ -178,11 +191,15 @@
     position: relative;
     transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s;
   }
+  .folder-checkbox:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
   :global(.dark) .folder-checkbox {
     border-color: #334155;
   }
 
-  .folder-checkbox:active {
+  .folder-checkbox:active:not(:disabled) {
     transform: scale(0.9);
   }
 

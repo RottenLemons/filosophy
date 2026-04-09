@@ -4,10 +4,12 @@
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
-  import { Settings as SettingsIcon } from 'lucide-svelte';
+  import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity } from 'lucide-svelte';
+  import { Settings as SettingsIconLucide } from 'lucide-svelte';
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import SettingsModal from '$lib/components/SettingsModal.svelte';
+  import { indexingStatus } from '$stores/indexer';
 
   let showSettings = false;
 
@@ -19,6 +21,16 @@
   let files = [];
   /** @type {boolean} */
   let searching = false;
+  /** @type {boolean} */
+  let searchError = false;
+
+  /** @type {number} */
+  let currentSearchTicket = 0;
+  /** @type {number} */
+  let renderLimit = 50;
+
+  /** @type {boolean} */
+  let previewImageError = false;
 
   let isFilterOpen = false;
   
@@ -56,9 +68,16 @@
     }
   }
 
+  // Task 4: Reset image error on file selection change
+  $: if (selectedFile) {
+    previewImageError = false;
+  }
+
   let filterType = 'All'; // Options: 'All', 'PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG', 'Other'
   let filterDate = 'Anytime'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
   let filterSize = 'Any'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '10 MB - 100 MB', '> 100 MB'
+
+  $: isFilterActive = filterType !== 'All' || filterDate !== 'Anytime' || filterSize !== 'Any';
 
   $: filteredFiles = (() => {
     const now = new Date();
@@ -100,11 +119,6 @@
     });
   })();
 
-  // Selection Fallback
-  $: if (selectedFile && !filteredFiles.find(f => f.Path === selectedFile.Path)) {
-    selectedFile = filteredFiles.length > 0 ? filteredFiles[0] : null;
-  }
-
   /** @param {HTMLElement} node */
   function clickOutside(node) {
     /** @param {MouseEvent} event */
@@ -121,53 +135,82 @@
   /** @type {any} */
   let searchTimeout;
 
-  function debouncedSearch() {
-    clearTimeout(searchTimeout);
-    
+  // Task 1 & Task 2: Ticket-based concurrency and Reset renderLimit
+  async function performingSearch() {
     if (!searchQuery.trim()) {
       files = [];
       selectedFile = null;
       searching = false;
+      searchError = false;
+      renderLimit = 50;
       return;
     }
 
+    currentSearchTicket++;
+    const localTicket = currentSearchTicket;
+    
     searching = true;
-    searchTimeout = setTimeout(async () => {
-      try {
-        const result = await Search(searchQuery);
+    searchError = false;
+    renderLimit = 50; 
+
+    try {
+      const result = await Search(searchQuery);
+      if (localTicket === currentSearchTicket) {
         files = result || [];
-        // Auto-select first result if desired, but user wants full-width search by default
         selectedFile = null; 
-      } catch (error) {
+      }
+    } catch (error) {
+      if (localTicket === currentSearchTicket) {
         console.error("Search failed:", error);
+        searchError = true;
         files = [];
         selectedFile = null;
       }
-      searching = false;
-    }, 300);
+    } finally {
+      if (localTicket === currentSearchTicket) {
+        searching = false;
+      }
+    }
+  }
+
+  function debouncedSearch() {
+    clearTimeout(searchTimeout);
+    if (!searchQuery.trim()) {
+        files = [];
+        selectedFile = null;
+        searching = false;
+        searchError = false;
+        renderLimit = 50;
+        return;
+    }
+    searchTimeout = setTimeout(performingSearch, 300);
   }
 
   /** @param {KeyboardEvent} e */
   function onKeyUp(e) {
     if (e.key === "Enter") {
       clearTimeout(searchTimeout);
-      if (!searchQuery.trim()) {
-        files = [];
-        selectedFile = null;
-        return;
-      }
-      searching = true;
-      Search(searchQuery).then(result => {
-        files = result || [];
-        selectedFile = null;
-        searching = false;
-      }).catch(error => {
-        console.error("Search failed:", error);
-        files = [];
-        selectedFile = null;
-        searching = false;
-      });
+      performingSearch();
     }
+  }
+
+  /** @param {KeyboardEvent} e */
+  function handleResultKeydown(e, file) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      selectedFile = file;
+    }
+  }
+
+  function cancelSearch() {
+    clearTimeout(searchTimeout);
+    currentSearchTicket++; // Invalidate pending search
+    searching = false;
+    searchError = false;
+  }
+
+  function loadMore() {
+    renderLimit += 50;
   }
 
   /** @param {number} score */
@@ -235,7 +278,7 @@
   }
 </script>
 
-<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
+<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
     <button
       on:click={() => showSettings = true}
@@ -243,27 +286,23 @@
       style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
       aria-label="Open Settings"
     >
-      <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
+      <SettingsIcon Lucide class="w-5 h-5 transition-transform group-hover:rotate-45" />
     </button>
     <ThemeToggle />
   </div>
 
   <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
   
-  <!-- Header -->
   <header class="w-full px-12 py-6 z-50 shrink-0">
     <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
   </header>
 
-  <main class="flex-1 flex overflow-hidden">
+  <!-- Task 3: Desktop layout lg:flex-row -->
+  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
     
-    <!-- Main Search Content (Left Column) -->
-    <!-- flex-1 ensures it fills all available space when sidebar is unmounted -->
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
-
-        <!-- Search Section -->
         <div class="space-y-4">
           <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#2a2a2a] pb-3 transition-colors focus-within:border-blue-500">
             <div class="text-gray-400">
@@ -289,7 +328,6 @@
 
               {#if isFilterOpen}
                 <div class="absolute right-0 top-full mt-2 w-72 bg-white dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-xl z-50 rounded-none p-4 flex flex-col gap-6" transition:slide={{ duration: 150 }}>
-                  <!-- Type Filter -->
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Type</span>
                     <div class="grid grid-cols-2 gap-1">
@@ -305,7 +343,6 @@
                     </div>
                   </div>
 
-                  <!-- Date Filter -->
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Timeframe</span>
                     <div class="flex flex-col gap-1">
@@ -321,7 +358,6 @@
                     </div>
                   </div>
 
-                  <!-- Size Filter -->
                   <div class="space-y-2">
                     <span class="text-[9px] font-bold uppercase tracking-widest text-gray-400">File Size</span>
                     <div class="flex flex-col gap-1">
@@ -341,32 +377,42 @@
             </div>
           </div>
           
-          <!-- Filter Badges -->
-          {#if (filterType !== 'All' || filterDate !== 'Anytime' || filterSize !== 'Any')}
+          {#if isFilterActive}
             <div class="flex flex-wrap gap-2 pt-1">
               {#if filterType !== 'All'}
-                <div class="flex items-center gap-1.5 border px-2 py-1 bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-black dark:border-white rounded-none">
+                <button 
+                  on:click={() => filterType = 'All'}
+                  class="flex items-center gap-1.5 border px-2 py-1 bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-black dark:border-white rounded-none hover:bg-slate-800 dark:hover:bg-gray-200 transition-colors group"
+                >
                   <span class="text-[9px] font-bold uppercase tracking-widest">Type</span>
                   <span class="text-[9px] font-bold uppercase tracking-widest opacity-80">{filterType}</span>
-                </div>
+                  <XCircle size={10} class="ml-1 opacity-60 group-hover:opacity-100" />
+                </button>
               {/if}
               {#if filterDate !== 'Anytime'}
-                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none">
+                <button 
+                  on:click={() => filterDate = 'Anytime'}
+                  class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none hover:bg-gray-50 dark:hover:bg-[#1a1a1a] transition-colors group"
+                >
                   <span class="text-[9px] font-bold uppercase tracking-widest">Date</span>
                   <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterDate}</span>
-                </div>
+                  <XCircle size={10} class="ml-1 opacity-40 group-hover:opacity-100" />
+                </button>
               {/if}
               {#if filterSize !== 'Any'}
-                <div class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none">
+                <button 
+                  on:click={() => filterSize = 'Any'}
+                  class="flex items-center gap-1.5 border px-2 py-1 bg-transparent text-gray-500 dark:text-gray-500 border-gray-300 dark:border-[#2a2a2a] rounded-none hover:bg-gray-50 dark:hover:bg-[#1a1a1a] transition-colors group"
+                >
                   <span class="text-[9px] font-bold uppercase tracking-widest">Size</span>
                   <span class="text-[9px] font-bold uppercase tracking-widest text-gray-700 dark:text-gray-400">{filterSize}</span>
-                </div>
+                  <XCircle size={10} class="ml-1 opacity-40 group-hover:opacity-100" />
+                </button>
               {/if}
             </div>
           {/if}
         </div>
         
-        <!-- Results List -->
         <div class="space-y-4 pt-4">
           {#if filteredFiles.length > 0}
             <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#2a2a2a]">
@@ -375,16 +421,53 @@
             </div>
           {/if}
           
-          {#if filteredFiles.length > 0}
-            <div class="flex flex-col gap-6 relative z-20">
-              {#each filteredFiles as file, i (file.Path)}
-                <!-- svelte-ignore a11y-click-events-have-key-events - Result Card -->
-                <!-- svelte-ignore a11y-no-static-element-interactions -->
+          {#if searchError}
+            <div class="p-8 border border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10 rounded-none flex flex-col items-center gap-4 text-center" transition:fade>
+              <AlertCircle class="text-red-500" size={32} />
+              <div class="space-y-1">
+                <h3 class="text-red-900 dark:text-red-400 font-bold uppercase tracking-widest text-xs">Search Failed</h3>
+                <p class="text-[11px] text-red-700 dark:text-red-500/70 italic">An error occurred while communicating with the search engine.</p>
+              </div>
+              <button 
+                on:click={performingSearch}
+                class="px-6 py-2 bg-red-600 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-red-700 transition-colors"
+              >
+                Retry Search
+              </button>
+            </div>
+          {:else if searching}
+            <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-8" transition:fade>
+              <svg class="animate-spin" style="animation-duration: 6s;" width="80" height="80" viewBox="0 0 80 80" fill="none" stroke="#757575" stroke-width="8" stroke-linecap="square">
+                <circle cx="40" cy="40" r="30" stroke-dasharray="140 48"></circle>
+              </svg>
+              <div class="h-8 relative w-full flex justify-center">
+                {#key currentMessageIndex}
+                  <span transition:fade={{duration: 600}} class="absolute text-[18px] text-[#acabab] text-center tracking-wide" style="font-family: 'Inter', sans-serif;">
+                    {loadingMessages[currentMessageIndex]}
+                  </span>
+                {/key}
+              </div>
+              <button 
+                on:click={cancelSearch}
+                class="px-4 py-1.5 border border-gray-300 dark:border-[#2a2a2a] text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-[10px] font-bold uppercase tracking-widest transition-colors"
+                aria-label="Cancel Search"
+              >
+                Cancel
+              </button>
+            </div>
+          {:else if filteredFiles.length > 0}
+            <div class="flex flex-col gap-6 relative z-20" role="listbox" aria-label="Search results">
+              <!-- Task 2: renderLimit paging -->
+              {#each filteredFiles.slice(0, renderLimit) as file, i (file.Path)}
                 <div 
-                  class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm
+                  class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset
                          {selectedFile === file ? 'bg-blue-50 border-blue-600 dark:bg-[#1a1a1a] dark:border-l-gray-400' : 'border-transparent hover:shadow hover:border-gray-200 dark:hover:border-[#2a2a2a] hover:bg-white dark:hover:bg-[#1a1a1a]'}"
                   on:click={() => selectedFile = file}
                   on:dblclick={() => OpenFileNative(file.Path)}
+                  on:keydown={(e) => handleResultKeydown(e, file)}
+                  tabindex="0"
+                  role="option"
+                  aria-selected={selectedFile === file}
                   style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 5}ms; opacity: 0; transform: translateY(10px);"
                 >
                   <div class="flex gap-6 items-start">
@@ -413,48 +496,59 @@
                   </div>
                 </div>
               {/each}
-            </div>
-          {:else if searching}
-            <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-8">
-              <svg class="animate-spin" style="animation-duration: 6s;" width="80" height="80" viewBox="0 0 80 80" fill="none" stroke="#757575" stroke-width="8" stroke-linecap="square">
-                <circle cx="40" cy="40" r="30" stroke-dasharray="140 48"></circle>
-              </svg>
-              <div class="h-8 relative w-full flex justify-center">
-                {#key currentMessageIndex}
-                  <span transition:fade={{duration: 600}} class="absolute text-[18px] text-[#acabab] text-center tracking-wide" style="font-family: 'Inter', sans-serif;">
-                    {loadingMessages[currentMessageIndex]}
-                  </span>
-                {/key}
-              </div>
+
+              {#if filteredFiles.length > renderLimit}
+                <button 
+                  on:click={loadMore}
+                  class="w-full py-6 border-2 border-dashed border-gray-200 dark:border-[#2a2a2a] text-gray-400 dark:text-gray-500 hover:text-blue-500 hover:border-blue-500 dark:hover:text-blue-400 dark:hover:border-blue-400 font-bold uppercase tracking-widest text-[10px] transition-all"
+                >
+                  Load More Results ({filteredFiles.length - renderLimit} Remaining)
+                </button>
+              {/if}
             </div>
           {:else if searchQuery.trim() !== ''}
-             <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">No relevant documents found.</div>
+             <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">
+               No relevant documents found.
+               {#if isFilterActive}
+                 <div class="mt-2 text-xs not-italic font-sans font-semibold text-blue-500 dark:text-blue-400 uppercase tracking-widest">
+                   Try clearing your active filters.
+                 </div>
+               {/if}
+             </div>
           {/if}
         </div>
       </div>
     </div>
     
-    <!-- Requirement: Master Layout Container Logic (Right Side) -->
-    <!-- Sidebar only mounts when selectedFile is truthy -->
+    <!-- Task 3: Mobile overlay lg:relative vs absolute inset-0 -->
     {#if selectedFile}
       <aside 
         transition:slide={{ axis: 'x', duration: 400 }}
-        class="w-[40%] min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col z-30 shadow-2xl relative overflow-hidden"
+        class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
       >
         <div class="flex-1 overflow-y-auto p-12 space-y-10 scrollbar-custom">
           <header class="space-y-6 relative">
+            <!-- Close button serves as dismissal for overlay and sidebar -->
             <button 
               class="absolute top-0 right-0 p-2 text-gray-400 hover:text-slate-900 transition-colors bg-[#FAF9F6] dark:bg-[#111] dark:hover:text-gray-100 rounded-full shadow-sm"
               on:click={() => selectedFile = null}
               aria-label="Close Preview"
             >
-              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-              </svg>
+              <X class="w-6 h-6" />
             </button>
             <div class="font-bold text-[9px] text-blue-600 dark:text-gray-300 uppercase tracking-widest">Key Match Found</div>
             <h2 class="text-4xl font-serif text-slate-900 dark:text-gray-100 font-bold leading-tight pr-12">{getFileName(selectedFile.Path)}</h2>
             
+            <button 
+              on:click={() => OpenFileNative(selectedFile.Path)}
+              class="w-full py-4 bg-slate-900 dark:bg-white text-white dark:text-black font-bold uppercase tracking-[0.2em] text-xs hover:bg-slate-800 dark:hover:bg-gray-100 transition-all shadow-xl flex items-center justify-center gap-3"
+            >
+               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
+               </svg>
+               Open File
+            </button>
+
             <div class="grid grid-cols-3 gap-6 border-y border-gray-200 dark:border-[#2a2a2a] py-6">
               <div class="space-y-1">
                 <div class="text-[8px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Type</div>
@@ -474,8 +568,20 @@
           <div class="flex-1 w-full h-full font-serif text-lg leading-relaxed text-slate-700 dark:text-gray-100 bg-white dark:bg-[#111] shadow-inner p-8 overflow-y-auto">
             {#if getFileCategory(selectedFile.Path) === 'image'}
               <div class="w-full h-full flex items-center justify-center bg-[#FAF9F6] dark:bg-[#111]">
-                <!-- svelte-ignore a11y-missing-attribute -->
-                <img src={"/loadfile/" + encodeURIComponent(selectedFile.Path)} class="w-full h-full object-contain shadow-sm" />
+                <!-- Task 4: Image Error Fallback -->
+                {#if !previewImageError}
+                  <img 
+                    src={"/loadfile/" + encodeURIComponent(selectedFile.Path)} 
+                    class="w-full h-full object-contain shadow-sm" 
+                    alt={getFileName(selectedFile.Path)}
+                    on:error={() => previewImageError = true}
+                  />
+                {:else}
+                  <div class="flex flex-col items-center gap-4 text-gray-400">
+                    <ImageIcon size={64} />
+                    <p class="text-sm font-mono italic">Failed to load preview.</p>
+                  </div>
+                {/if}
               </div>
             {:else if getFileCategory(selectedFile.Path) === 'text'}
               <div class="max-w-prose mx-auto font-serif text-slate-800 dark:text-gray-100 leading-relaxed whitespace-pre-wrap">
@@ -498,6 +604,26 @@
     {/if}
     
   </main>
+  
+  <!-- Task 10: Ambient Indexing Status -->
+  {#if $indexingStatus.isIndexing}
+    <div 
+      class="fixed bottom-0 left-0 right-0 z-[100] h-1.5 bg-gray-200 dark:bg-[#222]"
+      transition:slide={{ axis: 'y' }}
+    >
+      <div 
+        class="h-full bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)] transition-all duration-300 flex items-center justify-end px-4"
+        style="width: {$indexingStatus.progress}%"
+      >
+        <div class="absolute bottom-4 right-6 bg-white dark:bg-[#1a1a1a] px-3 py-1.5 rounded-full border border-gray-100 dark:border-[#333] shadow-lg flex items-center gap-2">
+          <Activity class="w-3.5 h-3.5 text-blue-500 animate-pulse" />
+          <span class="text-[9px] font-bold text-gray-600 dark:text-gray-300 uppercase tracking-widest">
+            Indexing Resources — {Math.round($indexingStatus.progress)}%
+          </span>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>

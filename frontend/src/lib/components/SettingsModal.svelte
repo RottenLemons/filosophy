@@ -15,6 +15,8 @@
   let gpuAcceleration = false;
   let loading = true;
 
+  let modalElement: HTMLElement;
+
   onMount(async () => {
     initIndexerStore();
     try {
@@ -45,6 +47,29 @@
   /** @param {KeyboardEvent} e */
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') close();
+    if (e.key === 'Tab') handleTab(e);
+  }
+
+  function handleTab(e: KeyboardEvent) {
+    if (!modalElement) return;
+
+    const focusableElements = modalElement.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    );
+    const firstElement = focusableElements[0] as HTMLElement;
+    const lastElement = focusableElements[focusableElements.length - 1] as HTMLElement;
+
+    if (e.shiftKey) {
+      if (document.activeElement === firstElement) {
+        e.preventDefault();
+        lastElement.focus();
+      }
+    } else {
+      if (document.activeElement === lastElement) {
+        e.preventDefault();
+        firstElement.focus();
+      }
+    }
   }
 </script>
 
@@ -59,8 +84,11 @@
     on:click|self={close}
   >
     <div 
+      bind:this={modalElement}
       class="w-full max-w-4xl h-[640px] bg-[#FAF9F6] dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-2xl flex overflow-hidden rounded-lg"
       transition:fly={{ y: 20, duration: 400, opacity: 0 }}
+      role="dialog"
+      aria-modal="true"
     >
       <!-- Sidebar Navigation -->
       <aside class="w-64 border-r border-gray-200 dark:border-[#2a2a2a] bg-gray-50/50 dark:bg-[#0a0a0a] flex flex-col pt-12">
@@ -130,6 +158,7 @@
           <button 
             on:click={close}
             class="p-2 text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+            aria-label="Close Settings"
           >
             <X class="w-5 h-5" />
           </button>
