@@ -22,7 +22,7 @@ import (
 
 // StaticEmbedder holds the embedding matrix and tokenizer.
 type StaticEmbedder struct {
-	matrix [][]float32       // matrix[tokenID] = float32 vector of length dim
+	matrix []float32         // matrix[tokenID*dim:(tokenID+1)*dim] = float32 vector of length dim
 	tok    *tokenizers.Tokenizer
 	dim    int
 }
@@ -55,7 +55,7 @@ func LoadStaticEmbedder(modelPath, tokenizerPath string) (*StaticEmbedder, error
 // loadSafetensors parses a .safetensors file and returns the embedding matrix.
 // Format: [uint64 header_len][header_len bytes JSON][raw float32 tensor data]
 // Offsets in DataOffsets are relative to the start of the data section.
-func loadSafetensors(path string) ([][]float32, int, error) {
+func loadSafetensors(path string) ([]float32, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open %q: %w", path, err)
@@ -142,16 +142,11 @@ func loadSafetensors(path string) ([][]float32, int, error) {
 		return nil, 0, fmt.Errorf("read tensor data: %w", err)
 	}
 
-	// Convert raw bytes (little-endian float32) into [][]float32 rows.
-	matrix := make([][]float32, vocabSize)
+	// Convert raw bytes (little-endian float32) into a flat slice.
+	matrix := make([]float32, totalFloats)
 	for i := range matrix {
-		row := make([]float32, dim)
-		base := i * dim * 4
-		for j := range row {
-			bits := binary.LittleEndian.Uint32(raw[base+j*4 : base+j*4+4])
-			row[j] = math.Float32frombits(bits)
-		}
-		matrix[i] = row
+		bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
+		matrix[i] = math.Float32frombits(bits)
 	}
 
 	return matrix, dim, nil
@@ -178,10 +173,10 @@ func (e *StaticEmbedder) EmbedString(text string) ([]float32, error) {
 
 	for _, id := range ids {
 		idx := int(id)
-		if idx < 0 || idx >= len(e.matrix) {
+		if idx < 0 || idx >= len(e.matrix)/e.dim {
 			continue // out-of-range token ID: skip
 		}
-		vec := e.matrix[idx]
+		vec := e.matrix[idx*e.dim : (idx+1)*e.dim]
 		// Element-wise accumulation.
 		for i, v := range vec {
 			acc[i] += v

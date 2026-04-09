@@ -34,12 +34,15 @@ func vipsThumbnailPath() string {
 	return "vipsthumbnail"
 }
 
-// Metadata holds content and path information for indexing
+// Metadata holds content and path information for indexing.
+// Ctime and Atime are extracted once from os.FileInfo to avoid redundant syscalls.
 type Metadata struct {
 	Content, Path string
 	Hash          int64
 	Mtime         int64
 	Size          int64
+	Ctime         int64
+	Atime         int64
 }
 
 var imageExtensions = map[string]struct{}{
@@ -52,7 +55,7 @@ var imageExtensions = map[string]struct{}{
 
 var empty int64 = int64(xxhash.Sum64String(""))
 
-// IsImageFile checks if the filename has an image extension
+// IsImageFile checks if the filename has an image extension.
 func IsImageFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
 	_, ok := imageExtensions[ext]
@@ -71,11 +74,13 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 		paths = append(paths, item.Path)
 	}
 
-	// Deduplicate file-level hashes by path
+	// Collect file-level metadata for dedup (skip empty-hash sentinel entries).
 	var filePaths []string
 	var fileHashes []int64
 	var fileMtimes []int64
 	var fileSizes []int64
+	var fileCtimes []int64
+	var fileAtimes []int64
 	for _, item := range items {
 		if item.Hash == empty {
 			continue
@@ -84,19 +89,21 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 		fileHashes = append(fileHashes, item.Hash)
 		fileMtimes = append(fileMtimes, item.Mtime)
 		fileSizes = append(fileSizes, item.Size)
+		fileCtimes = append(fileCtimes, item.Ctime)
+		fileAtimes = append(fileAtimes, item.Atime)
 	}
 
 	var err error
 	if mode == "image" {
-		err = sc.IndexImage(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes)
+		err = sc.IndexImage(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes)
 	} else {
-		err = sc.IndexText(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes)
+		err = sc.IndexText(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes)
 	}
 	if err != nil {
 		log.Printf("IndexBatch %s error: %v", mode, err)
 	}
 
-	// Index unique paths in FTS5 for path keyword search
+	// Index unique paths in FTS5 for path keyword search.
 	seen := make(map[string]struct{})
 	var uniquePaths []string
 	for _, p := range paths {
@@ -108,11 +115,11 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	sc.IndexPathsFTS(uniquePaths)
 }
 
-// HandleChunk adds metadata to a channel and flushes when full
-func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size int64, mu *sync.Mutex) {
+// HandleChunk adds metadata to a channel and flushes when full.
+func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size, ctime, atime int64, mu *sync.Mutex) {
 	mu.Lock()
 	select {
-	case chunks <- Metadata{content, path, hash, mtime, size}:
+	case chunks <- Metadata{content, path, hash, mtime, size, ctime, atime}:
 		mu.Unlock()
 	default:
 		var items []Metadata
@@ -123,9 +130,9 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 			default:
 			}
 		}
-		chunks <- Metadata{content, path, hash, mtime, size}
+		chunks <- Metadata{content, path, hash, mtime, size, ctime, atime}
 		mu.Unlock()
-		
+
 		// Run batch indexing outside the Mutex! This permits the other N worker threads
 		// to continue extracting PDFs and resizing images into the now-empty chunks channel
 		// concurrently while the ONNX Engine performs the heavy inference pipeline.
@@ -137,7 +144,7 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 	}
 }
 
-// DrainRemaining drains all remaining items from a channel and indexes them
+// DrainRemaining drains all remaining items from a channel and indexes them.
 func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
 	var items []Metadata
 	for len(chunks) > 0 {
@@ -146,7 +153,7 @@ func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
 	IndexBatch(items, mode, sc)
 }
 
-// ProcessorConfig holds configuration for file processing
+// ProcessorConfig holds configuration for file processing.
 type ProcessorConfig struct {
 	Splitter *textsplitter.RecursiveCharacter
 	Chunks   chan Metadata
@@ -156,20 +163,13 @@ type ProcessorConfig struct {
 	Mu       *sync.Mutex
 }
 
-// ProcessImage converts an image to PNG via vips, hashes the original raw bytes,
-// and queues it for indexing. The converted PNG path is passed as "content"
-// so hugot's RunWithImagePaths can load it.
-func ProcessImage(path string, mtime, size int64, cfg *ProcessorConfig) {
-	// Hash original raw bytes for dedup
-	imBytes, err := os.ReadFile(path)
-	if err != nil {
-		log.Println("Failed to read image:", err)
-		return
-	}
-	hash := int64(xxhash.Sum64(imBytes))
-	imBytes = nil
+// ProcessImage converts an image to JPEG via vips and queues it for indexing.
+// Hash is derived from mtime^size to avoid reading the full file just for dedup
+// (avoids a redundant full-file os.ReadFile that was previously discarded immediately).
+func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
+	hash := mtime ^ size
 
-	// Convert to JPEG via vips (small temp, handles all formats: HEIC, AVIF, WebP, etc.)
+	// Convert to JPEG via vips (handles all formats: HEIC, AVIF, WebP, etc.)
 	outPath := filepath.Join(cfg.TempDir, fmt.Sprintf("%d.jpg", hash))
 	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256x256!", "-o", outPath+"[Q=80,strip]")
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -177,15 +177,15 @@ func ProcessImage(path string, mtime, size int64, cfg *ProcessorConfig) {
 		return
 	}
 
-	// Content = converted JPEG path for hugot, Path = original path for metadata
-	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, cfg.Mu)
+	// Content = converted JPEG path for CLIP, Path = original path for metadata.
+	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, ctime, atime, cfg.Mu)
 }
 
-// ProcessText extracts text from a file and adds chunks to the channel
-func ProcessText(path string, mtime, size int64, cfg *ProcessorConfig) {
+// ProcessText extracts text from a file and adds chunks to the channel.
+func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
 	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result == nil || result.Content == "" {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
 		return
 	}
 	hash := int64(xxhash.Sum64String(result.Content))
@@ -198,17 +198,19 @@ func ProcessText(path string, mtime, size int64, cfg *ProcessorConfig) {
 	first := true
 	for _, chunk := range splits {
 		if first {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, cfg.Mu)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, ctime, atime, cfg.Mu)
 			first = false
 		} else {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, cfg.Mu)
+			// Subsequent chunks share the same file path but carry no file-level metadata
+			// (hash=empty signals IndexBatch to skip the files-table upsert for these rows).
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, 0, 0, cfg.Mu)
 		}
 	}
 }
 
 // ProcessFile processes a single file (image or text) based on its type.
-// It stats the file once to obtain mtime and size, both stored in the files
-// table to support resumability and daemon-driven updates.
+// A single os.Stat call provides mtime, size, ctime, and atime — eliminating
+// the redundant fileExtraTimes syscalls that previously occurred downstream.
 func ProcessFile(path string, cfg *ProcessorConfig) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -217,24 +219,28 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	}
 	mtime := info.ModTime().UnixNano()
 	size := info.Size()
+	ctime, atime := FileExtraTimesFromInfo(info) // no extra syscall
 	if IsImageFile(path) {
-		ProcessImage(path, mtime, size, cfg)
+		ProcessImage(path, mtime, size, ctime, atime, cfg)
 	} else {
-		ProcessText(path, mtime, size, cfg)
+		ProcessText(path, mtime, size, ctime, atime, cfg)
 	}
 }
 
-// ProcessDirectory adds directory path to the chunks channel
+// ProcessDirectory adds directory path to the chunks channel.
 func ProcessDirectory(path string, cfg *ProcessorConfig) {
-	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, cfg.Mu)
+	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, 0, 0, cfg.Mu)
 }
 
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
+// InitIndexTables is called at most once per Engine instance via sync.Once (IX-4 fix).
 func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) *ProcessorConfig {
-	if err := sc.InitIndexTables(); err != nil {
-		log.Printf("Failed to initialize index tables: %v", err)
-	}
+	sc.initTableOnce.Do(func() {
+		if err := sc.InitIndexTables(); err != nil {
+			log.Printf("Failed to initialize index tables: %v", err)
+		}
+	})
 
 	splitter := textsplitter.NewRecursiveCharacter(func(o *textsplitter.Options) {
 		o.ChunkSize = chunkSize
@@ -243,7 +249,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) *Processo
 	if err != nil {
 		log.Println("Failed to create temp dir for images:", err)
 	}
-	// Cap the image capacity high enough batching is effective
+	// Cap the image capacity high enough so batching is effective.
 	if imageCap < 100 {
 		imageCap = 100
 	}

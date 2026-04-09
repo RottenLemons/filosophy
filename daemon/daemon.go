@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -27,12 +28,13 @@ const (
 
 // shouldFilterPath returns true if the path should be ignored for content changes
 func shouldFilterPath(path string) bool {
-	parts := strings.Split(filepath.ToSlash(path), "/")
-	for _, part := range parts {
-		name := strings.ToLower(part)
-		if name == "appdata" || strings.HasPrefix(part, ".") || strings.HasPrefix(name, "ntuser") || name == "node_modules" || name == "vendor" {
-			return true
-		}
+	lower := strings.ToLower(filepath.ToSlash(path))
+	if strings.Contains(lower, "/appdata") ||
+		strings.Contains(lower, "/.") ||
+		strings.Contains(lower, "/ntuser") ||
+		strings.Contains(lower, "/node_modules") ||
+		strings.Contains(lower, "/vendor") {
+		return true
 	}
 	return false
 }
@@ -76,11 +78,17 @@ func (s sentinel) Sys() interface{}    { return nil }
 
 // hashFile returns the xxhash of a file's contents as int64 (for SQLite compatibility).
 func hashFile(path string) (int64, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
-	return int64(xxhash.Sum64(b)), nil
+	defer f.Close()
+
+	h := xxhash.New()
+	if _, err := io.Copy(h, io.LimitReader(f, 65536)); err != nil {
+		return 0, err
+	}
+	return int64(h.Sum64()), nil
 }
 
 // getHash returns the cached hash for a path, or queries the DB on cache miss.
@@ -90,14 +98,15 @@ func (t *tracker) getHash(path string) (int64, error) {
 		return h, nil
 	}
 	// Cache miss — query DB
-	conn, err := sqlite.OpenConn(t.dbPath, sqlite.OpenReadOnly)
-	if err != nil {
-		return 0, err
+	if t.conn == nil {
+		conn, err := sqlite.OpenConn(t.dbPath, sqlite.OpenReadOnly)
+		if err != nil {
+			return 0, err
+		}
+		t.conn = conn
 	}
-	defer conn.Close()
-
 	var hash int64
-	_ = sqlitex.Execute(conn, "SELECT hash FROM files WHERE path = ?", &sqlitex.ExecOptions{
+	_ = sqlitex.Execute(t.conn, "SELECT hash FROM files WHERE path = ?", &sqlitex.ExecOptions{
 		Args: []any{path},
 		ResultFunc: func(stmt *sqlite.Stmt) error {
 			hash = stmt.ColumnInt64(0)
@@ -115,6 +124,7 @@ type tracker struct {
 	changes map[string]*fileChanges
 	hashes  map[string]int64 // path → cached hash (write-through from DB)
 	dbPath  string
+	conn    *sqlite.Conn     // Persistent SQLite connection
 	prev    notify.EventInfo
 	count   int
 }
@@ -350,7 +360,6 @@ func (d *Daemon) flush() {
 		shared.DrainRemaining(cfg.Images, "image", d.sc)
 		cfg.CleanupTempDir()
 	}
-	fmt.Println("[FLUSH] done")
 }
 
 func (d *Daemon) Start() error {
@@ -400,19 +409,14 @@ func (d *Daemon) run() {
 			}
 			watchPath := filepath.Join(baseDir, name, "...")
 			if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
-				fmt.Println("Error watching content for", name, ":", err)
 				continue
 			}
 			if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
-				fmt.Println("Error watching structure for", name, ":", err)
 				continue
 			}
-			fmt.Println("Watching:", watchPath)
 		}
 		if err := notify.Watch(baseDir, d.contentChan, contentEventMask); err != nil {
-			fmt.Println("Error watching base directory content:", err)
 		} else {
-			fmt.Println("Watching base:", baseDir)
 		}
 	}
 	defer notify.Stop(d.structureChan)
@@ -426,8 +430,6 @@ func (d *Daemon) run() {
 			shouldFlush := d.t.count >= 50
 			d.t.mu.Unlock()
 
-			fmt.Println("[STRUCTURE]", ei.Event(), ei.Path(), ei.Sys())
-
 			// Auto-watch new top-level folders inside any watched base directory.
 			if (ei.Event() == notify.FileActionAdded || ei.Event() == notify.FileActionRenamedNewName) &&
 				d.isDirectChild(ei.Path()) {
@@ -436,12 +438,8 @@ func (d *Daemon) run() {
 					if info, err := os.Stat(ei.Path()); err == nil && info.IsDir() {
 						watchPath := filepath.Join(filepath.Dir(ei.Path()), name, "...")
 						if err := notify.Watch(watchPath, d.contentChan, contentEventMask); err != nil {
-							fmt.Println("Error watching content for new folder", name, ":", err)
 						}
 						if err := notify.Watch(watchPath, d.structureChan, structureEventMask); err != nil {
-							fmt.Println("Error watching structure for new folder", name, ":", err)
-						} else {
-							fmt.Println("Now watching new folder:", watchPath)
 						}
 					}
 				}
@@ -473,8 +471,6 @@ func (d *Daemon) run() {
 			shouldFlush := d.t.count >= 50
 			d.t.mu.Unlock()
 
-			fmt.Println("[CONTENT]", ei.Event(), ei.Path(), ei.Sys())
-
 			if shouldFlush {
 				go d.flush()
 			}
@@ -497,7 +493,6 @@ func (d *Daemon) run() {
 	// The initial indexing crawl was historically performed here. It has been entirely ripped out
 	// because `main.go` already triggers a structured 2-pass crawl via `runPass1` and `runPass2` before
 	// the Daemon boots up! Performing it here was duplicating work 1:1 and causing huge lock contention.
-	fmt.Println("[DAEMON] Initial crawl bypassed (delegated to main.go pipeline)")
 
 	<-d.exit
 }
@@ -505,7 +500,9 @@ func (d *Daemon) run() {
 func (d *Daemon) Stop() error {
 	// Stop should not block. Return with a few seconds.
 	if d.t != nil {
-		fmt.Println(d.t.changes)
+		if d.t.conn != nil {
+			d.t.conn.Close()
+		}
 	}
 	close(d.exit)
 	if d.structureChan != nil {

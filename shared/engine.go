@@ -108,7 +108,8 @@ type Engine struct {
 	rerankerTok       *tokenizers.Tokenizer       // WordPiece tokenizer for reranker
 	textCollectionID  int                         // cached collection ID for text embeddings
 	imageCollectionID int                         // cached collection ID for image embeddings
-	mu                sync.Mutex
+	mu                sync.RWMutex // RWMutex: concurrent reads (Search) don't block each other
+	initTableOnce     sync.Once    // ensures InitIndexTables runs at most once per Engine
 }
 
 // New initializes the Engine with the given database path and ONNX model paths.
@@ -397,7 +398,6 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 		return nil, nil
 	}
 
-	t0 := time.Now()
 	result := make([][]float32, len(texts))
 
 	// Worker pool: each goroutine calls StaticEmbedder.EmbedString (pure Go, no CGO lock).
@@ -450,7 +450,6 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 		result[o.idx] = o.emb
 	}
 
-	log.Printf("  -> Static embedText: %v for %d texts", time.Since(t0), len(texts))
 	return result, nil
 }
 
@@ -517,9 +516,6 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		return nil, nil
 	}
 
-	cpu0 := getCPUTime()
-	t0 := time.Now()
-
 	pixelsPerImage := 3 * visionSize * visionSize
 	// Preprocess all images; track which ones failed
 	validIndices := make([]int, 0, len(imagePaths))
@@ -537,18 +533,10 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		allPixels = append(allPixels, pixels...)
 	}
 
-	tPreprocess := time.Now()
-	log.Printf("  -> loadAndPreprocess: %v for %d images (%s)", tPreprocess.Sub(t0), len(imagePaths), getStats(cpu0, t0))
-
 	if len(validIndices) == 0 {
 		return result, nil
 	}
 
-	tTensor := time.Now()
-
-	// CPU Cache Optimization: batching 100 high-res image tensors sequentially blows up CPU L3 cache
-	// processing them with batch size = 1 keeps intermediate activations inside cache bounds and executes
-	// much faster (~10s for 100 images compared to ~60s).
 	for j, idx := range validIndices {
 		singlePixels := allPixels[j*pixelsPerImage : (j+1)*pixelsPerImage]
 		inputTensor, err := ort.NewTensor(
@@ -581,9 +569,6 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		outTensor.Destroy()
 		inputTensor.Destroy()
 	}
-
-	tInference := time.Now()
-	log.Printf("  -> ONNX single-batch inference loop run: %v (%s)", tInference.Sub(tTensor), getStats(cpu0, tTensor))
 
 	return result, nil
 }
@@ -714,13 +699,9 @@ func getCPUTime() int64 {
 }
 
 func getStats(startCPU int64, startTime time.Time) string {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	ramStr := fmt.Sprintf("%.1f MiB", float64(m.Sys)/1024/1024)
-
 	duration := time.Since(startTime).Seconds()
 	if duration <= 0 {
-		return fmt.Sprintf("RAM: %s, CPU: 0.0%%", ramStr)
+		return "CPU: 0.0%"
 	}
 
 	endCPU := getCPUTime()
@@ -732,7 +713,7 @@ func getStats(startCPU int64, startTime time.Time) string {
 	if cpuUsage > 100.0 {
 		cpuUsage = 100.0
 	}
-	return fmt.Sprintf("RAM: %s, CPU: %.1f%%", ramStr, cpuUsage)
+	return fmt.Sprintf("CPU: %.1f%%", cpuUsage)
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +723,8 @@ func getStats(startCPU int64, startTime time.Time) string {
 // upsertFiles inserts or updates file-level hashes, mtimes, sizes, and marks the file as content-indexed.
 // ext/ctime/atime are populated on insert; ctime is intentionally not overwritten on conflict
 // (creation time doesn't change), while atime and ext are updated to stay current.
-func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
+// Callers must hold s.mu (write lock) before calling.
+func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
 	if len(filePaths) == 0 {
 		return nil
 	}
@@ -766,8 +748,9 @@ func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes
 
 	for i := range filePaths {
 		ext := strings.ToLower(filepath.Ext(filePaths[i]))
-		ctime, atime := fileExtraTimes(filePaths[i])
-		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i], ext, ctime, atime); err != nil {
+		ct := fileCtimes[i]
+		at := fileAtimes[i]
+		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i], ext, ct, at); err != nil {
 			return err
 		}
 	}
@@ -777,28 +760,17 @@ func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes
 // IndexText generates text embeddings and stores them in the vector DB.
 // contents and paths must have the same length.
 // filePaths/fileHashes are optional file-level metadata for deduplication.
-func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cpu0 := getCPUTime()
-	t0 := time.Now()
+// Embedding generation runs outside the write lock; only the DB writes are locked.
+func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
 	ctx := context.Background()
 
-	// Generate embeddings
+	// Generate embeddings outside the lock — staticEmb is read-only (pure Go).
 	embs, err := s.embedText(contents)
 	if err != nil {
 		return fmt.Errorf("text embedding failed: %w", err)
 	}
-	log.Printf("Encode %d text: %v (%s)", len(embs), time.Since(t0), getStats(cpu0, t0))
 
-	// Upsert file hashes
-	tFiles := time.Now()
-	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes); err != nil {
-		return fmt.Errorf("upsert files failed: %w", err)
-	}
-
-	// Build embeddings for sqvect
+	// Build sqvect embedding objects (no shared mutable state).
 	sqEmbs := make([]*core.Embedding, len(embs))
 	for i, emb := range embs {
 		sqEmbs[i] = &core.Embedding{
@@ -812,44 +784,35 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 		}
 	}
 
-	// Batch upsert to sqvect (single source of truth for content + path)
-	tVec := time.Now()
+	// Acquire write lock only for the database writes.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes); err != nil {
+		return fmt.Errorf("upsert files failed: %w", err)
+	}
 	if err := s.db.Vector().UpsertBatch(ctx, sqEmbs); err != nil {
 		return fmt.Errorf("vector upsert failed: %w", err)
 	}
-
-	tEnd := time.Now()
-	log.Printf("  -> files upsert: %v (%s)", tVec.Sub(tFiles), getStats(cpu0, tFiles))
-	log.Printf("  -> vector upsert: %v (%s)", tEnd.Sub(tVec), getStats(cpu0, tVec))
-	log.Printf("Total text indexing: %v (%s)", tEnd.Sub(t0), getStats(cpu0, t0))
 	return nil
 }
 
 // IndexImage generates image embeddings from image file paths and stores them.
 // imagePaths are the filesystem paths to load images from.
 // paths are the logical paths stored as metadata.
-func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes []int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cpu0 := getCPUTime()
-	t0 := time.Now()
+// Embedding generation runs outside the write lock; only the DB writes are locked.
+func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
 	ctx := context.Background()
 
-	// Generate image embeddings using CLIP vision encoder
+	// Generate image embeddings outside the lock.
+	// In practice IndexImage is always called from a single draining goroutine
+	// (HandleChunk/DrainRemaining), never concurrently, so clipVisionSession is safe.
 	embs, err := s.embedImage(imagePaths)
 	if err != nil {
 		return fmt.Errorf("image embedding failed: %w", err)
 	}
-	log.Printf("Encode %d images: %v (%s)", len(embs), time.Since(t0), getStats(cpu0, t0))
 
-	// Upsert file hashes
-	tFiles := time.Now()
-	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes); err != nil {
-		return fmt.Errorf("upsert files failed: %w", err)
-	}
-
-	// Build embeddings for sqvect
+	// Build sqvect embedding objects (no shared mutable state).
 	sqEmbs := make([]*core.Embedding, len(embs))
 	for i, emb := range embs {
 		sqEmbs[i] = &core.Embedding{
@@ -863,16 +826,16 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 		}
 	}
 
-	// Batch upsert to sqvect (single source of truth for path)
-	tVec := time.Now()
+	// Acquire write lock only for the database writes.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes); err != nil {
+		return fmt.Errorf("upsert files failed: %w", err)
+	}
 	if err := s.db.Vector().UpsertBatch(ctx, sqEmbs); err != nil {
 		return fmt.Errorf("vector upsert failed: %w", err)
 	}
-
-	tEnd := time.Now()
-	log.Printf("  -> files upsert: %v (%s)", tVec.Sub(tFiles), getStats(cpu0, tFiles))
-	log.Printf("  -> vector upsert: %v (%s)", tEnd.Sub(tVec), getStats(cpu0, tVec))
-	log.Printf("Total image indexing: %v (%s)", tEnd.Sub(t0), getStats(cpu0, t0))
 	return nil
 }
 
@@ -978,7 +941,8 @@ func (s *Engine) InitIndexTables() error {
 // (extension, creation time, last-access time) into the files table without
 // marking them as content-indexed, and populates paths_fts so path-based search
 // works immediately after Pass 1. Already-present rows are left untouched (INSERT OR IGNORE).
-func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
+// ctimes and atimes are extracted from os.FileInfo by the caller — no extra os.Stat here.
+func (s *Engine) IndexMetadata(paths []string, mtimes, sizes, ctimes, atimes []int64) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -999,7 +963,10 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
 	}
 	defer filesStmt.Close()
 
-	ftsStmt, err := tx.PrepareContext(ctx, `INSERT INTO paths_fts(path) VALUES (?)`)
+	// IX-5 fix: populate the searchable column so FTS5 can index paths immediately.
+	// Previously only path was inserted (searchable=NULL), making all Pass-1 files
+	// invisible to path keyword search until Pass 2 re-ran IndexPathsFTS.
+	ftsStmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO paths_fts(searchable, path) VALUES (?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -1007,11 +974,14 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes []int64) error {
 
 	for i := range paths {
 		ext := strings.ToLower(filepath.Ext(paths[i]))
-		ctime, atime := fileExtraTimes(paths[i])
-		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i], ext, ctime, atime); err != nil {
+		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i], ext, ctimes[i], atimes[i]); err != nil {
 			return err
 		}
-		if _, err := ftsStmt.ExecContext(ctx, paths[i]); err != nil {
+		decoded := paths[i]
+		if d, err := url.PathUnescape(paths[i]); err == nil {
+			decoded = d
+		}
+		if _, err := ftsStmt.ExecContext(ctx, decoded, paths[i]); err != nil {
 			return err
 		}
 	}
@@ -1113,21 +1083,18 @@ type SearchResult struct {
 //  6. Exact/prefix/substring filename match boost
 //  7. Trigram fuzzy path similarity — typo tolerance
 func (s *Engine) Search(query string) ([]SearchResult, error) {
-	cpu0 := getCPUTime()
-	t0 := time.Now()
 	ctx := context.Background()
 
 	pq := ParseQuery(query)
 	query = pq.Text
 
-	// Encode query with text model
+	// Encode query vectors outside the lock — pure computation, no shared mutable state.
 	textEmbs, err := s.embedText([]string{query})
 	if err != nil {
 		return nil, fmt.Errorf("text query encoding failed: %w", err)
 	}
 	textQueryVec := textEmbs[0]
 
-	// Encode query with CLIP text encoder (for image similarity search)
 	clipEmbs, err := s.embedClipText([]string{query})
 	if err != nil {
 		log.Printf("image text encoding unavailable, text-only search: %v", err)
@@ -1135,7 +1102,11 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	imageQueryVec := clipEmbs[0]
 
-	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
+	// Acquire read lock for all DB operations.
+	// RLock allows concurrent Search() calls to proceed in parallel;
+	// write operations (IndexText/IndexImage) only block briefly during UpsertBatch.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	// Vector search both collections. Images are capped lower than text: they add
 	// semantic coverage but shouldn't flood rankings for text-heavy queries.
@@ -1213,45 +1184,79 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	addFilenameBoosts(query, scores)
 	addFuzzyPathBoosts(query, scores)
 
-	results := make([]SearchResult, 0, len(scores))
-	for path, score := range scores {
-		var size int64
-		var mod string
-		if info, err := os.Stat(path); err == nil {
-			size = info.Size()
-			mod = info.ModTime().Format(time.RFC3339)
-		}
-		results = append(results, SearchResult{
-			Path:     path,
-			Score:    score,
-			Size:     size,
-			Modified: mod,
-		})
-	}
+	// Batch-fetch size/mtime from the files table — replaces per-result os.Stat.
+	results := s.buildResultsFromScores(ctx, scores)
 	sortResults(results)
 	results = s.rerank(query, results)
 	results = s.applyFilters(results, pq)
-
-	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return results, nil
+}
+
+// buildResultsFromScores converts a path→score map to []SearchResult, fetching
+// size and mtime from the files table in a single batched query instead of
+// issuing an os.Stat syscall for each result path.
+func (s *Engine) buildResultsFromScores(ctx context.Context, scores map[string]float64) []SearchResult {
+	if len(scores) == 0 {
+		return nil
+	}
+	pathList := make([]string, 0, len(scores))
+	for p := range scores {
+		pathList = append(pathList, p)
+	}
+	type fileMeta struct {
+		size int64
+		mod  string
+	}
+	meta := make(map[string]fileMeta, len(pathList))
+	ph := strings.Repeat("?,", len(pathList))
+	ph = ph[:len(ph)-1]
+	args := make([]any, len(pathList))
+	for i, p := range pathList {
+		args[i] = p
+	}
+	rows, err := s.sqlDB.QueryContext(ctx,
+		`SELECT path, size, mtime FROM files WHERE path IN (`+ph+`)`, args...)
+	if err == nil {
+		for rows.Next() {
+			var p string
+			var sz, mt int64
+			if rows.Scan(&p, &sz, &mt) == nil {
+				meta[p] = fileMeta{sz, time.Unix(0, mt).UTC().Format(time.RFC3339)}
+			}
+		}
+		rows.Close()
+	}
+	results := make([]SearchResult, 0, len(scores))
+	for path, score := range scores {
+		m := meta[path]
+		results = append(results, SearchResult{
+			Path:     path,
+			Score:    score,
+			Size:     m.size,
+			Modified: m.mod,
+		})
+	}
+	return results
 }
 
 // TextSearch performs search over text embeddings only.
 // Signals: path FTS5 exact+prefix (3x/1.5x weighted RRF) > text vector RRF > content FTS5 RRF > filename/fuzzy boosts.
 func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
-	cpu0 := getCPUTime()
-	t0 := time.Now()
 	ctx := context.Background()
 
 	pq := ParseQuery(query)
 	query = pq.Text
 
+	// Encode query outside the lock — pure computation.
 	embs, err := s.embedText([]string{query})
 	if err != nil {
 		return nil, fmt.Errorf("text query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
+
+	// Acquire read lock for all DB operations.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: textCollection,
@@ -1311,41 +1316,26 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	addFilenameBoosts(query, scores)
 	addFuzzyPathBoosts(query, scores)
 
-	out := make([]SearchResult, 0, len(scores))
-	for path, score := range scores {
-		var size int64
-		var mod string
-		if info, err := os.Stat(path); err == nil {
-			size = info.Size()
-			mod = info.ModTime().Format(time.RFC3339)
-		}
-		out = append(out, SearchResult{
-			Path:     path,
-			Score:    score,
-			Size:     size,
-			Modified: mod,
-		})
-	}
+	out := s.buildResultsFromScores(ctx, scores)
 	sortResults(out)
 	out = s.rerank(query, out)
 	out = s.applyFilters(out, pq)
-
-	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
 	return out, nil
 }
 
 // ImageSearch performs search over image embeddings only.
 func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
-	cpu0 := getCPUTime()
-	t0 := time.Now()
 	ctx := context.Background()
 
+	// Encode outside the lock.
 	embs, err := s.embedClipText([]string{query})
 	if err != nil {
 		return nil, fmt.Errorf("image query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-	log.Printf("Search encode: %v (%s)", time.Since(t0), getStats(cpu0, t0))
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: imageCollection,
@@ -1355,32 +1345,17 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("image search failed: %w", err)
 	}
 
-	out := make([]SearchResult, 0, len(results))
+	// Deduplicate by path.
 	seen := map[string]bool{}
+	scores := make(map[string]float64, len(results))
 	for _, res := range results {
 		path := res.Metadata["path"]
-		if seen[path] {
-			continue
+		if !seen[path] {
+			seen[path] = true
+			scores[path] = float64(res.Score)
 		}
-		seen[path] = true
-
-		var size int64
-		var mod string
-		if info, err := os.Stat(path); err == nil {
-			size = info.Size()
-			mod = info.ModTime().Format(time.RFC3339)
-		}
-
-		out = append(out, SearchResult{
-			Path:     path,
-			Score:    res.Score,
-			Size:     size,
-			Modified: mod,
-		})
 	}
-
-	log.Printf("Search total: %v (%s)", time.Since(t0), getStats(cpu0, t0))
-	return out, nil
+	return s.buildResultsFromScores(ctx, scores), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,15 +2171,21 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 		return pairTokens{ids64, mask64}
 	}
 
+	const debug = false
+
 	for i, item := range textItems {
 		snippets := docSnippets[item.result.Path]
 		if len(snippets) == 0 {
 			// No FTS match (e.g. directory, empty file): use filename as sole snippet.
 			snippets = []string{"Filename: " + basenames[item.result.Path]}
 		}
-		log.Printf("reranker [%s] %d snippet(s):", basenames[item.result.Path], len(snippets))
+		if debug {
+			log.Printf("reranker [%s] %d snippet(s):", basenames[item.result.Path], len(snippets))
+		}
 		for si, snip := range snippets {
-			log.Printf("  snippet[%d]: %s", si, snip)
+			if debug {
+				log.Printf("  snippet[%d]: %s", si, snip)
+			}
 			pairs = append(pairs, encodePair("Filename: "+basenames[item.result.Path]+"\n"+snip))
 			pairDoc = append(pairDoc, i)
 		}
@@ -2291,7 +2272,9 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 					blended := float32(0.5*rerankerProb + 0.5*rrfNorm)
 					r := item.result
 					r.Score = float64(blended)
-					log.Printf("reranker score %.4f (logit=%.4f rrf=%.4f)  %s", blended, docMax[i], item.result.Score, item.result.Path)
+					if debug {
+						log.Printf("reranker score %.4f (logit=%.4f rrf=%.4f)  %s", blended, docMax[i], item.result.Score, item.result.Path)
+					}
 					rerankedText = append(rerankedText, scored{r, blended})
 				}
 			}
@@ -2326,12 +2309,14 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 		out = append(out, nonTextItems[nonIdx].result)
 	}
 	out = append(out, rest...)
-	log.Printf("reranker final order:")
-	for i, r := range out {
-		if i >= rerankerTopN {
-			break
+	if debug {
+		log.Printf("reranker final order:")
+		for i, r := range out {
+			if i >= rerankerTopN {
+				break
+			}
+			log.Printf("  #%d  %.4f  %s", i+1, r.Score, r.Path)
 		}
-		log.Printf("  #%d  %.4f  %s", i+1, r.Score, r.Path)
 	}
 	return out
 }

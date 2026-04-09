@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -37,7 +36,6 @@ var maxConcurrency = runtime.NumCPU()
 
 const daemonPidFile = "filosophy-daemon.pid"
 const appPidFile = "filosophy-app.pid"
-const excludedConfigFile = "filosophy_excluded.json"
 
 // FolderState describes a directory and whether it is content-indexed.
 type FolderState struct {
@@ -75,40 +73,21 @@ func getHomeSubdirs(home string) []string {
 	return names
 }
 
-// loadExcluded reads the set of excluded absolute paths (lowercased).
-// The config stores full paths so nested subdirs can be excluded individually.
-func loadExcluded(cwd string) map[string]bool {
-	data, _ := os.ReadFile(filepath.Join(cwd, excludedConfigFile))
-	var paths []string
-	json.Unmarshal(data, &paths)
-	m := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		m[strings.ToLower(p)] = true
-	}
-	return m
-}
-
-// saveExcluded persists the set of excluded absolute paths.
-func saveExcluded(cwd string, excluded map[string]bool) error {
-	paths := make([]string, 0, len(excluded))
-	for p := range excluded {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-	data, _ := json.Marshal(paths)
-	return os.WriteFile(filepath.Join(cwd, excludedConfigFile), data, 0644)
-}
-
-// isPathExcluded returns true if the given path or any of its ancestors is in the excluded set.
-func isPathExcluded(path string, excluded map[string]bool) bool {
-	lower := strings.ToLower(filepath.ToSlash(path))
-	for excl := range excluded {
-		excl = strings.ToLower(filepath.ToSlash(excl))
-		if lower == excl || strings.HasPrefix(lower, excl+"/") {
-			return true
+// getContentDirs returns the absolute paths of home subdirectories that are
+// not excluded. These are passed to pass1/pass2 for content indexing.
+func (a *App) getContentDirs() []string {
+	subdirs := getHomeSubdirs(a.home)
+	var dirs []string
+	for _, name := range subdirs {
+		p := filepath.Join(a.home, name)
+		if !a.config.IsExcluded(p) {
+			dirs = append(dirs, p)
 		}
 	}
-	return false
+	if len(dirs) == 0 {
+		dirs = []string{a.home}
+	}
+	return dirs
 }
 
 // hasSubdirs returns true if path contains at least one non-hidden subdirectory.
@@ -123,32 +102,15 @@ func hasSubdirs(path string) bool {
 }
 
 // makeFolderState builds a FolderState for a given directory.
-func makeFolderState(name, path string, excluded map[string]bool) FolderState {
+func (a *App) makeFolderState(name, path string) FolderState {
 	return FolderState{
 		Name:        name,
 		Path:        path,
-		Indexed:     !isPathExcluded(path, excluded),
+		Indexed:     !a.config.IsExcluded(path),
 		HasChildren: hasSubdirs(path),
 	}
 }
 
-// getContentDirs returns the absolute paths of home subdirectories that are
-// not excluded. These are passed to pass1/pass2 for content indexing.
-func getContentDirs(home, cwd string) []string {
-	subdirs := getHomeSubdirs(home)
-	excluded := loadExcluded(cwd)
-	var dirs []string
-	for _, name := range subdirs {
-		p := filepath.Join(home, name)
-		if !isPathExcluded(p, excluded) {
-			dirs = append(dirs, p)
-		}
-	}
-	if len(dirs) == 0 {
-		dirs = []string{home}
-	}
-	return dirs
-}
 
 // isDaemonRunning checks whether a previously launched daemon process is still alive.
 func isDaemonRunning(cwd string) bool {
@@ -219,7 +181,7 @@ func launchDaemon(cwd string) {
 	cmd.Process.Release()
 }
 
-func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded map[string]bool, pruneStale bool) {
+func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	if ctx != nil {
 		wailsruntime.EventsEmit(ctx, "indexing_status", "Scanning directories...")
 		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
@@ -231,7 +193,11 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded ma
 	var paths []string
 	var mtimes []int64
 	var sizes []int64
+	var ctimes []int64
+	var atimes []int64
 
+	// Single walk: collect file metadata AND queue directories simultaneously.
+	// Previously two separate walks were made over the same tree, doubling syscall count.
 	for _, dir := range dirs {
 		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			select {
@@ -244,9 +210,10 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded ma
 			}
 			if info.IsDir() {
 				// Skip user-excluded subdirs (but not the root dir itself).
-				if path != dir && excluded != nil && isPathExcluded(path, excluded) {
+				if path != dir && config != nil && config.IsExcluded(path) {
 					return filepath.SkipDir
 				}
+				shared.ProcessDirectory(path, cfg)
 				return nil
 			}
 			if isJunkFile(info.Name()) {
@@ -255,9 +222,13 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded ma
 			if isContentSkipped(path) {
 				return nil
 			}
+			// Extract ctime/atime from the already-loaded FileInfo — no extra syscall.
+			ct, at := shared.FileExtraTimesFromInfo(info)
 			paths = append(paths, path)
 			mtimes = append(mtimes, info.ModTime().UnixNano())
 			sizes = append(sizes, info.Size())
+			ctimes = append(ctimes, ct)
+			atimes = append(atimes, at)
 			return nil
 		})
 		if ctx.Err() != nil {
@@ -277,32 +248,8 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, excluded ma
 	if ctx != nil {
 		wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing metadata...")
 	}
-	if err := sc.IndexMetadata(paths, mtimes, sizes); err != nil {
+	if err := sc.IndexMetadata(paths, mtimes, sizes, ctimes, atimes); err != nil {
 		log.Println("pass1 metadata index error:", err)
-	}
-
-	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Processing directories...")
-	}
-	for _, dir := range dirs {
-		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			select {
-			case <-ctx.Done():
-				return filepath.SkipDir
-			default:
-			}
-			if err != nil || !info.IsDir() {
-				return nil
-			}
-			if path != dir && excluded != nil && isPathExcluded(path, excluded) {
-				return filepath.SkipDir
-			}
-			shared.ProcessDirectory(path, cfg)
-			return nil
-		})
-		if ctx.Err() != nil {
-			return
-		}
 	}
 
 	if ctx.Err() != nil {
@@ -539,6 +486,8 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 type App struct {
 	ctx           context.Context
 	engine        *shared.Engine
+	config        *shared.AppConfig
+	hasGPU        atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
 	isIndexing    atomic.Bool
 	indexerCancel context.CancelFunc
 	cwd           string
@@ -579,6 +528,29 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.home = home
 
+	a.config = shared.LoadConfig(cwd)
+
+	go func() {
+		// Asynchronous GPU detection with hidden window to avoid terminal flashing
+		cmd := exec.Command("nvidia-smi", "-L")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Run(); err == nil {
+			a.hasGPU.Store(true)
+			return
+		}
+
+		out, err := exec.Command("wmic", "path", "Win32_VideoController", "get", "Name").Output()
+		if err == nil {
+			lower := strings.ToLower(string(out))
+			for _, kw := range []string{"nvidia", "amd", "radeon", "geforce", "quadro", "arc "} {
+				if strings.Contains(lower, kw) {
+					a.hasGPU.Store(true)
+					return
+				}
+			}
+		}
+	}()
+
 	_, dbMissing := os.Stat(dbPath)
 	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
 
@@ -590,7 +562,7 @@ func (a *App) startup(ctx context.Context) {
 	a.engine = engine
 	log.Println("Engine initialized")
 
-	dirs := getContentDirs(home, cwd)
+	dirs := a.getContentDirs()
 	for _, d := range dirs {
 		os.MkdirAll(d, 0755)
 	}
@@ -605,7 +577,7 @@ func (a *App) startup(ctx context.Context) {
 	a.indexerCancel = cancel
 
 	if forceIndex || os.IsNotExist(dbMissing) {
-		runPass1(idxCtx, a.engine, dirs, loadExcluded(cwd), forceIndex)
+		runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
 		go func() {
 			runPass2(idxCtx, a.engine)
 			launchDaemon(cwd)
@@ -693,11 +665,10 @@ func (a *App) OpenFileNative(path string) error {
 // GetHomeFolders returns the top-level home subdirectories with their indexing state.
 func (a *App) GetHomeFolders() []FolderState {
 	subdirs := getHomeSubdirs(a.home)
-	excluded := loadExcluded(a.cwd)
 	result := make([]FolderState, 0, len(subdirs))
 	for _, name := range subdirs {
 		p := filepath.Join(a.home, name)
-		result = append(result, makeFolderState(name, p, excluded))
+		result = append(result, a.makeFolderState(name, p))
 	}
 	return result
 }
@@ -709,14 +680,13 @@ func (a *App) GetFolderChildren(path string) []FolderState {
 	if err != nil {
 		return nil
 	}
-	excluded := loadExcluded(a.cwd)
 	var result []FolderState
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		childPath := filepath.Join(path, e.Name())
-		result = append(result, makeFolderState(e.Name(), childPath, excluded))
+		result = append(result, a.makeFolderState(e.Name(), childPath))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
@@ -726,14 +696,8 @@ func (a *App) GetFolderChildren(path string) []FolderState {
 // Enabling triggers a background pass1+pass2 for that directory.
 // Disabling updates the config and restarts the daemon.
 func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
-	excluded := loadExcluded(a.cwd)
-	lower := strings.ToLower(folderPath)
-	if indexed {
-		delete(excluded, lower)
-	} else {
-		excluded[lower] = true
-	}
-	if err := saveExcluded(a.cwd, excluded); err != nil {
+	a.config.SetExcluded(folderPath, !indexed)
+	if err := a.config.Save(); err != nil {
 		return err
 	}
 
@@ -767,12 +731,25 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 
 	go func() {
 		defer a.isIndexing.Store(false)
-		runPass1(idxCtx, a.engine, []string{dir}, loadExcluded(a.cwd), false)
+		runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
 		runPass2(idxCtx, a.engine)
 		launchDaemon(a.cwd)
 	}()
 
 	return nil
+}
+
+func (a *App) CheckSystemGPU() bool {
+	return a.hasGPU.Load()
+}
+
+func (a *App) GetGPUAcceleration() bool {
+	return a.config.GPUEnabled
+}
+
+func (a *App) SetGPUAcceleration(enabled bool) error {
+	a.config.GPUEnabled = enabled
+	return a.config.Save()
 }
 
 func main() {

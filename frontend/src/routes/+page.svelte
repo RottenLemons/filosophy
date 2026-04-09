@@ -4,9 +4,12 @@
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
+  import { Settings as SettingsIcon } from 'lucide-svelte';
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
-  import Indexer from '$lib/components/Indexer.svelte';
+  import SettingsModal from '$lib/components/SettingsModal.svelte';
+
+  let showSettings = false;
 
   /** @type {string} */
   let searchQuery = "";
@@ -57,43 +60,45 @@
   let filterDate = 'Anytime'; // Options: 'Anytime', 'Last 7 Days', 'Last 30 Days', 'This Year'
   let filterSize = 'Any'; // Options: 'Any', '< 1 MB', '1 MB - 10 MB', '10 MB - 100 MB', '> 100 MB'
 
-  $: filteredFiles = files.filter(file => {
-    // 1. Type Match
-    const knownTypes = ['PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG'];
-    const type = getFileType(file.Path);
-    let matchType = false;
-    if (filterType === 'All') {
-      matchType = true;
-    } else if (filterType === 'Other') {
-      matchType = !knownTypes.includes(type);
-    } else {
-      matchType = type === filterType;
-    }
-
-    // 2. Size Match (file.Size is in bytes)
-    let matchSize = true;
-    const sizeMB = file.Size / (1024 * 1024);
-    if (filterSize === '< 1 MB') matchSize = sizeMB < 1;
-    else if (filterSize === '1 MB - 10 MB') matchSize = sizeMB >= 1 && sizeMB <= 10;
-    else if (filterSize === '10 MB - 100 MB') matchSize = sizeMB >= 10 && sizeMB <= 100;
-    else if (filterSize === '> 100 MB') matchSize = sizeMB > 100;
-
-    // 3. Date Match (file.Modified is ISO string)
-    let matchDate = true;
-    if (filterDate !== 'Anytime' && file.Modified) {
-      const modifiedDate = new Date(file.Modified);
-      const now = new Date();
-      if (filterDate === 'Last 7 Days') {
-        matchDate = (now.getTime() - modifiedDate.getTime()) <= 7 * 24 * 60 * 60 * 1000;
-      } else if (filterDate === 'Last 30 Days') {
-        matchDate = (now.getTime() - modifiedDate.getTime()) <= 30 * 24 * 60 * 60 * 1000;
-      } else if (filterDate === 'This Year') {
-        matchDate = modifiedDate.getFullYear() === now.getFullYear();
+  $: filteredFiles = (() => {
+    const now = new Date();
+    return files.filter(file => {
+      // 1. Type Match
+      const knownTypes = ['PDF', 'DOCX', 'XLSX', 'CSV', 'TXT', 'MD', 'JPG', 'PNG'];
+      const type = getFileType(file.Path);
+      let matchType = false;
+      if (filterType === 'All') {
+        matchType = true;
+      } else if (filterType === 'Other') {
+        matchType = !knownTypes.includes(type);
+      } else {
+        matchType = type === filterType;
       }
-    }
 
-    return matchType && matchSize && matchDate;
-  });
+      // 2. Size Match (file.Size is in bytes)
+      let matchSize = true;
+      const sizeMB = file.Size / (1024 * 1024);
+      if (filterSize === '< 1 MB') matchSize = sizeMB < 1;
+      else if (filterSize === '1 MB - 10 MB') matchSize = sizeMB >= 1 && sizeMB <= 10;
+      else if (filterSize === '10 MB - 100 MB') matchSize = sizeMB >= 10 && sizeMB <= 100;
+      else if (filterSize === '> 100 MB') matchSize = sizeMB > 100;
+
+      // 3. Date Match (file.Modified is ISO string)
+      let matchDate = true;
+      if (filterDate !== 'Anytime' && file.Modified) {
+        const modifiedDate = new Date(file.Modified);
+        if (filterDate === 'Last 7 Days') {
+          matchDate = (now.getTime() - modifiedDate.getTime()) <= 7 * 24 * 60 * 60 * 1000;
+        } else if (filterDate === 'Last 30 Days') {
+          matchDate = (now.getTime() - modifiedDate.getTime()) <= 30 * 24 * 60 * 60 * 1000;
+        } else if (filterDate === 'This Year') {
+          matchDate = modifiedDate.getFullYear() === now.getFullYear();
+        }
+      }
+
+      return matchType && matchSize && matchDate;
+    });
+  })();
 
   // Selection Fallback
   $: if (selectedFile && !filteredFiles.find(f => f.Path === selectedFile.Path)) {
@@ -231,7 +236,19 @@
 </script>
 
 <div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
-  <ThemeToggle />
+  <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
+    <button
+      on:click={() => showSettings = true}
+      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
+      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+      aria-label="Open Settings"
+    >
+      <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
+    </button>
+    <ThemeToggle />
+  </div>
+
+  <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
   
   <!-- Header -->
   <header class="w-full px-12 py-6 z-50 shrink-0">
@@ -245,8 +262,6 @@
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
-        <!-- Indexer Section -->
-        <Indexer />
 
         <!-- Search Section -->
         <div class="space-y-4">
@@ -370,7 +385,7 @@
                          {selectedFile === file ? 'bg-blue-50 border-blue-600 dark:bg-[#1a1a1a] dark:border-l-gray-400' : 'border-transparent hover:shadow hover:border-gray-200 dark:hover:border-[#2a2a2a] hover:bg-white dark:hover:bg-[#1a1a1a]'}"
                   on:click={() => selectedFile = file}
                   on:dblclick={() => OpenFileNative(file.Path)}
-                  style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 15}ms; opacity: 0; transform: translateY(10px);"
+                  style="animation: slideFadeIn 0.3s ease-out forwards; animation-delay: {i * 5}ms; opacity: 0; transform: translateY(10px);"
                 >
                   <div class="flex gap-6 items-start">
                     <div class="w-12 h-12 shrink-0 flex items-center justify-center {selectedFile === file ? 'bg-blue-100 text-blue-600 dark:bg-[#1a1a1a] dark:text-gray-100' : 'bg-gray-100 dark:bg-[#1a1a1a] text-gray-400 dark:text-gray-500'}">

@@ -5,7 +5,7 @@
 
 <button
   on:click={toggleTheme}
-  class="absolute top-6 right-8 p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none z-[9999] group cursor-pointer"
+  class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
   style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
   aria-label="Toggle Dark Mode"
 >

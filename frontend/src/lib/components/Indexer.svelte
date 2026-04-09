@@ -1,17 +1,19 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { fade, slide } from 'svelte/transition';
+  import { Search as SearchIcon } from 'lucide-svelte';
   import { GetHomeFolders } from '$lib/wailsjs/go/main/App';
+  import { indexingStatus } from '../../stores/indexer';
   import FolderNode from './FolderNode.svelte';
 
   /** @typedef {{ Name: string, Path: string, Indexed: boolean, HasChildren: boolean }} FolderState */
 
+  export let flat = false;
+
   /** @type {FolderState[]} */
   let folders = [];
   let isOpen = false;
-  let isIndexing = false;
-  let progress = 0;
-  let statusMessage = '';
+  let searchTerm = "";
 
   /** @type {(() => void) | null} */
   let eventsCleanup = null;
@@ -30,29 +32,8 @@
     const w = /** @type {any} */ (window);
     if (w.runtime && w.runtime.EventsOn) {
       w.runtime.EventsOn('home_folders_changed', loadFolders);
-
-      w.runtime.EventsOn('indexing_progress', (/** @type {number} */ p) => {
-        if (p > progress || p === 0) progress = p;
-        isIndexing = true;
-      });
-
-      w.runtime.EventsOn('indexing_status', (/** @type {string} */ s) => {
-        statusMessage = s;
-        if (s === 'Indexing complete.') {
-          setTimeout(() => {
-            isIndexing = false;
-            progress = 0;
-            statusMessage = '';
-          }, 2000);
-        } else if (s) {
-          isIndexing = true;
-        }
-      });
-
       eventsCleanup = () => {
         w.runtime.EventsOff('home_folders_changed');
-        w.runtime.EventsOff('indexing_progress');
-        w.runtime.EventsOff('indexing_status');
       };
     }
   });
@@ -67,64 +48,94 @@
   }
 </script>
 
-<div class="indexer-row">
-  <div class="picker-wrap">
-    <button
-      class="btn-folders"
-      on:click={() => { isOpen = !isOpen; if (isOpen) loadFolders(); }}
-    >
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-      </svg>
-      <span>Indexed Folders</span>
-      <svg class="chevron" class:open={isOpen} width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <path d="M6 9l6 6 6-6"/>
-      </svg>
-    </button>
+<div class="indexer-container" class:flat>
+  {#if !flat}
+    <div class="picker-wrap">
+      <button
+        class="btn-folders"
+        on:click={() => { isOpen = !isOpen; if (isOpen) loadFolders(); }}
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span>Indexed Folders</span>
+        <svg class="chevron" class:open={isOpen} width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M6 9l6 6 6-6"/>
+        </svg>
+      </button>
 
-    {#if isOpen}
-      <!-- svelte-ignore a11y-click-events-have-key-events -->
-      <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="backdrop" on:click={onBackdropClick}></div>
+      {#if isOpen}
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="backdrop" on:click={onBackdropClick}></div>
 
-      <div class="dropdown" transition:slide={{ duration: 150 }}>
-        <div class="dropdown-header">
-          <span class="dropdown-title">Home Folder</span>
-          <span class="dropdown-hint">Uncheck to exclude from indexing</span>
+        <div class="dropdown" transition:slide={{ duration: 150 }}>
+          <div class="dropdown-header">
+            <span class="dropdown-title">Home Folder</span>
+            <span class="dropdown-hint">Uncheck to exclude from indexing</span>
+          </div>
+
+          <div class="folder-tree">
+            {#if folders.length === 0}
+              <div class="empty-hint">No subfolders found.</div>
+            {:else}
+              {#each folders as folder (folder.Path)}
+                <FolderNode {folder} depth={0} />
+              {/each}
+            {/if}
+          </div>
         </div>
+      {/if}
+    </div>
 
-        <div class="folder-tree">
-          {#if folders.length === 0}
-            <div class="empty-hint">No subfolders found.</div>
-          {:else}
-            {#each folders as folder (folder.Path)}
-              <FolderNode {folder} depth={0} />
-            {/each}
-          {/if}
+    <!-- Progress bar (only shown in non-flat mode or kept for compatibility) -->
+    {#if $indexingStatus.isIndexing || $indexingStatus.statusMessage}
+      <div class="progress-wrapper" transition:fade={{ duration: 300 }}>
+        <span class="status-label">{$indexingStatus.statusMessage}</span>
+        <div class="progress-track">
+          <div class="progress-fill" style="width: {$indexingStatus.progress}%"></div>
         </div>
       </div>
     {/if}
-  </div>
+  {:else}
+    <!-- Flat Integrated View for Modal -->
+    <div class="flat-view">
+      <div class="search-bar">
+        <div class="search-input-wrap">
+          <SearchIcon class="w-3.5 h-3.5 text-gray-400" />
+          <input 
+            type="text" 
+            bind:value={searchTerm} 
+            placeholder="Search folders..." 
+            class="folder-search-input"
+          />
+        </div>
+      </div>
 
-  <!-- Progress bar -->
-  {#if isIndexing || statusMessage}
-    <div class="progress-wrapper" transition:fade={{ duration: 300 }}>
-      <span class="status-label">{statusMessage}</span>
-      <div class="progress-track">
-        <div class="progress-fill" style="width: {progress}%"></div>
+      <div class="folder-tree scrollbar-custom">
+        {#if folders.length === 0}
+          <div class="empty-hint">Scanning file system...</div>
+        {:else}
+          {#each folders as folder (folder.Path)}
+            <FolderNode {folder} depth={0} {searchTerm} />
+          {/each}
+        {/if}
       </div>
     </div>
   {/if}
 </div>
 
 <style>
-  .indexer-row {
+  .indexer-container {
+    width: 100%;
+    position: relative;
+  }
+
+  .indexer-container:not(.flat) {
     display: flex;
     align-items: center;
     gap: 1.5rem;
-    width: 100%;
     padding: 0.25rem 0;
-    position: relative;
   }
 
   .picker-wrap {
@@ -139,7 +150,7 @@
     padding: 0.35rem 0.85rem;
     background: transparent;
     border: 1px solid rgba(191, 200, 202, 0.2);
-    border-radius: 0.125rem;
+    border-radius: 4px;
     color: #bfc8ca;
     font-family: 'Inter', sans-serif;
     font-size: 0.7rem;
@@ -177,7 +188,7 @@
     background: #111;
     border: 1px solid #2a2a2a;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-    border-radius: 0.125rem;
+    border-radius: 4px;
     display: flex;
     flex-direction: column;
   }
@@ -212,14 +223,72 @@
   }
 
   .empty-hint {
-    padding: 0.75rem;
+    padding: 1.5rem;
     font-family: 'Inter', sans-serif;
-    font-size: 0.68rem;
-    color: #444;
+    font-size: 0.7rem;
+    color: #666;
+    text-align: center;
     font-style: italic;
   }
 
-  /* Progress */
+  /* Flat View */
+  .flat-view {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 300px;
+  }
+
+  .search-bar {
+    padding: 0 0 1rem 0;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  :global(.dark) .search-bar {
+    border-bottom-color: #1a1a1a;
+  }
+
+  .search-input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  :global(.dark) .search-input-wrap {
+    background: #0a0a0a;
+    border-color: #1a1a1a;
+  }
+  .search-input-wrap:focus-within {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+  }
+
+  .folder-search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 0.75rem;
+    font-family: 'Inter', sans-serif;
+    color: #111;
+  }
+  :global(.dark) .folder-search-input {
+    color: #eee;
+  }
+  .folder-search-input::placeholder {
+    color: #9ca3af;
+  }
+
+  .flat-view .folder-tree {
+    flex: 1;
+    max-height: 400px;
+    padding-top: 0.5rem;
+  }
+
+  /* Progress (Legacy support or sidebar) */
   .progress-wrapper {
     display: flex;
     align-items: center;
@@ -249,4 +318,10 @@
     background-color: #bfc8ca;
     transition: width 0.3s ease-out;
   }
+
+  /* Custom Scrollbar integration */
+  .scrollbar-custom::-webkit-scrollbar { width: 4px; }
+  .scrollbar-custom::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar-custom::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+  :global(.dark) .scrollbar-custom::-webkit-scrollbar-thumb { background: #1a1a1a; }
 </style>

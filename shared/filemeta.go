@@ -4,13 +4,18 @@ package shared
 
 import "os"
 
-// fileExtraTimes returns creation and access times. On non-Windows platforms
-// these are not reliably available so we fall back to mtime for both.
+// FileExtraTimesFromInfo extracts ctime/atime from an already-loaded FileInfo.
+// On non-Windows platforms these are not reliably available; mtime is returned for both.
+func FileExtraTimesFromInfo(fi os.FileInfo) (ctime, atime int64) {
+	t := fi.ModTime().UnixNano()
+	return t, t
+}
+
+// fileExtraTimes is retained for callers that only hold a path.
 func fileExtraTimes(path string) (ctime, atime int64) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return 0, 0
 	}
-	t := fi.ModTime().UnixNano()
-	return t, t
+	return FileExtraTimesFromInfo(fi)
 }
