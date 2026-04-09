@@ -46,6 +46,13 @@ type FolderState struct {
 	HasChildren bool   `json:"HasChildren"`
 }
 
+// IndexingStatus represents the current state of the backend indexer
+type IndexingStatus struct {
+	IsIndexing    bool   `json:"isIndexing"`
+	StatusMessage string `json:"statusMessage"`
+	Progress      int    `json:"progress"`
+}
+
 // getHomeSubdirs returns the names of all non-hidden, non-system direct subdirectories
 // of the home directory. Hidden (dot) folders and AppData are excluded from the list.
 func getHomeSubdirs(home string) []string {
@@ -181,11 +188,10 @@ func launchDaemon(cwd string) {
 	cmd.Process.Release()
 }
 
-func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
+func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Scanning directories...")
-		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
+		a.setStatus(true, "Phase 1/2: Scanning directories...", 0)
 	}
 
 	cfg, err := shared.NewProcessorConfig(8096, 4000, 100, sc)
@@ -245,7 +251,7 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *sha
 
 	if pruneStale && sc != nil {
 		if ctx != nil {
-			wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Pruning stale files...")
+			a.setStatus(true, "Phase 1/2: Pruning stale files...", 0)
 		}
 		log.Println("[Indexer] Phase 1/2: Pruning stale files...")
 		if err := sc.PruneStale(paths); err != nil {
@@ -255,7 +261,7 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *sha
 
 	if sc != nil {
 		if ctx != nil {
-			wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Indexing metadata...")
+			a.setStatus(true, "Phase 1/2: Indexing metadata...", 0)
 		}
 		log.Println("[Indexer] Phase 1/2: Indexing metadata...")
 		if err := sc.IndexMetadata(paths, mtimes, sizes, ctimes, atimes); err != nil {
@@ -270,7 +276,7 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *sha
 	log.Println("[Indexer] Phase 1/2: Metadata scan complete.")
 }
 
-func runPass2(ctx context.Context, sc *shared.Engine) {
+func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	if sc == nil {
 		return
 	}
@@ -279,7 +285,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	if err != nil {
 		log.Println("pass2 query error:", err)
 		if ctx != nil {
-			wailsruntime.EventsEmit(ctx, "indexing_status", "Error querying unindexed files")
+			a.setStatus(false, "Error querying unindexed files", 0)
 		}
 		return
 	}
@@ -287,8 +293,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	total := len(paths)
 	if total == 0 {
 		if ctx != nil {
-			wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing complete.")
-			wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
+			a.setStatus(false, "Indexing complete.", 100)
 		}
 		log.Println("[Indexer] Phase 2/2: No files to index.")
 		return
@@ -296,8 +301,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	log.Printf("[Indexer] Phase 2/2: Starting semantic indexing for %d files...", total)
 
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 2/2: Starting...")
-		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
+		a.setStatus(true, "Phase 2/2: Starting...", 0)
 	}
 
 	start := time.Now()
@@ -355,8 +359,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 						log.Printf("[Indexer] Phase 2/2 progress: %d%%", progressPct)
 					}
 
-					wailsruntime.EventsEmit(ctx, "indexing_progress", progressPct)
-					wailsruntime.EventsEmit(ctx, "indexing_status", statusMsg)
+					a.setStatus(true, statusMsg, progressPct)
 				}
 			}
 		}()
@@ -392,8 +395,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
 
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing complete.")
+		a.setStatus(false, "Indexing complete.", 100)
 	}
 }
 
@@ -519,7 +521,13 @@ type App struct {
 	engine        *shared.Engine
 	config        *shared.AppConfig
 	hasGPU        atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
-	isIndexing    atomic.Bool
+	
+	// Thread-safe state tracking for the frontend fetch
+	statusMutex   sync.RWMutex
+	isIndexing    bool
+	statusMessage string
+	progress      int
+
 	indexerCancel context.CancelFunc
 	cwd           string
 	home          string
@@ -622,9 +630,9 @@ func (a *App) startup(ctx context.Context) {
 		go func() {
 			log.Println("[Boot 8] Running background metadata sync...")
 			// runPass1 checks for new/deleted files (Metadata)
-			runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
 			// runPass2 processes any unindexed content (Semantic)
-			runPass2(idxCtx, a.engine)
+			a.runPass2(idxCtx, a.engine)
 			
 			log.Println("[Boot 9] Initial sync complete. Launching daemon...")
 			launchDaemon(cwd)
@@ -712,6 +720,33 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 }
 
+// GetIndexingStatus allows the frontend to fetch the exact state on mount
+func (a *App) GetIndexingStatus() IndexingStatus {
+	a.statusMutex.RLock()
+	defer a.statusMutex.RUnlock()
+	return IndexingStatus{
+		IsIndexing:    a.isIndexing,
+		StatusMessage: a.statusMessage,
+		Progress:      a.progress,
+	}
+}
+
+// Helper method to safely update state and emit to frontend
+func (a *App) setStatus(isIndexing bool, message string, progress int) {
+	a.statusMutex.Lock()
+	a.isIndexing = isIndexing
+	a.statusMessage = message
+	a.progress = progress
+	a.statusMutex.Unlock()
+
+	// Emit the standard Wails event so active listeners update
+	wailsruntime.EventsEmit(a.ctx, "indexing_status", IndexingStatus{
+		IsIndexing:    isIndexing,
+		StatusMessage: message,
+		Progress:      progress,
+	})
+}
+
 func (a *App) GetEngineStatus() bool {
 	return a.engine != nil
 }
@@ -796,16 +831,26 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	}
 
 	// Folder was enabled — index it in the background.
-	if !a.isIndexing.CompareAndSwap(false, true) {
+	a.statusMutex.Lock()
+	if a.isIndexing {
+		a.statusMutex.Unlock()
 		// Another index run is in progress; daemon will be relaunched when it finishes.
 		go func() {
-			for a.isIndexing.Load() {
+			for {
+				a.statusMutex.RLock()
+				stillBusy := a.isIndexing
+				a.statusMutex.RUnlock()
+				if !stillBusy {
+					break
+				}
 				time.Sleep(200 * time.Millisecond)
 			}
 			launchDaemon(a.cwd)
 		}()
 		return nil
 	}
+	a.isIndexing = true
+	a.statusMutex.Unlock()
 
 	if a.indexerCancel != nil {
 		a.indexerCancel()
@@ -815,9 +860,8 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	dir := folderPath
 
 	go func() {
-		defer a.isIndexing.Store(false)
-		runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
-		runPass2(idxCtx, a.engine)
+		a.runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
+		a.runPass2(idxCtx, a.engine)
 		launchDaemon(a.cwd)
 	}()
 
