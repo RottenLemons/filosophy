@@ -282,8 +282,8 @@
 
   .flat-view .folder-tree {
     flex: 1;
-    max-height: 400px;
     padding-top: 0.5rem;
+    padding-bottom: 2rem;
   }
 
   /* Progress (Legacy support or sidebar) */

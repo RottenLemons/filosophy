@@ -1,6 +1,12 @@
 <script>
+  import { onMount } from 'svelte';
   import '../app.css';
   import { themeStore } from '../stores/theme';
+  import { initIndexerStore } from '../stores/indexer';
+
+  onMount(() => {
+    initIndexerStore();
+  });
 
   $: {
     if (typeof window !== 'undefined') {

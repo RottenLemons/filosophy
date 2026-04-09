@@ -115,6 +115,7 @@ type Engine struct {
 // New initializes the Engine with the given database path and ONNX model paths.
 // textModelPath and imageModelPath should point to directories containing the ONNX model files.
 func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
+	log.Println("[Engine 1] Opening sqvect database at", dbPath)
 	// Open sqvect database for vector operations
 	cfg := sqvect.Config{
 		Path:         dbPath,
@@ -128,6 +129,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 
 	// Open a separate sql.DB for the files dedup table
+	log.Println("[Engine 2] Opening companion SQL database...")
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		db.Close()
@@ -154,6 +156,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	ctx := context.Background()
 
 	// Create collections for text and image embeddings
+	log.Println("[Engine 3] Ensuring vector collections exist...")
 	if _, err := db.Vector().CreateCollection(ctx, textCollection, textEmbedDim); err != nil {
 		log.Printf("text collection: %v", err)
 	}
@@ -168,6 +171,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	if useGPU {
 		log.Printf("CUDA runtime verified — GPU acceleration enabled")
 	}
+	log.Println("[Engine 4] Initializing ONNX Runtime environment...")
 	if err := ort.InitializeEnvironment(); err != nil {
 		sqlDB.Close()
 		db.Close()
@@ -176,6 +180,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 
 	// Load the static text embedder (reads model.safetensors + tokenizer.json directly,
 	// no ONNX inference needed for text).
+	log.Println("[Engine 5] Loading static text embedder from", textModelPath)
 	staticEmb, err := LoadStaticEmbedder(
 		filepath.Join(textModelPath, "model.safetensors"),
 		filepath.Join(textModelPath, "tokenizer.json"),
@@ -187,6 +192,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		return nil, fmt.Errorf("failed to load static embedder: %w", err)
 	}
 
+	log.Println("[Engine 6] Loading CLIP tokenizer from", imageModelPath)
 	clipTok, err := tokenizers.FromFile(filepath.Join(imageModelPath, "tokenizer.json"))
 	if err != nil {
 		staticEmb.Close()
@@ -213,6 +219,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 
 	// Create ONNX sessions for CLIP only (text uses the static embedder).
+	log.Println("[Engine 7] Initializing CLIP text session...")
 	clipTextSession, err := ort.NewDynamicAdvancedSession(
 		filepath.Join(imageModelPath, "text_model.onnx"),
 		[]string{"input_ids"},
@@ -244,6 +251,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		log.Printf("CLIP vision session: CUDA GPU enabled")
 	}
 
+	log.Println("[Engine 8] Initializing CLIP vision session...")
 	clipVisionSession, err := ort.NewDynamicAdvancedSession(
 		filepath.Join(imageModelPath, "vision_model.onnx"),
 		[]string{"pixel_values"},
@@ -317,6 +325,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 				} else {
 					rerankerSession = rsess
 					rerankerTok = rtok
+					log.Println("[Engine 9] Reranker model loaded successfully")
 					log.Printf("reranker loaded: %s", rerankerOnnx)
 				}
 			}

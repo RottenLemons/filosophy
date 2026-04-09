@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -111,7 +112,6 @@ func (a *App) makeFolderState(name, path string) FolderState {
 	}
 }
 
-
 // isDaemonRunning checks whether a previously launched daemon process is still alive.
 func isDaemonRunning(cwd string) bool {
 	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
@@ -182,12 +182,17 @@ func launchDaemon(cwd string) {
 }
 
 func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
+	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Scanning directories...")
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Scanning directories...")
 		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
 	}
 
-	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	cfg, err := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	if err != nil {
+		log.Printf("runPass1 error: %v", err)
+		return
+	}
 	defer cfg.CleanupTempDir()
 
 	var paths []string
@@ -200,10 +205,12 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *sha
 	// Previously two separate walks were made over the same tree, doubling syscall count.
 	for _, dir := range dirs {
 		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			select {
-			case <-ctx.Done():
-				return filepath.SkipDir
-			default:
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return filepath.SkipDir
+				default:
+				}
 			}
 			if err != nil {
 				return nil
@@ -231,34 +238,43 @@ func runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *sha
 			atimes = append(atimes, at)
 			return nil
 		})
-		if ctx.Err() != nil {
+		if ctx != nil && ctx.Err() != nil {
 			return
 		}
 	}
 
-	if pruneStale {
+	if pruneStale && sc != nil {
 		if ctx != nil {
-			wailsruntime.EventsEmit(ctx, "indexing_status", "Pruning stale files...")
+			wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Pruning stale files...")
 		}
+		log.Println("[Indexer] Phase 1/2: Pruning stale files...")
 		if err := sc.PruneStale(paths); err != nil {
 			log.Println("pass1 prune error:", err)
 		}
 	}
 
-	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing metadata...")
-	}
-	if err := sc.IndexMetadata(paths, mtimes, sizes, ctimes, atimes); err != nil {
-		log.Println("pass1 metadata index error:", err)
+	if sc != nil {
+		if ctx != nil {
+			wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 1/2: Indexing metadata...")
+		}
+		log.Println("[Indexer] Phase 1/2: Indexing metadata...")
+		if err := sc.IndexMetadata(paths, mtimes, sizes, ctimes, atimes); err != nil {
+			log.Println("pass1 metadata index error:", err)
+		}
 	}
 
-	if ctx.Err() != nil {
+	if ctx != nil && ctx.Err() != nil {
 		return
 	}
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	log.Println("[Indexer] Phase 1/2: Metadata scan complete.")
 }
 
 func runPass2(ctx context.Context, sc *shared.Engine) {
+	if sc == nil {
+		return
+	}
+	log.Println("[Indexer] Phase 2/2: Querying unindexed files...")
 	paths, _, err := sc.UnindexedFiles()
 	if err != nil {
 		log.Println("pass2 query error:", err)
@@ -274,16 +290,22 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 			wailsruntime.EventsEmit(ctx, "indexing_status", "Indexing complete.")
 			wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
 		}
+		log.Println("[Indexer] Phase 2/2: No files to index.")
 		return
 	}
+	log.Printf("[Indexer] Phase 2/2: Starting semantic indexing for %d files...", total)
 
 	if ctx != nil {
-		wailsruntime.EventsEmit(ctx, "indexing_status", "CALCULATING ETA...")
+		wailsruntime.EventsEmit(ctx, "indexing_status", "Phase 2/2: Starting...")
 		wailsruntime.EventsEmit(ctx, "indexing_progress", 0)
 	}
 
 	start := time.Now()
-	cfg := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	cfg, err := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	if err != nil {
+		log.Printf("runPass2 error: %v", err)
+		return
+	}
 	defer cfg.CleanupTempDir()
 
 	var processed int32
@@ -321,12 +343,16 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 							lastETATime = time.Now()
 						}
 						if lastETA != "" {
-							statusMsg = fmt.Sprintf("%d%% - %s", progressPct, lastETA)
+							statusMsg = fmt.Sprintf("Phase 2/2: %d%% — %s", progressPct, lastETA)
 						} else {
-							statusMsg = fmt.Sprintf("%d%%", progressPct)
+							statusMsg = fmt.Sprintf("Phase 2/2: %d%%", progressPct)
 						}
 					} else {
-						statusMsg = fmt.Sprintf("%d%%", progressPct)
+						statusMsg = fmt.Sprintf("Phase 2/2: %d%%", progressPct)
+					}
+
+					if progressPct % 10 == 0 {
+						log.Printf("[Indexer] Phase 2/2 progress: %d%%", progressPct)
 					}
 
 					wailsruntime.EventsEmit(ctx, "indexing_progress", progressPct)
@@ -338,13 +364,13 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 
 	sem := make(chan struct{}, maxConcurrency)
 	for _, path := range paths {
-		select {
-		case <-ctx.Done():
-			if ctx != nil {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
 				close(doneChan)
+				return
+			default:
 			}
-			return
-		default:
 		}
 		sem <- struct{}{}
 		go func(p string) {
@@ -363,7 +389,7 @@ func runPass2(ctx context.Context, sc *shared.Engine) {
 
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 	shared.DrainRemaining(cfg.Images, "image", sc)
-	fmt.Printf("indexing complete (%v)\n", time.Since(start))
+	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
 
 	if ctx != nil {
 		wailsruntime.EventsEmit(ctx, "indexing_progress", 100)
@@ -441,6 +467,9 @@ func availableDrives() []string {
 }
 
 func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
+	if sc == nil {
+		return
+	}
 	log.Println("[sysindex] Starting system-wide path index...")
 	const batchSize = 2000
 	batch := make([]string, 0, batchSize)
@@ -457,10 +486,12 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 			if err != nil {
 				return nil
 			}
-			select {
-			case <-ctx.Done():
-				return filepath.SkipAll
-			default:
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return filepath.SkipAll
+				default:
+				}
 			}
 			if info.IsDir() {
 				if systemPathSkipDirs[strings.ToLower(info.Name())] {
@@ -493,6 +524,7 @@ type App struct {
 	cwd           string
 	home          string
 	homeWatchStop chan struct{}
+	mu            sync.Mutex
 }
 
 func NewApp() *App {
@@ -529,7 +561,6 @@ func (a *App) startup(ctx context.Context) {
 	a.home = home
 
 	a.config = shared.LoadConfig(cwd)
-
 	go func() {
 		// Asynchronous GPU detection with hidden window to avoid terminal flashing
 		cmd := exec.Command("nvidia-smi", "-L")
@@ -551,45 +582,92 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 
-	_, dbMissing := os.Stat(dbPath)
+	log.Println("[Boot 3] Initializing logger...")
+
+	_, err = os.Stat(dbPath)
+	dbMissing := os.IsNotExist(err)
 	forceIndex := len(os.Args) > 1 && os.Args[1] == "--index"
 
-	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Printf("Failed to initialize Engine: %v", err)
-		return
-	}
-	a.engine = engine
-	log.Println("Engine initialized")
+	// Initialize config
+	log.Println("[Boot 4] Loading configuration from database...")
+	a.config = shared.LoadConfig(cwd)
 
 	dirs := a.getContentDirs()
 	for _, d := range dirs {
 		os.MkdirAll(d, 0755)
 	}
 
-	if forceIndex {
-		if err := a.engine.ResetContentIndex(); err != nil {
-			log.Println("reset index error:", err)
+	// Launch Engine
+	log.Println("[Boot 5] Spawning Engine initialization...")
+	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+	if err != nil {
+		log.Printf("[Boot Error] CRITICAL initialization failed: %v", err)
+		log.Printf("The application will continue with search backend disabled.")
+	} else {
+		a.engine = engine
+		log.Println("[Boot 6] Engine initialized successfully")
+		if forceIndex {
+			if err := a.engine.ResetContentIndex(); err != nil {
+				log.Println("reset index error:", err)
+			}
 		}
 	}
 
 	idxCtx, cancel := context.WithCancel(a.ctx)
 	a.indexerCancel = cancel
 
-	if forceIndex || os.IsNotExist(dbMissing) {
-		runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+	if a.engine != nil {
+		log.Println("[Boot 7] Initializing background indexing...")
+		// Always launch indexing in the background on boot to synchronize changes and resume partial scans
 		go func() {
+			log.Println("[Boot 8] Running background metadata sync...")
+			// runPass1 checks for new/deleted files (Metadata)
+			runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+			// runPass2 processes any unindexed content (Semantic)
 			runPass2(idxCtx, a.engine)
+			
+			log.Println("[Boot 9] Initial sync complete. Launching daemon...")
 			launchDaemon(cwd)
+			go runSystemPathIndex(idxCtx, a.engine)
 		}()
-		go runSystemPathIndex(idxCtx, a.engine)
 	} else {
-		launchDaemon(cwd)
+		// Even if engine is nil, launch daemon if it's not a fresh install (best effort)
+		if !dbMissing {
+			log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
+			launchDaemon(cwd)
+		}
 	}
 
 	// Watch home dir top level so the frontend can react to new/deleted folders.
 	a.homeWatchStop = make(chan struct{})
 	go a.watchHomeFolders()
+	log.Println("[Boot 13] Startup sequence complete (Main Thread Released)")
+}
+
+// RetryEngineInit attempts to initialize the engine if it previously failed.
+func (a *App) RetryEngineInit() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.engine != nil {
+		return nil // Already initialized
+	}
+
+	cwd, _ := os.Getwd()
+	dbPath := filepath.Join(cwd, "filosophy.db")
+	textModelPath := filepath.Join(cwd, "text")
+	imageModelPath := filepath.Join(cwd, "image")
+
+	log.Println("[Retry] Attempting manual Engine re-initialization...")
+	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+	if err != nil {
+		log.Printf("[Retry Error] Re-initialization failed: %v", err)
+		return fmt.Errorf("initialization failed: %w", err)
+	}
+
+	a.engine = engine
+	log.Println("[Retry Success] Engine is now online")
+	return nil
 }
 
 // watchHomeFolders watches the home directory for top-level folder
@@ -634,11 +712,15 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 }
 
+func (a *App) GetEngineStatus() bool {
+	return a.engine != nil
+}
+
 func (a *App) Search(query string) ([]shared.SearchResult, error) {
-	log.Printf("App.Search called with query: %s", query)
 	if a.engine == nil {
-		return nil, fmt.Errorf("engine not initialized")
+		return nil, fmt.Errorf("backend engine not initialized")
 	}
+	log.Printf("App.Search called with query: %s", query)
 	res, err := a.engine.Search(query)
 	log.Printf("App.Search returned %d results, err: %v", len(res), err)
 	return res, err
@@ -696,6 +778,9 @@ func (a *App) GetFolderChildren(path string) []FolderState {
 // Enabling triggers a background pass1+pass2 for that directory.
 // Disabling updates the config and restarts the daemon.
 func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
+	if a.engine == nil {
+		return fmt.Errorf("backend engine not initialized")
+	}
 	a.config.SetExcluded(folderPath, !indexed)
 	if err := a.config.Save(); err != nil {
 		return err
@@ -798,12 +883,16 @@ func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/pdf")
 		case ".txt", ".md", ".csv":
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		default:
+			w.Header().Set("Content-Type", "application/octet-stream")
 		}
 
-		http.ServeFile(w, r, decodedPath)
-		return
-	}
-	if h.Handler != nil {
-		h.Handler.ServeHTTP(w, r)
+		data, err := os.ReadFile(decodedPath)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
 	}
 }

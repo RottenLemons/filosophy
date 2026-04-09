@@ -5,11 +5,10 @@
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
   import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity } from 'lucide-svelte';
-  import { Settings as SettingsIconLucide } from 'lucide-svelte';
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import SettingsModal from '$lib/components/SettingsModal.svelte';
-  import { indexingStatus } from '$stores/indexer';
+  import { indexingStatus } from '../stores/indexer';
 
   let showSettings = false;
 
@@ -21,8 +20,8 @@
   let files = [];
   /** @type {boolean} */
   let searching = false;
-  /** @type {boolean} */
-  let searchError = false;
+  /** @type {string | null} */
+  let searchErrorMsg = null;
 
   /** @type {number} */
   let currentSearchTicket = 0;
@@ -141,7 +140,7 @@
       files = [];
       selectedFile = null;
       searching = false;
-      searchError = false;
+      searchErrorMsg = null;
       renderLimit = 50;
       return;
     }
@@ -149,20 +148,17 @@
     currentSearchTicket++;
     const localTicket = currentSearchTicket;
     
-    searching = true;
-    searchError = false;
-    renderLimit = 50; 
-
     try {
       const result = await Search(searchQuery);
       if (localTicket === currentSearchTicket) {
         files = result || [];
         selectedFile = null; 
+        searchErrorMsg = null;
       }
     } catch (error) {
       if (localTicket === currentSearchTicket) {
         console.error("Search failed:", error);
-        searchError = true;
+        searchErrorMsg = String(error);
         files = [];
         selectedFile = null;
       }
@@ -179,7 +175,7 @@
         files = [];
         selectedFile = null;
         searching = false;
-        searchError = false;
+        searchErrorMsg = null;
         renderLimit = 50;
         return;
     }
@@ -206,7 +202,7 @@
     clearTimeout(searchTimeout);
     currentSearchTicket++; // Invalidate pending search
     searching = false;
-    searchError = false;
+    searchErrorMsg = null;
   }
 
   function loadMore() {
@@ -286,7 +282,7 @@
       style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
       aria-label="Open Settings"
     >
-      <SettingsIcon Lucide class="w-5 h-5 transition-transform group-hover:rotate-45" />
+      <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
     </button>
     <ThemeToggle />
   </div>
@@ -421,19 +417,28 @@
             </div>
           {/if}
           
-          {#if searchError}
-            <div class="p-8 border border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10 rounded-none flex flex-col items-center gap-4 text-center" transition:fade>
-              <AlertCircle class="text-red-500" size={32} />
-              <div class="space-y-1">
-                <h3 class="text-red-900 dark:text-red-400 font-bold uppercase tracking-widest text-xs">Search Failed</h3>
-                <p class="text-[11px] text-red-700 dark:text-red-500/70 italic">An error occurred while communicating with the search engine.</p>
-              </div>
-              <button 
-                on:click={performingSearch}
-                class="px-6 py-2 bg-red-600 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-red-700 transition-colors"
-              >
-                Retry Search
-              </button>
+          {#if searchErrorMsg}
+            <div class="p-8 border {searchErrorMsg.includes('backend engine not initialized') ? 'border-amber-400 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20' : 'border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10'} rounded-none flex flex-col items-center gap-4 text-center" transition:fade>
+              {#if searchErrorMsg.includes('backend engine not initialized')}
+                <Activity class="text-amber-500 animate-pulse" size={32} />
+                <div class="space-y-1">
+                  <h3 class="text-amber-900 dark:text-amber-400 font-bold uppercase tracking-widest text-xs">Engine Offline</h3>
+                  <p class="text-[11px] text-amber-700 dark:text-amber-500/70 italic max-w-sm">The local AI search backend failed to boot. This usually happens if model files are missing or the database is locked. Please check <code>filosophy.log</code> and restart.</p>
+                </div>
+              {:else}
+                <AlertCircle class="text-red-500" size={32} />
+                <div class="space-y-1">
+                  <h3 class="text-red-900 dark:text-red-400 font-bold uppercase tracking-widest text-xs">Search Failed</h3>
+                  <p class="text-[11px] text-red-700 dark:text-red-500/70 italic">An error occurred while communicating with the search engine.</p>
+                  <p class="text-[9px] font-mono text-red-400 mt-2">{searchErrorMsg}</p>
+                </div>
+                <button 
+                  on:click={performingSearch}
+                  class="px-6 py-2 bg-red-600 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-red-700 transition-colors"
+                >
+                  Retry Search
+                </button>
+              {/if}
             </div>
           {:else if searching}
             <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-8" transition:fade>
@@ -578,7 +583,7 @@
                   />
                 {:else}
                   <div class="flex flex-col items-center gap-4 text-gray-400">
-                    <ImageIcon size={64} />
+                    <ImageIcon size={32} />
                     <p class="text-sm font-mono italic">Failed to load preview.</p>
                   </div>
                 {/if}
@@ -605,23 +610,41 @@
     
   </main>
   
-  <!-- Task 10: Ambient Indexing Status -->
-  {#if $indexingStatus.isIndexing}
+  <!-- Task 10: Persistent Engine Health Badge (UX Remediation H1) -->
+  {#if searchErrorMsg !== 'backend engine not initialized'}
     <div 
-      class="fixed bottom-0 left-0 right-0 z-[100] h-1.5 bg-gray-200 dark:bg-[#222]"
-      transition:slide={{ axis: 'y' }}
+      class="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-2"
+      transition:fade={{ duration: 300 }}
     >
-      <div 
-        class="h-full bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)] transition-all duration-300 flex items-center justify-end px-4"
-        style="width: {$indexingStatus.progress}%"
-      >
-        <div class="absolute bottom-4 right-6 bg-white dark:bg-[#1a1a1a] px-3 py-1.5 rounded-full border border-gray-100 dark:border-[#333] shadow-lg flex items-center gap-2">
-          <Activity class="w-3.5 h-3.5 text-blue-500 animate-pulse" />
-          <span class="text-[9px] font-bold text-gray-600 dark:text-gray-300 uppercase tracking-widest">
-            Indexing Resources — {Math.round($indexingStatus.progress)}%
+      <div class="bg-white/80 dark:bg-black/50 backdrop-blur-md border border-gray-200/50 dark:border-white/10 px-4 py-2 rounded-2xl shadow-2xl flex items-center gap-3">
+        <div class="relative flex items-center justify-center">
+            <Activity class="w-4 h-4 {$indexingStatus.isIndexing ? 'text-blue-500 animate-pulse' : 'text-emerald-500 dark:text-emerald-400'}" />
+            {#if $indexingStatus.isIndexing}
+              <div class="absolute inset-0 bg-blue-500/20 blur-lg rounded-full animate-pulse"></div>
+            {/if}
+        </div>
+        <div class="flex flex-col">
+          <span class="text-[10px] font-black {$indexingStatus.isIndexing ? 'text-blue-600 dark:text-blue-400' : 'text-emerald-600 dark:text-emerald-500'} uppercase tracking-tighter leading-none mb-0.5">
+            {$indexingStatus.isIndexing ? 'Backend Engine Busy' : 'Filosophy Engine'}
+          </span>
+          <span class="text-[11px] font-bold text-gray-900 dark:text-gray-100 tracking-tight leading-none">
+            {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Syncing...') : 'System Ready'}
           </span>
         </div>
       </div>
+      
+      <!-- Micro-progress bar (only visible when indexing) -->
+      {#if $indexingStatus.isIndexing}
+        <div 
+            class="w-48 h-1 bg-gray-200/50 dark:bg-white/5 rounded-full overflow-hidden backdrop-blur-sm border border-white/5"
+            transition:slide={{ axis: 'y' }}
+        >
+            <div 
+            class="h-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.6)] transition-all duration-500 ease-out"
+            style="width: {$indexingStatus.progress}%"
+            ></div>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>

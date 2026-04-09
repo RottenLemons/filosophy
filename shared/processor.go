@@ -64,7 +64,7 @@ func IsImageFile(filename string) bool {
 
 // IndexBatch directly indexes a batch of metadata items using the Engine.
 func IndexBatch(items []Metadata, mode string, sc *Engine) {
-	if len(items) == 0 {
+	if sc == nil || len(items) == 0 {
 		return
 	}
 	contents := make([]string, 0, len(items))
@@ -117,6 +117,9 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 
 // HandleChunk adds metadata to a channel and flushes when full.
 func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size, ctime, atime int64, mu *sync.Mutex) {
+	if sc == nil {
+		return
+	}
 	mu.Lock()
 	select {
 	case chunks <- Metadata{content, path, hash, mtime, size, ctime, atime}:
@@ -146,6 +149,9 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 
 // DrainRemaining drains all remaining items from a channel and indexes them.
 func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
+	if sc == nil || len(chunks) == 0 {
+		return
+	}
 	var items []Metadata
 	for len(chunks) > 0 {
 		items = append(items, <-chunks)
@@ -167,6 +173,9 @@ type ProcessorConfig struct {
 // Hash is derived from mtime^size to avoid reading the full file just for dedup
 // (avoids a redundant full-file os.ReadFile that was previously discarded immediately).
 func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
+	if cfg == nil || cfg.Engine == nil {
+		return
+	}
 	hash := mtime ^ size
 
 	// Convert to JPEG via vips (handles all formats: HEIC, AVIF, WebP, etc.)
@@ -183,6 +192,9 @@ func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorCo
 
 // ProcessText extracts text from a file and adds chunks to the channel.
 func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
+	if cfg == nil || cfg.Engine == nil {
+		return
+	}
 	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result == nil || result.Content == "" {
 		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
@@ -212,6 +224,9 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 // A single os.Stat call provides mtime, size, ctime, and atime — eliminating
 // the redundant fileExtraTimes syscalls that previously occurred downstream.
 func ProcessFile(path string, cfg *ProcessorConfig) {
+	if cfg == nil {
+		return
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		log.Println("Failed to stat file:", err)
@@ -229,13 +244,19 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 
 // ProcessDirectory adds directory path to the chunks channel.
 func ProcessDirectory(path string, cfg *ProcessorConfig) {
+	if cfg == nil || cfg.Engine == nil {
+		return
+	}
 	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, 0, 0, cfg.Mu)
 }
 
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
 // InitIndexTables is called at most once per Engine instance via sync.Once (IX-4 fix).
-func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) *ProcessorConfig {
+func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*ProcessorConfig, error) {
+	if sc == nil {
+		return nil, fmt.Errorf("cannot create processor config: engine is nil")
+	}
 	sc.initTableOnce.Do(func() {
 		if err := sc.InitIndexTables(); err != nil {
 			log.Printf("Failed to initialize index tables: %v", err)
@@ -260,12 +281,12 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) *Processo
 		Engine:   sc,
 		TempDir:  tmpDir,
 		Mu:       &sync.Mutex{},
-	}
+	}, nil
 }
 
 // CleanupTempDir removes the temp directory used for image conversions.
 func (cfg *ProcessorConfig) CleanupTempDir() {
-	if cfg.TempDir != "" {
+	if cfg != nil && cfg.TempDir != "" {
 		os.RemoveAll(cfg.TempDir)
 	}
 }

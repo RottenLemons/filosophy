@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
   import { fade, slide, fly } from 'svelte/transition';
-  import { X, Folder, Cpu, Settings, Activity } from 'lucide-svelte';
+  import { X, Folder, Cpu, Settings, Activity, AlertCircle } from 'lucide-svelte';
   import { themeStore } from '../../stores/theme';
   import { indexingStatus, initIndexerStore } from '../../stores/indexer';
-  import { CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration } from '$lib/wailsjs/go/main/App';
+  import { GetHomeFolders, GetEngineStatus, RetryEngineInit, CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration } from '$lib/wailsjs/go/main/App';
   import Indexer from './Indexer.svelte';
 
   const dispatch = createEventDispatcher();
@@ -14,6 +14,8 @@
   let hasGPU = false;
   let gpuAcceleration = false;
   let loading = true;
+  let engineError = false;
+  let retrying = false;
 
   let modalElement: HTMLElement;
 
@@ -22,12 +24,38 @@
     try {
       hasGPU = await CheckSystemGPU();
       gpuAcceleration = await GetGPUAcceleration();
+      // Check if engine is initialized
+      const engineIsReady = await GetEngineStatus();
+      if (!engineIsReady) {
+        engineError = true;
+      }
     } catch (e) {
-      console.error('Failed to load hardware settings:', e);
+      console.error('Settings initialization error:', e);
+      if (String(e).includes('backend engine not initialized')) {
+        engineError = true;
+      }
     } finally {
       loading = false;
     }
   });
+
+  async function retryEngine() {
+    if (retrying) return;
+    retrying = true;
+    try {
+      await RetryEngineInit();
+      const ready = await GetEngineStatus();
+      if (ready) {
+        engineError = false;
+        // Full refresh to re-init all stores and components correctly
+        window.location.reload();
+      }
+    } catch (e) {
+      console.error('Retry failed:', e);
+    } finally {
+      retrying = false;
+    }
+  }
 
   async function toggleGPU() {
     if (!hasGPU) return;
@@ -36,6 +64,9 @@
       await SetGPUAcceleration(gpuAcceleration);
     } catch (e) {
       console.error('Failed to save GPU setting:', e);
+      if (String(e).includes('backend engine not initialized')) {
+        engineError = true;
+      }
       gpuAcceleration = !gpuAcceleration; // revert
     }
   }
@@ -141,6 +172,18 @@
             </div>
           {/if}
           
+          {#if engineError}
+            <div class="space-y-2" transition:slide>
+              <div class="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                <AlertCircle class="w-3 h-3" />
+                <span>Backend Offline</span>
+              </div>
+              <div class="text-[8px] text-gray-400 dark:text-gray-500 font-medium leading-tight">
+                AI search engine failed to initialize.
+              </div>
+            </div>
+          {/if}
+          
           <div class="flex items-center gap-2 text-[9px] font-medium text-gray-400 uppercase tracking-widest">
             <Settings class="w-3 h-3" />
             <span>v1.2.0 Stable</span>
@@ -174,9 +217,37 @@
                   Select the directories you want Filosophy to monitor. Folders are recursively indexed for semantic search and metadata extraction.
                 </p>
               </div>
-              <div class="flex-1 min-h-0 bg-gray-50/50 dark:bg-[#0a0a0a] rounded-xl border border-gray-100 dark:border-[#1a1a1a] overflow-hidden p-6">
-                <Indexer flat={true} />
-              </div>
+
+              {#if engineError}
+                <div class="flex-1 flex flex-col items-center justify-center p-10 bg-amber-50/50 dark:bg-amber-950/10 border border-amber-100 dark:border-amber-900/30 rounded-xl text-center space-y-4">
+                  <Activity class="w-12 h-12 text-amber-500 animate-pulse" />
+                  <div class="space-y-2">
+                    <h5 class="text-lg font-serif font-bold text-amber-900 dark:text-amber-400">Search Engine Offline</h5>
+                    <p class="text-xs text-amber-700 dark:text-amber-500/80 max-w-xs leading-relaxed">
+                      The AI backend failed to initialize. Indexing operations and vector search are currently disabled.
+                    </p>
+                    <p class="text-[10px] font-mono text-amber-600/60 dark:text-amber-500/40 pt-2">
+                      Please check <code>filosophy.log</code> for errors and restart the application.
+                    </p>
+                  </div>
+                  <button 
+                    on:click={retryEngine}
+                    disabled={retrying}
+                    class="mt-2 px-6 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-full transition-all shadow-lg shadow-amber-900/20 disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {#if retrying}
+                      <Activity class="w-3 h-3 animate-spin" />
+                      <span>Reconnecting...</span>
+                    {:else}
+                      <span>Retry Connection</span>
+                    {/if}
+                  </button>
+                </div>
+              {:else}
+                <div class="flex-1 min-h-0 bg-gray-50/50 dark:bg-[#0a0a0a] rounded-xl border border-gray-100 dark:border-[#1a1a1a] overflow-hidden p-6">
+                  <Indexer flat={true} />
+                </div>
+              {/if}
             </div>
           {:else if activeTab === 'hardware'}
             <div in:fade={{ duration: 200 }} class="space-y-12">
