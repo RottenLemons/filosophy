@@ -4,7 +4,6 @@ package main
 
 import (
 	_ "embed"
-	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
@@ -53,17 +52,6 @@ func getHomeSubdirs(home string) []string {
 	return names
 }
 
-// loadExcluded reads the excluded-folder names from the config file.
-func loadExcluded(cwd string) map[string]bool {
-	data, _ := os.ReadFile(filepath.Join(cwd, "filosophy_excluded.json"))
-	var names []string
-	json.Unmarshal(data, &names)
-	m := make(map[string]bool, len(names))
-	for _, n := range names {
-		m[strings.ToLower(n)] = true
-	}
-	return m
-}
 
 func main() {
 	cwd, err := os.Getwd()
@@ -80,21 +68,38 @@ func main() {
 		log.SetOutput(lf)
 	}
 
-	// Compute which home subdirectories to watch (same logic as main.go).
+// Compute which home subdirectories to watch (same logic as main.go).
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal("daemon: cannot determine home directory:", err)
 	}
-	excluded := loadExcluded(cwd)
+	config := shared.LoadConfig(cwd)
 	subdirs := getHomeSubdirs(home)
 	var baseDirs []string
 	for _, name := range subdirs {
-		if !excluded[strings.ToLower(name)] {
-			baseDirs = append(baseDirs, filepath.Join(home, name))
+		p := filepath.Join(home, name)
+		if !config.IsExcluded(p) {
+			baseDirs = append(baseDirs, p)
 		}
 	}
 	if len(baseDirs) == 0 {
 		baseDirs = []string{home}
+	}
+	// Include extra directories (e.g. network drives) from config.
+	for _, d := range config.GetExtraDirs() {
+		if !config.IsExcluded(d) {
+			baseDirs = append(baseDirs, d)
+		}
+	}
+	// Auto-detect mapped network drives.
+	seen := make(map[string]bool)
+	for _, d := range baseDirs {
+		seen[strings.ToLower(d)] = true
+	}
+	for _, nd := range shared.NetworkDrives() {
+		if !seen[strings.ToLower(nd)] && !config.IsExcluded(nd) {
+			baseDirs = append(baseDirs, nd)
+		}
 	}
 
 	engine, err := shared.New(

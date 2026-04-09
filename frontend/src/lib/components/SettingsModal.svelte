@@ -24,6 +24,7 @@
     try {
       hasGPU = await CheckSystemGPU();
       gpuAcceleration = await GetGPUAcceleration();
+      if (!hasGPU) gpuAcceleration = false;
       // Check if engine is initialized
       const engineIsReady = await GetEngineStatus();
       if (!engineIsReady) {
@@ -285,11 +286,11 @@
                     disabled={!hasGPU || loading}
                     aria-label="Toggle GPU Acceleration"
                     class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed
-                           {gpuAcceleration ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                           {hasGPU && gpuAcceleration ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
                   >
                     <span 
                       class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out
-                             {gpuAcceleration ? 'translate-x-5' : 'translate-x-0'}"
+                             {hasGPU && gpuAcceleration ? 'translate-x-5' : 'translate-x-0'}"
                     ></span>
                   </button>
                 </div>

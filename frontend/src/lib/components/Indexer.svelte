@@ -1,8 +1,8 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { fade, slide } from 'svelte/transition';
-  import { Search as SearchIcon } from 'lucide-svelte';
-  import { GetHomeFolders } from '$lib/wailsjs/go/main/App';
+  import { Search as SearchIcon, FolderPlus } from 'lucide-svelte';
+  import { GetHomeFolders, BrowseForDirectory, AddExtraDirectory, RemoveExtraDirectory } from '$lib/wailsjs/go/main/App';
   import { indexingStatus } from '../../stores/indexer';
   import FolderNode from './FolderNode.svelte';
 
@@ -43,6 +43,18 @@
   /** @param {MouseEvent} e */
   function onBackdropClick(e) {
     if (e.target === e.currentTarget) isOpen = false;
+  }
+
+  async function browseAndAddFolder() {
+    try {
+      const dir = await BrowseForDirectory();
+      if (dir) {
+        await AddExtraDirectory(dir);
+        await loadFolders();
+      }
+    } catch (e) {
+      console.error('Add folder error:', e);
+    }
   }
 </script>
 
@@ -99,14 +111,20 @@
     <!-- Flat Integrated View for Modal -->
     <div class="flat-view">
       <div class="search-bar">
-        <div class="search-input-wrap">
-          <SearchIcon class="w-3.5 h-3.5 text-gray-400" />
-          <input 
-            type="text" 
-            bind:value={searchTerm} 
-            placeholder="Search folders..." 
-            class="folder-search-input"
-          />
+        <div class="search-row">
+          <div class="search-input-wrap">
+            <SearchIcon class="w-3.5 h-3.5 text-gray-400" />
+            <input 
+              type="text" 
+              bind:value={searchTerm} 
+              placeholder="Search folders..." 
+              class="folder-search-input"
+            />
+          </div>
+          <button class="btn-add-folder" on:click={browseAndAddFolder} title="Add a network drive or external folder">
+            <FolderPlus class="w-3.5 h-3.5" />
+            <span>Add Folder</span>
+          </button>
         </div>
       </div>
 
@@ -278,6 +296,43 @@
   }
   .folder-search-input::placeholder {
     color: #9ca3af;
+  }
+
+  .search-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .btn-add-folder {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.5rem 0.75rem;
+    background: transparent;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    color: #6b7280;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s ease;
+  }
+  .btn-add-folder:hover {
+    background: #f3f4f6;
+    border-color: #3b82f6;
+    color: #3b82f6;
+  }
+  :global(.dark) .btn-add-folder {
+    border-color: #1a1a1a;
+    color: #9ca3af;
+  }
+  :global(.dark) .btn-add-folder:hover {
+    background: #1a1a1a;
+    border-color: #3b82f6;
+    color: #3b82f6;
   }
 
   .flat-view .folder-tree {

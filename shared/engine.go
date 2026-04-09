@@ -10,7 +10,9 @@ import "C"
 
 import (
 	"context"
+	crand "crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
@@ -25,13 +27,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"net/url"
 
 	"github.com/daulet/tokenizers"
-	"github.com/google/uuid"
 	"github.com/liliang-cn/sqvect/v2/pkg/core"
 	"github.com/liliang-cn/sqvect/v2/pkg/sqvect"
 	ort "github.com/yalue/onnxruntime_go"
@@ -394,8 +396,29 @@ func (s *Engine) Close() error {
 	return nil
 }
 
+// idPrefix is a session-unique 8-byte random hex string set once at startup.
+// idSeq is an atomic counter for the per-session sequence number.
+// Together they produce globally unique, cheaply generated IDs.
+var (
+	idPrefix string
+	idSeq    atomic.Uint64
+)
+
+func init() {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// Fallback: use current time nanoseconds as seed material
+		ns := uint64(time.Now().UnixNano())
+		binary.LittleEndian.PutUint64(b[:], ns)
+	}
+	idPrefix = fmt.Sprintf("%016x", b)
+}
+
+// generateID returns a unique string ID. It calls crypto/rand once per process
+// (in init) and uses an atomic counter for subsequent calls — avoiding the
+// per-call syscall overhead of uuid.New().
 func generateID() string {
-	return uuid.New().String()
+	return fmt.Sprintf("%s-%016x", idPrefix, idSeq.Add(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +700,19 @@ func padOrTruncate(ids []int64, maxLen int) []int64 {
 	return padded
 }
 
+// pathUnescape decodes percent-encoded characters in a path.
+// It skips the url.PathUnescape allocation entirely when the path contains no '%',
+// which covers the vast majority of Windows file paths.
+func pathUnescape(p string) string {
+	if !strings.ContainsRune(p, '%') {
+		return p
+	}
+	if d, err := url.PathUnescape(p); err == nil {
+		return d
+	}
+	return p
+}
+
 func normalize(v []float32) {
 	var sum float64
 	for _, x := range v {
@@ -870,10 +906,7 @@ func (s *Engine) IndexPathsFTS(paths []string) {
 	}
 	defer stmt.Close()
 	for _, p := range paths {
-		decoded := p
-		if d, err := url.PathUnescape(p); err == nil {
-			decoded = d
-		}
+		decoded := pathUnescape(p)
 		if _, err := stmt.ExecContext(ctx, decoded, p); err != nil {
 			log.Printf("paths_fts insert warning: %v", err)
 		}
@@ -926,11 +959,7 @@ func (s *Engine) InitIndexTables() error {
 				for rows.Next() {
 					var p string
 					rows.Scan(&p)
-					decoded := p
-					if d, err := url.PathUnescape(p); err == nil {
-						decoded = d
-					}
-					stmt.ExecContext(ctx, decoded, p)
+					stmt.ExecContext(ctx, pathUnescape(p), p)
 				}
 				stmt.Close()
 				tx.Commit()
@@ -986,11 +1015,7 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes, ctimes, atimes []i
 		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i], ext, ctimes[i], atimes[i]); err != nil {
 			return err
 		}
-		decoded := paths[i]
-		if d, err := url.PathUnescape(paths[i]); err == nil {
-			decoded = d
-		}
-		if _, err := ftsStmt.ExecContext(ctx, decoded, paths[i]); err != nil {
+		if _, err := ftsStmt.ExecContext(ctx, pathUnescape(paths[i]), paths[i]); err != nil {
 			return err
 		}
 	}
@@ -1000,6 +1025,10 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes, ctimes, atimes []i
 // PruneStale removes index entries for paths that no longer exist on disk.
 // livePaths is the complete set of current paths from a directory walk.
 func (s *Engine) PruneStale(livePaths []string) error {
+	// Nothing to prune against — skip the full table scan.
+	if len(livePaths) == 0 {
+		return nil
+	}
 	liveSet := make(map[string]struct{}, len(livePaths))
 	for _, p := range livePaths {
 		liveSet[p] = struct{}{}
@@ -1029,6 +1058,34 @@ func (s *Engine) PruneStale(livePaths []string) error {
 		return nil
 	}
 	return s.DeletePaths(stale)
+}
+
+// MarkContentIndexed sets content_indexed=1 for the given paths without storing
+// any embedding. Used for files that were processed but yielded no extractable
+// content (binaries, unsupported formats, etc.) so they are never re-queued.
+func (s *Engine) MarkContentIndexed(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `UPDATE files SET content_indexed=1 WHERE path=?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, p := range paths {
+		if _, err := stmt.ExecContext(ctx, p); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // UnindexedFiles returns all files that have not yet been content-indexed, ordered
@@ -1444,11 +1501,7 @@ func (s *Engine) RenamePaths(oldPaths, newPaths []string) error {
 		}
 		// Update paths FTS5 (delete old, insert new)
 		tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", oldPath)
-		decoded := newPath
-		if d, err := url.PathUnescape(newPath); err == nil {
-			decoded = d
-		}
-		tx.ExecContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)", decoded, newPath)
+		tx.ExecContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)", pathUnescape(newPath), newPath)
 	}
 
 	return tx.Commit()

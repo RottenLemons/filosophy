@@ -341,7 +341,11 @@ func (d *Daemon) flush() {
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
 		fmt.Println("[FLUSH] indexing:", addPaths)
-		cfg := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
+		cfg, err := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
+		if err != nil {
+			log.Println("[FLUSH] NewProcessorConfig error:", err)
+			return
+		}
 
 		for _, path := range addPaths {
 			info, err := os.Stat(path)
@@ -356,6 +360,7 @@ func (d *Daemon) flush() {
 			}
 		}
 
+		cfg.Flush()
 		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
 		shared.DrainRemaining(cfg.Images, "image", d.sc)
 		cfg.CleanupTempDir()

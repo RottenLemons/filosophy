@@ -19,3 +19,9 @@ func fileExtraTimes(path string) (ctime, atime int64) {
 	}
 	return FileExtraTimesFromInfo(fi)
 }
+
+// IsOfflineFile checks if the file is a cloud-only placeholder or offline file.
+// On non-Windows platforms, this currently returns false.
+func IsOfflineFile(fi os.FileInfo) bool {
+	return false
+}

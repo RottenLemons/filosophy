@@ -33,7 +33,9 @@ import (
 //go:embed all:frontend/build
 var assets embed.FS
 
-var maxConcurrency = runtime.NumCPU()
+// Pass-2 file extraction (kreuzberg) is I/O-bound: 2×CPU keeps the pipeline
+// saturated while half the goroutines wait on disk reads.
+var maxConcurrency = runtime.NumCPU() * 2
 
 const daemonPidFile = "filosophy-daemon.pid"
 const appPidFile = "filosophy-app.pid"
@@ -94,6 +96,22 @@ func (a *App) getContentDirs() []string {
 	}
 	if len(dirs) == 0 {
 		dirs = []string{a.home}
+	}
+	// Append extra directories (manually added) from config.
+	for _, d := range a.config.GetExtraDirs() {
+		if !a.config.IsExcluded(d) {
+			dirs = append(dirs, d)
+		}
+	}
+	// Auto-detect mapped network drives and include them.
+	seen := make(map[string]bool)
+	for _, d := range dirs {
+		seen[strings.ToLower(d)] = true
+	}
+	for _, nd := range shared.NetworkDrives() {
+		if !seen[strings.ToLower(nd)] && !a.config.IsExcluded(nd) {
+			dirs = append(dirs, nd)
+		}
 	}
 	return dirs
 }
@@ -222,9 +240,15 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 				return nil
 			}
 			if info.IsDir() {
-				// Skip user-excluded subdirs (but not the root dir itself).
-				if path != dir && config != nil && config.IsExcluded(path) {
-					return filepath.SkipDir
+				if path != dir {
+					// Skip entire subtree for user-excluded dirs.
+					if config != nil && config.IsExcluded(path) {
+						return filepath.SkipDir
+					}
+					// Skip entire subtree for known-useless dir names.
+					if isContentSkippedDir(info.Name()) {
+						return filepath.SkipDir
+					}
 				}
 				shared.ProcessDirectory(path, cfg)
 				return nil
@@ -232,7 +256,7 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 			if isJunkFile(info.Name()) {
 				return nil
 			}
-			if isContentSkipped(path) {
+			if isContentSkippedPath(path) {
 				return nil
 			}
 			// Extract ctime/atime from the already-loaded FileInfo — no extra syscall.
@@ -390,6 +414,7 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 		close(doneChan)
 	}
 
+	cfg.Flush() // Execute any lingering batch images
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 	shared.DrainRemaining(cfg.Images, "image", sc)
 	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
@@ -436,25 +461,139 @@ func isJunkFile(name string) bool {
 	return junkExtensions[ext]
 }
 
-var contentSkipPrefixes = []string{
-	`\appdata\`,
-	`/appdata/`,
-	`\program files\`,
-	`/program files/`,
-	`\program files (x86)\`,
-	`/program files (x86)/`,
-	`\programdata\`,
-	`/programdata/`,
+// contentSkipDirNames is matched against the lowercased *directory name* (not full path).
+// When the walker enters a directory whose name is in this set, the entire subtree
+// is skipped with filepath.SkipDir — no files inside are ever stat'd or indexed.
+//
+// Rule of thumb for inclusion: would you ever semantic-search for content *inside*
+// this folder? If no, it belongs here.
+var contentSkipDirNames = map[string]bool{
+	// ── System / Windows ────────────────────────────────────────────────────
+	"appdata":        true, // roaming + local + locallow
+	"program files":  true,
+	"program files (x86)": true,
+	"programdata":    true,
+	"windows":        true,
+	"$windows.~bt":   true,
+	"$windows.~ws":   true,
+	"system volume information": true,
+	"$recycle.bin":   true,
+	"recovery":       true,
+
+	// ── Package / dependency caches ─────────────────────────────────────────
+	// Go
+	"pkg":            true, // catches go\pkg\mod — checked via path prefix below too
+	// Rust
+	".cargo":         true,
+	// Java / Kotlin
+	".m2":            true,
+	".gradle":        true,
+	// .NET
+	".nuget":         true,
+	// Python
+	"__pycache__":   true,
+	".venv":         true,
+	"venv":          true,
+	"env":           true,
+	".tox":          true,
+	"site-packages": true,
+	// Node
+	"node_modules": true,
+	// Ruby
+	".bundle": true,
+	"gems":    true,
+
+	// ── Version control internals ────────────────────────────────────────────
+	".git":           true,
+	".hg":            true,
+	".svn":           true,
+
+	// ── IDE / editor state ───────────────────────────────────────────────────
+	".vscode":        true,
+	".idea":          true,
+	".vs":            true,
+	".eclipse":       true,
+	".metadata":      true, // Eclipse workspace metadata
+	".settings":      true, // Eclipse project settings
+
+	// ── Build outputs ────────────────────────────────────────────────────────
+	"target":         true, // Rust / Maven / Gradle build output
+	"dist":           true, // JS/Python dist
+	"build":          true, // common build dir
+	"out":            true, // common output dir
+	"bin":            true, // compiled binaries
+	"obj":            true, // .NET intermediate objects
+	".next":         true, // Next.js build cache
+	".nuxt":         true,
+	".output":       true,
+	".cache":        true, // generic tool caches
+	".parcel-cache": true,
+
+	// ── Container / VM ───────────────────────────────────────────────────────
+	".docker":        true,
+	"virtualbox vms": true,
+	"virtual machines": true, // Hyper-V / VMware
+	"vmware":         true,
+
+	// ── Games (Documents sub-folders & top-level) ────────────────────────────
+	"my games":               true,
+	"electronic arts":        true,
+	"rockstar games":         true,
+	"activision":             true,
+	"ubisoft game launcher":  true,
+	"paradox interactive":    true,
+	"bethesda softworks":     true,
+	"2k games":               true,
+	"epic games":             true,
+	"steam":                  true, // Steam library (games data)
+	"steamapps":              true,
+	"riot games":             true,
+	"battlenet":              true,
+	"battle.net":             true,
+	"blizzard entertainment": true,
+	"square enix":            true,
+	"sega":                   true,
+	"cd projekt red":         true,
+
+	// ── Browser / app caches ─────────────────────────────────────────────────
+	"cache":          true,
+	"caches":         true,
+	"crashreports":   true,
+	"crashpad":       true,
+	"logs":           true,
+	"temp":           true,
+	"tmp":            true,
+	"thumbnailcache": true,
+
+	// ── Media libraries (large files, not text-searchable content) ───────────
+	"music":          true,
+	"videos":         true,
+	"movies":         true,
+	"tv shows":       true,
+
+	// ── Misc tool dirs ───────────────────────────────────────────────────────
+	".android": true, // Android SDK AVDs
+	"android":  true,
+	".ssh":           true, // private keys — never index
+	".gnupg":         true, // GPG keys
+	".aws":           true, // credentials
+	".azure":         true,
+	".kube":          true, // kubeconfig
 }
 
-func isContentSkipped(path string) bool {
+// isContentSkippedDir returns true if this directory should be entirely skipped.
+// Called with info.IsDir() == true; returns filepath.SkipDir when true.
+func isContentSkippedDir(name string) bool {
+	return contentSkipDirNames[strings.ToLower(name)]
+}
+
+// isContentSkippedPath returns true for files whose full path contains a
+// system-level prefix that should never be content-indexed (belt-and-suspenders
+// for paths that enter via a symlink or unusual root).
+func isContentSkippedPath(path string) bool {
 	lower := strings.ToLower(path)
-	for _, prefix := range contentSkipPrefixes {
-		if strings.Contains(lower, prefix) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(lower, `\go\pkg\mod\`) ||
+		strings.Contains(lower, `/go/pkg/mod/`)
 }
 
 func availableDrives() []string {
@@ -472,46 +611,52 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 	if sc == nil {
 		return
 	}
-	log.Println("[sysindex] Starting system-wide path index...")
+	drives := availableDrives()
+	log.Printf("[sysindex] Starting system-wide path index across %d drive(s)...", len(drives))
+
+	// Walk each drive in parallel. Each goroutine accumulates its own batch
+	// so there is no cross-goroutine contention on the slice until flush.
 	const batchSize = 2000
-	batch := make([]string, 0, batchSize)
-
-	flush := func() {
-		if len(batch) > 0 {
-			sc.IndexPathsFTS(batch)
-			batch = batch[:0]
-		}
-	}
-
-	for _, root := range availableDrives() {
-		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
+	var wg sync.WaitGroup
+	for _, root := range drives {
+		wg.Add(1)
+		go func(root string) {
+			defer wg.Done()
+			batch := make([]string, 0, batchSize)
+			flush := func() {
+				if len(batch) > 0 {
+					sc.IndexPathsFTS(batch)
+					batch = batch[:0]
+				}
 			}
-			if ctx != nil {
+			filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return nil
+				}
 				select {
 				case <-ctx.Done():
 					return filepath.SkipAll
 				default:
 				}
-			}
-			if info.IsDir() {
-				if systemPathSkipDirs[strings.ToLower(info.Name())] {
-					return filepath.SkipDir
+				if info.IsDir() {
+					if systemPathSkipDirs[strings.ToLower(info.Name())] {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if isJunkFile(info.Name()) {
+					return nil
+				}
+				batch = append(batch, path)
+				if len(batch) >= batchSize {
+					flush()
 				}
 				return nil
-			}
-			if isJunkFile(info.Name()) {
-				return nil
-			}
-			batch = append(batch, path)
-			if len(batch) >= batchSize {
-				flush()
-			}
-			return nil
-		})
+			})
+			flush()
+		}(root)
 	}
-	flush()
+	wg.Wait()
 	log.Println("[sysindex] System-wide path index complete.")
 }
 
@@ -787,6 +932,19 @@ func (a *App) GetHomeFolders() []FolderState {
 		p := filepath.Join(a.home, name)
 		result = append(result, a.makeFolderState(name, p))
 	}
+	// Append manually added extra directories.
+	seen := make(map[string]bool)
+	for _, d := range a.config.GetExtraDirs() {
+		name := filepath.Base(d)
+		result = append(result, a.makeFolderState(name+" (extra)", d))
+		seen[strings.ToLower(d)] = true
+	}
+	// Auto-detected network drives.
+	for _, nd := range shared.NetworkDrives() {
+		if !seen[strings.ToLower(nd)] {
+			result = append(result, a.makeFolderState(nd+" (network)", nd))
+		}
+	}
 	return result
 }
 
@@ -866,6 +1024,58 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	}()
 
 	return nil
+}
+
+// AddExtraDirectory adds an arbitrary directory path (e.g. a network drive)
+// to the set of content-indexed directories. It triggers indexing immediately.
+func (a *App) AddExtraDirectory(dirPath string) error {
+	if a.engine == nil {
+		return fmt.Errorf("backend engine not initialized")
+	}
+	// Validate the directory exists and is accessible.
+	info, err := os.Stat(dirPath)
+	if err != nil {
+		return fmt.Errorf("cannot access directory: %v", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", dirPath)
+	}
+	if !a.config.AddExtraDir(dirPath) {
+		return nil // already present
+	}
+	if err := a.config.Save(); err != nil {
+		return err
+	}
+	log.Printf("Added extra directory: %s", dirPath)
+
+	// Trigger indexing for the newly added directory.
+	return a.SetFolderIndexed(dirPath, true)
+}
+
+// RemoveExtraDirectory removes an extra directory from indexing.
+func (a *App) RemoveExtraDirectory(dirPath string) error {
+	if !a.config.RemoveExtraDir(dirPath) {
+		return nil // wasn't present
+	}
+	if err := a.config.Save(); err != nil {
+		return err
+	}
+	log.Printf("Removed extra directory: %s", dirPath)
+	// Restart daemon so it stops watching the removed directory.
+	stopDaemonProcess(a.cwd)
+	launchDaemon(a.cwd)
+	return nil
+}
+
+// BrowseForDirectory opens a native folder picker dialog and returns the selected path.
+func (a *App) BrowseForDirectory() (string, error) {
+	result, err := wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
+		Title: "Select a directory to index",
+	})
+	if err != nil {
+		return "", err
+	}
+	return result, nil
 }
 
 func (a *App) CheckSystemGPU() bool {

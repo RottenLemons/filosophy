@@ -6,12 +6,11 @@ require (
 	github.com/cespare/xxhash v1.1.0
 	github.com/daulet/tokenizers v1.25.0
 	github.com/getlantern/systray v1.2.2
-	github.com/google/uuid v1.6.0
 	github.com/kreuzberg-dev/kreuzberg/packages/go/v4 v4.3.8
 	github.com/liliang-cn/sqvect/v2 v2.7.0
 	github.com/syncthing/notify v0.0.0-20250528144937-c7027d4f7465
 	github.com/tmc/langchaingo v0.1.14
-	github.com/wailsapp/wails/v2 v2.11.0
+	github.com/wailsapp/wails/v2 v2.12.0
 	github.com/yalue/onnxruntime_go v1.26.0
 	golang.org/x/image v0.36.0
 	golang.org/x/sys v0.42.0
@@ -20,6 +19,7 @@ require (
 )
 
 require (
+	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -32,6 +32,7 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
 	github.com/labstack/echo/v4 v4.13.3 // indirect

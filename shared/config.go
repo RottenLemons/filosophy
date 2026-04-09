@@ -11,6 +11,7 @@ import (
 
 type AppConfig struct {
 	ExcludedPaths   []string `json:"ExcludedPaths"`
+	ExtraDirs       []string `json:"ExtraDirs,omitempty"`
 	GPUEnabled      bool     `json:"GPUEnabled"`
 	path            string
 	mu              sync.RWMutex
@@ -123,4 +124,41 @@ func (c *AppConfig) SetExcluded(path string, excluded bool) {
 		c.ExcludedPaths = newPaths
 	}
 	c.rebuildCacheLocked()
+}
+
+// GetExtraDirs returns a copy of the extra directories list.
+func (c *AppConfig) GetExtraDirs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, len(c.ExtraDirs))
+	copy(out, c.ExtraDirs)
+	return out
+}
+
+// AddExtraDir adds an arbitrary directory (e.g. network drive) to watch/index.
+func (c *AppConfig) AddExtraDir(dir string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lower := strings.ToLower(dir)
+	for _, d := range c.ExtraDirs {
+		if strings.ToLower(d) == lower {
+			return false // already exists
+		}
+	}
+	c.ExtraDirs = append(c.ExtraDirs, dir)
+	return true
+}
+
+// RemoveExtraDir removes an extra directory by path.
+func (c *AppConfig) RemoveExtraDir(dir string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lower := strings.ToLower(dir)
+	for i, d := range c.ExtraDirs {
+		if strings.ToLower(d) == lower {
+			c.ExtraDirs = append(c.ExtraDirs[:i], c.ExtraDirs[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
