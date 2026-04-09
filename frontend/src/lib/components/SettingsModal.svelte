@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
   import { fade, slide, fly } from 'svelte/transition';
-  import { X, Folder, Cpu, Settings } from 'lucide-svelte';
+  import { X, Folder, Cpu, Settings, Activity } from 'lucide-svelte';
   import { themeStore } from '../../stores/theme';
+  import { indexingStatus, initIndexerStore } from '../../stores/indexer';
   import { CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration } from '$lib/wailsjs/go/main/App';
   import Indexer from './Indexer.svelte';
 
@@ -15,6 +16,7 @@
   let loading = true;
 
   onMount(async () => {
+    initIndexerStore();
     try {
       hasGPU = await CheckSystemGPU();
       gpuAcceleration = await GetGPUAcceleration();
@@ -57,7 +59,7 @@
     on:click|self={close}
   >
     <div 
-      class="w-full max-w-4xl h-[600px] bg-[#FAF9F6] dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-2xl flex overflow-hidden rounded-lg"
+      class="w-full max-w-4xl h-[640px] bg-[#FAF9F6] dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-2xl flex overflow-hidden rounded-lg"
       transition:fly={{ y: 20, duration: 400, opacity: 0 }}
     >
       <!-- Sidebar Navigation -->
@@ -91,7 +93,26 @@
           </button>
         </nav>
 
-        <div class="p-6 border-t border-gray-100 dark:border-[#1a1a1a]">
+        <!-- Sidebar Footer Status -->
+        <div class="p-6 space-y-4 border-t border-gray-100 dark:border-[#1a1a1a]">
+          {#if $indexingStatus.isIndexing}
+            <div class="space-y-2" transition:slide>
+              <div class="flex items-center justify-between text-[9px] font-bold uppercase tracking-wider text-blue-600 dark:text-blue-400">
+                <div class="flex items-center gap-1.5">
+                  <Activity class="w-3 h-3 animate-pulse" />
+                  <span>Indexing</span>
+                </div>
+                <span>{Math.round($indexingStatus.progress)}%</span>
+              </div>
+              <div class="h-1 w-full bg-gray-200 dark:bg-[#222] rounded-full overflow-hidden">
+                <div class="h-full bg-blue-500 transition-all duration-300" style="width: {$indexingStatus.progress}%"></div>
+              </div>
+              <div class="text-[8px] text-gray-400 dark:text-gray-500 font-medium truncate">
+                {$indexingStatus.statusMessage}
+              </div>
+            </div>
+          {/if}
+          
           <div class="flex items-center gap-2 text-[9px] font-medium text-gray-400 uppercase tracking-widest">
             <Settings class="w-3 h-3" />
             <span>v1.2.0 Stable</span>
@@ -117,15 +138,15 @@
         <!-- Body -->
         <div class="flex-1 overflow-y-auto p-10 scrollbar-custom">
           {#if activeTab === 'folders'}
-            <div in:fade={{ duration: 200 }}>
-              <div class="mb-8">
+            <div in:fade={{ duration: 200 }} class="flex flex-col h-full">
+              <div class="mb-6 shrink-0">
                 <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-2">Content Libraries</h4>
                 <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
                   Select the directories you want Filosophy to monitor. Folders are recursively indexed for semantic search and metadata extraction.
                 </p>
               </div>
-              <div class="bg-gray-50 dark:bg-[#0a0a0a] rounded-lg border border-gray-100 dark:border-[#1a1a1a] p-1">
-                <Indexer />
+              <div class="flex-1 min-h-0 bg-gray-50/50 dark:bg-[#0a0a0a] rounded-xl border border-gray-100 dark:border-[#1a1a1a] overflow-hidden p-6">
+                <Indexer flat={true} />
               </div>
             </div>
           {:else if activeTab === 'hardware'}
@@ -162,6 +183,7 @@
                   <button 
                     on:click={toggleGPU}
                     disabled={!hasGPU || loading}
+                    aria-label="Toggle GPU Acceleration"
                     class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed
                            {gpuAcceleration ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
                   >

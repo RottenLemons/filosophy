@@ -6,11 +6,9 @@
   import { indexingStatus } from '../../stores/indexer';
   import FolderNode from './FolderNode.svelte';
 
-  /** @typedef {{ Name: string, Path: string, Indexed: boolean, HasChildren: boolean }} FolderState */
-
   export let flat = false;
 
-  /** @type {FolderState[]} */
+  /** @type {any[]} */
   let folders = [];
   let isOpen = false;
   let searchTerm = "";
