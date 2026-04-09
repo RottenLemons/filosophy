@@ -67,20 +67,21 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	if sc == nil || len(items) == 0 {
 		return
 	}
-	contents := make([]string, 0, len(items))
-	paths := make([]string, 0, len(items))
-	for _, item := range items {
-		contents = append(contents, item.Content)
-		paths = append(paths, item.Path)
+	contents := make([]string, len(items))
+	paths := make([]string, len(items))
+	for i, item := range items {
+		contents[i] = item.Content
+		paths[i] = item.Path
 	}
 
-	// Collect file-level metadata for dedup (skip empty-hash sentinel entries).
-	var filePaths []string
-	var fileHashes []int64
-	var fileMtimes []int64
-	var fileSizes []int64
-	var fileCtimes []int64
-	var fileAtimes []int64
+	// Pre-allocate metadata slices based on item count
+	filePaths := make([]string, 0, len(items))
+	fileHashes := make([]int64, 0, len(items))
+	fileMtimes := make([]int64, 0, len(items))
+	fileSizes := make([]int64, 0, len(items))
+	fileCtimes := make([]int64, 0, len(items))
+	fileAtimes := make([]int64, 0, len(items))
+
 	for _, item := range items {
 		if item.Hash == empty {
 			continue
@@ -116,43 +117,57 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 }
 
 // HandleChunk adds metadata to a channel and flushes when full.
-func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size, ctime, atime int64, mu *sync.Mutex) {
+// Contention issue fixed: Mutex removed from hot path as channels are natively thread-safe.
+// Flushing now uses a non-blocking select to drain efficiently.
+func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, hash, mtime, size, ctime, atime int64) {
 	if sc == nil {
 		return
 	}
-	mu.Lock()
+	
+	item := Metadata{content, path, hash, mtime, size, ctime, atime}
+	
 	select {
-	case chunks <- Metadata{content, path, hash, mtime, size, ctime, atime}:
-		mu.Unlock()
+	case chunks <- item:
+		// Queued successfully
 	default:
-		var items []Metadata
-		for j := 0; j < cap(chunks); j++ {
+		// Channel is full, drain and flush
+		items := make([]Metadata, 0, cap(chunks))
+		done := false
+		for !done {
 			select {
 			case tmp := <-chunks:
 				items = append(items, tmp)
 			default:
+				done = true
 			}
 		}
-		chunks <- Metadata{content, path, hash, mtime, size, ctime, atime}
-		mu.Unlock()
+		
+		// Attempt to queue the current item again or just include it in batch
+		if len(items) < cap(chunks) {
+			items = append(items, item)
+		} else {
+			// Extremely rare: channel refilled while we were draining. 
+			// Process separately.
+			IndexBatch([]Metadata{item}, mode, sc)
+		}
 
-		// Run batch indexing outside the Mutex! This permits the other N worker threads
-		// to continue extracting PDFs and resizing images into the now-empty chunks channel
-		// concurrently while the ONNX Engine performs the heavy inference pipeline.
-		IndexBatch(items, mode, sc)
-		// Yield after releasing the HNSW write lock so search goroutines can acquire
-		// RLock between consecutive batch flushes. Without this, back-to-back flushes
-		// from competing goroutines starve search (RLock blocks when writers are queued).
+		// Run batch indexing outside any locks
+		if len(items) > 0 {
+			IndexBatch(items, mode, sc)
+		}
 		runtime.Gosched()
 	}
 }
+
+// Global cache for files that failed thumbnailing to avoid process-spawn loops
+var failedThumbnails sync.Map
 
 // DrainRemaining drains all remaining items from a channel and indexes them.
 func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
 	if sc == nil || len(chunks) == 0 {
 		return
 	}
-	var items []Metadata
+	items := make([]Metadata, 0, len(chunks))
 	for len(chunks) > 0 {
 		items = append(items, <-chunks)
 	}
@@ -170,24 +185,34 @@ type ProcessorConfig struct {
 }
 
 // ProcessImage converts an image to JPEG via vips and queues it for indexing.
-// Hash is derived from mtime^size to avoid reading the full file just for dedup
-// (avoids a redundant full-file os.ReadFile that was previously discarded immediately).
 func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
-	hash := mtime ^ size
 
-	// Convert to JPEG via vips (handles all formats: HEIC, AVIF, WebP, etc.)
-	outPath := filepath.Join(cfg.TempDir, fmt.Sprintf("%d.jpg", hash))
-	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256x256!", "-o", outPath+"[Q=80,strip]")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("vipsthumbnail failed for %s: %v\n%s", path, err, string(output))
+	// Check if this path previously failed to avoid redundant process spawning
+	if _, failed := failedThumbnails.Load(path); failed {
 		return
 	}
 
-	// Content = converted JPEG path for CLIP, Path = original path for metadata.
-	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, ctime, atime, cfg.Mu)
+	hash := mtime ^ size
+	outPath := filepath.Join(cfg.TempDir, fmt.Sprintf("%d.jpg", hash))
+	
+	// Skip if already converted (mtime/size match)
+	if _, err := os.Stat(outPath); err == nil {
+		HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, ctime, atime)
+		return
+	}
+
+	cmd := exec.Command(vipsThumbnailPath(), path, "-s", "256x256!", "-o", outPath+"[Q=80,strip]")
+	if err := cmd.Run(); err != nil {
+		log.Printf("vipsthumbnail failed for %s: %v", path, err)
+		failedThumbnails.Store(path, true)
+		return
+	}
+
+
+	HandleChunk(cfg.Images, cfg.Engine, "image", outPath, path, hash, mtime, size, ctime, atime)
 }
 
 // ProcessText extracts text from a file and adds chunks to the channel.
@@ -197,7 +222,7 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 	}
 	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result == nil || result.Content == "" {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
 		return
 	}
 	hash := int64(xxhash.Sum64String(result.Content))
@@ -210,31 +235,26 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 	first := true
 	for _, chunk := range splits {
 		if first {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, ctime, atime, cfg.Mu)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, ctime, atime)
 			first = false
 		} else {
-			// Subsequent chunks share the same file path but carry no file-level metadata
-			// (hash=empty signals IndexBatch to skip the files-table upsert for these rows).
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, 0, 0, cfg.Mu)
+			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, 0, 0)
 		}
 	}
 }
 
 // ProcessFile processes a single file (image or text) based on its type.
-// A single os.Stat call provides mtime, size, ctime, and atime — eliminating
-// the redundant fileExtraTimes syscalls that previously occurred downstream.
 func ProcessFile(path string, cfg *ProcessorConfig) {
 	if cfg == nil {
 		return
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		log.Println("Failed to stat file:", err)
 		return
 	}
 	mtime := info.ModTime().UnixNano()
 	size := info.Size()
-	ctime, atime := FileExtraTimesFromInfo(info) // no extra syscall
+	ctime, atime := FileExtraTimesFromInfo(info)
 	if IsImageFile(path) {
 		ProcessImage(path, mtime, size, ctime, atime, cfg)
 	} else {
@@ -247,8 +267,9 @@ func ProcessDirectory(path string, cfg *ProcessorConfig) {
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
-	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, 0, 0, cfg.Mu)
+	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, 0, 0)
 }
+
 
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
