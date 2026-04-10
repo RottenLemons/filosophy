@@ -13,10 +13,13 @@ type AppConfig struct {
 	ExcludedPaths   []string `json:"ExcludedPaths"`
 	ExtraDirs       []string `json:"ExtraDirs,omitempty"`
 	GPUEnabled      bool     `json:"GPUEnabled"`
+	HasGPU          bool     `json:"HasGPU"`
+	HasCheckedGPU   bool     `json:"HasCheckedGPU"`
 	path            string
 	mu              sync.RWMutex
 	normalizedPaths []string `json:"-"`
 }
+
 
 func (c *AppConfig) rebuildCacheLocked() {
 	c.normalizedPaths = make([]string, len(c.ExcludedPaths))
@@ -35,8 +38,10 @@ func LoadConfig(dir string) *AppConfig {
 	oldPath := filepath.Join(dir, "filosophy_excluded.json")
 	
 	config := &AppConfig{
-		ExcludedPaths: []string{},
+		ExcludedPaths: []string{".git", "node_modules", "anaconda3", "miniconda3"},
 		GPUEnabled:    false,
+		HasGPU:        false,
+		HasCheckedGPU: false,
 		path:         path,
 	}
 
@@ -47,7 +52,7 @@ func LoadConfig(dir string) *AppConfig {
 		// Migration path
 		var paths []string
 		json.Unmarshal(oldData, &paths)
-		config.ExcludedPaths = paths
+		config.ExcludedPaths = append(config.ExcludedPaths, paths...)
 		config.Save()
 		os.Remove(oldPath) // Cleanup old file
 	}
@@ -55,6 +60,7 @@ func LoadConfig(dir string) *AppConfig {
 	config.rebuildCacheLocked()
 	return config
 }
+
 
 func (c *AppConfig) Save() error {
 	c.mu.Lock()

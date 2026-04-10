@@ -493,52 +493,64 @@ func (s *Engine) embedClipText(texts []string) ([][]float32, error) {
 		return nil, nil
 	}
 
+	const batchSize = 16
 	result := make([][]float32, len(texts))
-	for i, text := range texts {
-		ids, _ := s.clipTok.Encode(text, true)
 
-		ids64 := uint32ToInt64(ids)
-		if len(ids64) > clipCtxLen {
-			ids64 = ids64[:clipCtxLen]
-		}
-		// CLIP positional embeddings have a fixed size of clipCtxLen (77).
-		// The Add node requires input_ids to match that length exactly — pad with zeros.
-		if len(ids64) < clipCtxLen {
-			padded := make([]int64, clipCtxLen)
-			copy(padded, ids64)
-			ids64 = padded
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
 		}
 
-		inputIDs, err := ort.NewTensor(ort.NewShape(1, clipCtxLen), ids64)
+		currentBatchTexts := texts[i:end]
+		numTexts := len(currentBatchTexts)
+		allIDs := make([]int64, int(numTexts)*clipCtxLen)
+
+		for j, text := range currentBatchTexts {
+			ids, _ := s.clipTok.Encode(text, true)
+			ids64 := uint32ToInt64(ids)
+			if len(ids64) > clipCtxLen {
+				ids64 = ids64[:clipCtxLen]
+			}
+			// Copy ids into the flattened batch buffer at the correct offset
+			copy(allIDs[j*clipCtxLen:], ids64)
+		}
+
+		inputIDs, err := ort.NewTensor(ort.NewShape(int64(numTexts), clipCtxLen), allIDs)
 		if err != nil {
-			return nil, fmt.Errorf("clip text input_ids tensor: %w", err)
+			return nil, fmt.Errorf("clip text batch input_ids tensor: %w", err)
 		}
 
-		outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(1, clipEmbedDim))
+		outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(int64(numTexts), clipEmbedDim))
 		if err != nil {
 			inputIDs.Destroy()
-			return nil, fmt.Errorf("clip text output tensor: %w", err)
+			return nil, fmt.Errorf("clip text batch output tensor: %w", err)
 		}
 
-		err = s.clipTextSession.Run(
+		if err := s.clipTextSession.Run(
 			[]ort.Value{inputIDs},
 			[]ort.Value{outTensor},
-		)
-		data := outTensor.GetData()
-		outTensor.Destroy()
-		inputIDs.Destroy()
-
-		if err != nil {
-			return nil, fmt.Errorf("clip text inference failed: %w", err)
+		); err != nil {
+			outTensor.Destroy()
+			inputIDs.Destroy()
+			return nil, fmt.Errorf("clip text batch inference failed: %w", err)
 		}
 
-		emb := make([]float32, imageEmbedDim)
-		copy(emb, data[:imageEmbedDim])
-		normalize(emb)
-		result[i] = emb
+		data := outTensor.GetData()
+		for j := 0; j < numTexts; j++ {
+			emb := make([]float32, imageEmbedDim)
+			offset := j * clipEmbedDim
+			copy(emb, data[offset:offset+imageEmbedDim])
+			normalize(emb)
+			result[i+j] = emb
+		}
+
+		outTensor.Destroy()
+		inputIDs.Destroy()
 	}
 	return result, nil
 }
+
 
 // embedImage generates image embeddings in a single batched inference call.
 // Images are loaded, resized to 256x256, CLIP-normalized, and concatenated
@@ -548,39 +560,50 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		return nil, nil
 	}
 
+	const batchSize = 16
 	pixelsPerImage := 3 * visionSize * visionSize
-	// Preprocess all images; track which ones failed
-	validIndices := make([]int, 0, len(imagePaths))
-	allPixels := make([]float32, 0, len(imagePaths)*pixelsPerImage)
 	result := make([][]float32, len(imagePaths))
+	
+	// Pre-initialize result with zero vectors in case of failures
+	for i := range result {
+		result[i] = make([]float32, imageEmbedDim)
+	}
 
-	for i, imgPath := range imagePaths {
-		pixels, err := loadAndPreprocess(imgPath)
-		if err != nil {
-			log.Printf("image preprocess %s: %v", imgPath, err)
-			result[i] = make([]float32, imageEmbedDim) // zero vector
+	for i := 0; i < len(imagePaths); i += batchSize {
+		end := i + batchSize
+		if end > len(imagePaths) {
+			end = len(imagePaths)
+		}
+
+		currentBatchPaths := imagePaths[i:end]
+		validIndicesInBatch := make([]int, 0, len(currentBatchPaths))
+		batchPixels := make([]float32, 0, len(currentBatchPaths)*pixelsPerImage)
+
+		for j, imgPath := range currentBatchPaths {
+			pixels, err := loadAndPreprocess(imgPath)
+			if err != nil {
+				log.Printf("image preprocess %s: %v", imgPath, err)
+				continue
+			}
+			validIndicesInBatch = append(validIndicesInBatch, j)
+			batchPixels = append(batchPixels, pixels...)
+		}
+
+		if len(validIndicesInBatch) == 0 {
 			continue
 		}
-		validIndices = append(validIndices, i)
-		allPixels = append(allPixels, pixels...)
-	}
 
-	if len(validIndices) == 0 {
-		return result, nil
-	}
-
-	for j, idx := range validIndices {
-		singlePixels := allPixels[j*pixelsPerImage : (j+1)*pixelsPerImage]
+		numValid := int64(len(validIndicesInBatch))
 		inputTensor, err := ort.NewTensor(
-			ort.NewShape(1, 3, int64(visionSize), int64(visionSize)), singlePixels)
+			ort.NewShape(numValid, 3, int64(visionSize), int64(visionSize)), batchPixels)
 		if err != nil {
-			return nil, fmt.Errorf("vision input tensor error on img %d: %w", j, err)
+			return nil, fmt.Errorf("vision batch input tensor error: %w", err)
 		}
 
-		outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(clipEmbedDim)))
+		outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(numValid, int64(clipEmbedDim)))
 		if err != nil {
 			inputTensor.Destroy()
-			return nil, fmt.Errorf("vision output tensor error on img %d: %w", j, err)
+			return nil, fmt.Errorf("vision batch output tensor error: %w", err)
 		}
 
 		if err := s.clipVisionSession.Run(
@@ -589,14 +612,17 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 		); err != nil {
 			outTensor.Destroy()
 			inputTensor.Destroy()
-			return nil, fmt.Errorf("vision inference failed on img %d: %w", j, err)
+			return nil, fmt.Errorf("vision batch inference failed: %w", err)
 		}
 
 		data := outTensor.GetData()
-		emb := make([]float32, imageEmbedDim)
-		copy(emb, data[:imageEmbedDim])
-		normalize(emb)
-		result[idx] = emb
+		for batchIdx, originalIdx := range validIndicesInBatch {
+			emb := make([]float32, imageEmbedDim)
+			offset := batchIdx * clipEmbedDim
+			copy(emb, data[offset:offset+imageEmbedDim])
+			normalize(emb)
+			result[i+originalIdx] = emb
+		}
 
 		outTensor.Destroy()
 		inputTensor.Destroy()
@@ -604,6 +630,7 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 
 	return result, nil
 }
+
 
 // ---------------------------------------------------------------------------
 // Image preprocessing

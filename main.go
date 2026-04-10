@@ -6,6 +6,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -228,7 +229,7 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	// Single walk: collect file metadata AND queue directories simultaneously.
 	// Previously two separate walks were made over the same tree, doubling syscall count.
 	for _, dir := range dirs {
-		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if ctx != nil {
 				select {
 				case <-ctx.Done():
@@ -239,27 +240,32 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 			if err != nil {
 				return nil
 			}
-			if info.IsDir() {
+			if d.IsDir() {
 				if path != dir {
 					// Skip entire subtree for user-excluded dirs.
 					if config != nil && config.IsExcluded(path) {
 						return filepath.SkipDir
 					}
 					// Skip entire subtree for known-useless dir names.
-					if isContentSkippedDir(info.Name()) {
+					if isContentSkippedDir(d.Name()) {
 						return filepath.SkipDir
 					}
 				}
 				shared.ProcessDirectory(path, cfg)
 				return nil
 			}
-			if isJunkFile(info.Name()) {
+			if isJunkFile(d.Name()) {
 				return nil
 			}
 			if isContentSkippedPath(path) {
 				return nil
 			}
-			// Extract ctime/atime from the already-loaded FileInfo — no extra syscall.
+			// Extract ctime/atime from info — WalkDir doesn't provide it by default,
+			// but we need it for metadata indexing. Stat is required here.
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
 			ct, at := shared.FileExtraTimesFromInfo(info)
 			paths = append(paths, path)
 			mtimes = append(mtimes, info.ModTime().UnixNano())
@@ -268,6 +274,7 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 			atimes = append(atimes, at)
 			return nil
 		})
+
 		if ctx != nil && ctx.Err() != nil {
 			return
 		}
@@ -629,7 +636,7 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 					batch = batch[:0]
 				}
 			}
-			filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return nil
 				}
@@ -638,13 +645,13 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 					return filepath.SkipAll
 				default:
 				}
-				if info.IsDir() {
-					if systemPathSkipDirs[strings.ToLower(info.Name())] {
+				if d.IsDir() {
+					if systemPathSkipDirs[strings.ToLower(d.Name())] {
 						return filepath.SkipDir
 					}
 					return nil
 				}
-				if isJunkFile(info.Name()) {
+				if isJunkFile(d.Name()) {
 					return nil
 				}
 				batch = append(batch, path)
@@ -657,6 +664,27 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 		}(root)
 	}
 	wg.Wait()
+=======
+			}
+			if d.IsDir() {
+				if systemPathSkipDirs[strings.ToLower(d.Name())] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isJunkFile(d.Name()) {
+				return nil
+			}
+			batch = append(batch, path)
+			if len(batch) >= batchSize {
+				flush()
+			}
+			return nil
+		})
+	}
+
+	flush()
+>>>>>>> bbb40eff8e0f9fabd3aeb35413ffe325ebbbcf51
 	log.Println("[sysindex] System-wide path index complete.")
 }
 
@@ -714,26 +742,35 @@ func (a *App) startup(ctx context.Context) {
 	a.home = home
 
 	a.config = shared.LoadConfig(cwd)
-	go func() {
-		// Asynchronous GPU detection with hidden window to avoid terminal flashing
-		cmd := exec.Command("nvidia-smi", "-L")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		if err := cmd.Run(); err == nil {
-			a.hasGPU.Store(true)
-			return
-		}
-
-		out, err := exec.Command("wmic", "path", "Win32_VideoController", "get", "Name").Output()
-		if err == nil {
-			lower := strings.ToLower(string(out))
-			for _, kw := range []string{"nvidia", "amd", "radeon", "geforce", "quadro", "arc "} {
-				if strings.Contains(lower, kw) {
-					a.hasGPU.Store(true)
-					return
+	if a.config.HasCheckedGPU {
+		a.hasGPU.Store(a.config.HasGPU)
+	} else {
+		go func() {
+			// Asynchronous GPU detection with hidden window to avoid terminal flashing
+			cmd := exec.Command("nvidia-smi", "-L")
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			hasGPU := false
+			if err := cmd.Run(); err == nil {
+				hasGPU = true
+			} else {
+				out, err := exec.Command("wmic", "path", "Win32_VideoController", "get", "Name").Output()
+				if err == nil {
+					lower := strings.ToLower(string(out))
+					for _, kw := range []string{"nvidia", "amd", "radeon", "geforce", "quadro", "arc "} {
+						if strings.Contains(lower, kw) {
+							hasGPU = true
+							break
+						}
+					}
 				}
 			}
-		}
-	}()
+			a.hasGPU.Store(hasGPU)
+			a.config.HasGPU = hasGPU
+			a.config.HasCheckedGPU = true
+			a.config.Save()
+		}()
+	}
+
 
 	log.Println("[Boot 3] Initializing logger...")
 
