@@ -22,14 +22,15 @@ import (
 	"syscall"
 	"time"
 
+	"filosophy/daemon"
 	"filosophy/shared"
 
+	"github.com/getlantern/systray"
 	"github.com/syncthing/notify"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
-	"golang.org/x/sys/windows"
 )
 
 //go:embed all:frontend/build
@@ -40,7 +41,6 @@ var assets embed.FS
 var maxConcurrency = runtime.NumCPU() * 2
 var imageBatchSize = 100 // Defaults, adapted at startup
 
-const daemonPidFile = "filosophy-daemon.pid"
 const appPidFile = "filosophy-app.pid"
 
 // FolderState describes a directory and whether it is content-indexed.
@@ -140,74 +140,7 @@ func (a *App) makeFolderState(name, path string) FolderState {
 	}
 }
 
-// isDaemonRunning checks whether a previously launched daemon process is still alive.
-func isDaemonRunning(cwd string) bool {
-	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return false
-	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
-	if err != nil {
-		return false
-	}
-	defer windows.CloseHandle(h)
-	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil {
-		return false
-	}
-	return code == 259 // STILL_ACTIVE
-}
 
-// stopDaemonProcess kills the daemon process recorded in the PID file.
-func stopDaemonProcess(cwd string) {
-	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
-	if err != nil {
-		return
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return
-	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		proc.Kill()
-	}
-	os.Remove(filepath.Join(cwd, daemonPidFile))
-}
-
-// launchDaemon starts filosophy-daemon.exe as a detached process.
-func launchDaemon(cwd string) {
-	if isDaemonRunning(cwd) {
-		log.Println("daemon already running, skipping launch")
-		return
-	}
-
-	exe, _ := os.Executable()
-	daemonExe := filepath.Join(filepath.Dir(exe), "filosophy-daemon.exe")
-	if _, err := os.Stat(daemonExe); err != nil {
-		daemonExe = ""
-	}
-
-	var cmd *exec.Cmd
-	if daemonExe != "" {
-		cmd = exec.Command(daemonExe)
-	} else {
-		cmd = exec.Command("go", "run", "./cmd/daemon")
-	}
-	cmd.Dir = cwd
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("failed to launch daemon: %v", err)
-		return
-	}
-	log.Printf("daemon launched (pid %d)", cmd.Process.Pid)
-	cmd.Process.Release()
-}
 
 func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
@@ -691,6 +624,7 @@ type App struct {
 	home          string
 	homeWatchStop chan struct{}
 	mu            sync.Mutex
+	daemon        *daemon.Daemon
 }
 
 func NewApp() *App {
@@ -846,18 +780,24 @@ func (a *App) startup(ctx context.Context) {
 			log.Println("[Boot 8] Running background metadata sync...")
 			// runPass1 checks for new/deleted files (Metadata)
 			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+			
+			// Deterministically block until pass 1 metadata has landed on disk
+			a.engine.Flush()
+
 			// runPass2 processes any unindexed content (Semantic)
 			a.runPass2(idxCtx, a.engine)
 			
-			log.Println("[Boot 9] Initial sync complete. Launching daemon...")
-			launchDaemon(cwd)
+			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon...")
+			a.daemon = daemon.NewDaemon(dirs, a.engine)
+			a.daemon.Start()
 			go runSystemPathIndex(idxCtx, a.engine)
 		}()
 	} else {
 		// Even if engine is nil, launch daemon if it's not a fresh install (best effort)
 		if !dbMissing {
 			log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
-			launchDaemon(cwd)
+			a.daemon = daemon.NewDaemon(dirs, a.engine)
+			a.daemon.Start()
 		}
 	}
 
@@ -929,6 +869,9 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 	if a.indexerCancel != nil {
 		a.indexerCancel()
+	}
+	if a.daemon != nil {
+		a.daemon.Stop()
 	}
 	if a.engine != nil {
 		a.engine.Close()
@@ -1050,11 +993,14 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	}
 
 	// Restart daemon with updated dir list.
-	stopDaemonProcess(a.cwd)
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
 
 	if !indexed {
 		// Just disable — restart daemon and done.
-		launchDaemon(a.cwd)
+		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+		a.daemon.Start()
 		return nil
 	}
 
@@ -1073,7 +1019,8 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
-			launchDaemon(a.cwd)
+			a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+			a.daemon.Start()
 		}()
 		return nil
 	}
@@ -1090,7 +1037,8 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	go func() {
 		a.runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
 		a.runPass2(idxCtx, a.engine)
-		launchDaemon(a.cwd)
+		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+		a.daemon.Start()
 	}()
 
 	return nil
@@ -1131,9 +1079,11 @@ func (a *App) RemoveExtraDirectory(dirPath string) error {
 		return err
 	}
 	log.Printf("Removed extra directory: %s", dirPath)
-	// Restart daemon so it stops watching the removed directory.
-	stopDaemonProcess(a.cwd)
-	launchDaemon(a.cwd)
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
+	a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+	a.daemon.Start()
 	return nil
 }
 
@@ -1164,10 +1114,36 @@ func (a *App) SetGPUAcceleration(enabled bool) error {
 func main() {
 	app := NewApp()
 
+	go systray.Run(func() {
+		systray.SetTitle("Filosophy")
+		systray.SetTooltip("Filosophy Search")
+		
+		// Note: providing an empty []byte works for an invisible/default icon, 
+		// but typically you load an icon file here: systray.SetIcon(iconBytes)
+		// Since we don't have an icon loaded, we rely on the OS default generic icon.
+		
+		mShow := systray.AddMenuItem("Show Filosophy", "Show the main window")
+		systray.AddSeparator()
+		mQuit := systray.AddMenuItem("Quit", "Quit the whole app")
+
+		for {
+			select {
+			case <-mShow.ClickedCh:
+				wailsruntime.WindowShow(app.ctx)
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+				wailsruntime.Quit(app.ctx)
+			}
+		}
+	}, func() {
+		// Ensure teardown if systray exits
+	})
+
 	err := wails.Run(&options.App{
 		Title:  "Filosophy",
 		Width:  1280,
 		Height: 800,
+		HideWindowOnClose: true,
 		AssetServer: &assetserver.Options{
 			Assets:  assets,
 			Handler: &LocalFileHandler{},
