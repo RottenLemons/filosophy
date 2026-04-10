@@ -373,10 +373,6 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*Process
 	if err != nil {
 		log.Println("Failed to create temp dir for images:", err)
 	}
-	// Cap the image capacity high enough so batching is effective.
-	if imageCap < 100 {
-		imageCap = 100
-	}
 	cfg := &ProcessorConfig{
 		Splitter: &splitter,
 		Chunks:   make(chan Metadata, chunkCap),
@@ -385,7 +381,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*Process
 		TempDir:  tmpDir,
 		Mu:       &sync.Mutex{},
 	}
-	cfg.Batcher = NewVipsBatcher(cfg, 100) // 100 images per vips exec call
+	cfg.Batcher = NewVipsBatcher(cfg, imageCap)
 	return cfg, nil
 }
 

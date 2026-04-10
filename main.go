@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ var assets embed.FS
 // Pass-2 file extraction (kreuzberg) is I/O-bound: 2×CPU keeps the pipeline
 // saturated while half the goroutines wait on disk reads.
 var maxConcurrency = runtime.NumCPU() * 2
+var imageBatchSize = 100 // Defaults, adapted at startup
 
 const daemonPidFile = "filosophy-daemon.pid"
 const appPidFile = "filosophy-app.pid"
@@ -213,7 +215,7 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 		a.setStatus(true, "Phase 1/2: Scanning directories...", 0)
 	}
 
-	cfg, err := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	cfg, err := shared.NewProcessorConfig(8096, 4000, imageBatchSize, sc)
 	if err != nil {
 		log.Printf("runPass1 error: %v", err)
 		return
@@ -336,7 +338,7 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	}
 
 	start := time.Now()
-	cfg, err := shared.NewProcessorConfig(8096, 4000, 100, sc)
+	cfg, err := shared.NewProcessorConfig(8096, 4000, imageBatchSize, sc)
 	if err != nil {
 		log.Printf("runPass2 error: %v", err)
 		return
@@ -353,9 +355,11 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 
 			var lastETA string
 			var lastETATime time.Time
+			var lastLoggedPct int = -1
 
 			for {
 				select {
+
 				case <-doneChan:
 					return
 				case <-ticker.C:
@@ -386,8 +390,9 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 						statusMsg = fmt.Sprintf("Phase 2/2: %d%%", progressPct)
 					}
 
-					if progressPct % 10 == 0 {
+					if progressPct%10 == 0 && progressPct != lastLoggedPct {
 						log.Printf("[Indexer] Phase 2/2 progress: %d%%", progressPct)
+						lastLoggedPct = progressPct
 					}
 
 					a.setStatus(true, statusMsg, progressPct)
@@ -424,6 +429,7 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	cfg.Flush() // Execute any lingering batch images
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 	shared.DrainRemaining(cfg.Images, "image", sc)
+	sc.TruncateWAL()
 	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
 
 	if ctx != nil {
@@ -700,6 +706,55 @@ func (a *App) startup(ctx context.Context) {
 		cwd = "."
 	}
 	a.cwd = cwd
+	a.config = shared.LoadConfig(cwd)
+
+	// --- Memory Adaptive Engine ---
+	_, availBytes := shared.GetMemoryInfo()
+	if availBytes > 0 {
+		availGB := availBytes / (1024 * 1024 * 1024)
+		debug.SetMemoryLimit(int64(float64(availBytes) * 0.75))
+
+		concurrency := int(availGB / 2)
+		cpuCap := int(float64(runtime.NumCPU()) * 1.5)
+		if concurrency > cpuCap {
+			concurrency = cpuCap
+		}
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		maxConcurrency = concurrency
+
+		batch := int(availGB * 5)
+		if batch < 20 {
+			batch = 20
+		} else if batch > 100 {
+			batch = 100
+		}
+		imageBatchSize = batch
+		log.Printf("[Indexer] Adaptive RAM %dGB available -> concurrency=%d, batchSize=%d", availGB, maxConcurrency, imageBatchSize)
+	}
+
+	// Stale temp file cleanup
+	tempMatches, _ := filepath.Glob(filepath.Join(os.TempDir(), "filosophy-img-*"))
+	for _, m := range tempMatches {
+		os.RemoveAll(m)
+	}
+
+	// Memory watchdog
+	go func() {
+		var m runtime.MemStats
+		limit := int64(float64(availBytes) * 0.75)
+		if limit <= 0 {
+			return
+		}
+		for {
+			time.Sleep(5 * time.Second)
+			runtime.ReadMemStats(&m)
+			if int64(m.Alloc) > int64(float64(limit)*0.9) {
+				log.Printf("⚠️ MEMORY WATCHDOG: Heap usage exceeds 90%% of soft limit (In-use: %v MB)", m.Alloc/(1024*1024))
+			}
+		}
+	}()
 
 	dbPath := filepath.Join(cwd, "filosophy.db")
 	textModelPath := filepath.Join(cwd, "text")
@@ -720,7 +775,6 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.home = home
 
-	a.config = shared.LoadConfig(cwd)
 	if a.config.HasCheckedGPU {
 		a.hasGPU.Store(a.config.HasGPU)
 	} else {
@@ -759,7 +813,7 @@ func (a *App) startup(ctx context.Context) {
 
 	// Initialize config
 	log.Println("[Boot 4] Loading configuration from database...")
-	a.config = shared.LoadConfig(cwd)
+	// a.config already loaded above
 
 	dirs := a.getContentDirs()
 	for _, d := range dirs {

@@ -1,0 +1,11 @@
+{
+  "ExcludedPaths": [
+    ".git",
+    "anaconda3",
+    "miniconda3",
+    "node_modules"
+  ],
+  "GPUEnabled": false,
+  "HasGPU": true,
+  "HasCheckedGPU": true
+}
