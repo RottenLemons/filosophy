@@ -664,27 +664,6 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 		}(root)
 	}
 	wg.Wait()
-=======
-			}
-			if d.IsDir() {
-				if systemPathSkipDirs[strings.ToLower(d.Name())] {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if isJunkFile(d.Name()) {
-				return nil
-			}
-			batch = append(batch, path)
-			if len(batch) >= batchSize {
-				flush()
-			}
-			return nil
-		})
-	}
-
-	flush()
->>>>>>> bbb40eff8e0f9fabd3aeb35413ffe325ebbbcf51
 	log.Println("[sysindex] System-wide path index complete.")
 }
 

@@ -283,7 +283,7 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 	// so UnindexedFiles() never returns it again.
 	ext := strings.ToLower(filepath.Ext(path))
 	if !textAllowExtensions[ext] {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
 		return
 	}
 	result, err := kreuzberg.ExtractFileSync(path, nil)
@@ -325,7 +325,7 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	if IsOfflineFile(info) {
 		// Log to know we're skipping offline/cloud-only files without attempting retrieval.
 		log.Printf("ProcessFile: skipping offline/cloud-only file %s", path)
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
 		return
 	}
 
@@ -334,7 +334,7 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	// Image formats that vips can't handle or have no semantic search value:
 	// skip immediately and mark as indexed so they're never retried.
 	if _, skip := imageSkipExtensions[ext]; skip {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime, cfg.Mu)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
 		return
 	}
 	if IsImageFile(path) {

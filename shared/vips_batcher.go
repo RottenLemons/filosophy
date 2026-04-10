@@ -154,10 +154,10 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 		if _, err := os.Stat(expectedOut); err == nil {
 			// Success: Rename to hash.jpg
 			os.Rename(expectedOut, finalOut)
-			HandleChunk(v.cfg.Images, v.cfg.Engine, "image", finalOut, j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime, v.cfg.Mu)
+			HandleChunk(v.cfg.Images, v.cfg.Engine, "image", finalOut, j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime)
 		} else {
 			// Failed for this specific image: Create empty sentinel to prevent endless retrying
-			HandleChunk(v.cfg.Chunks, v.cfg.Engine, "text", "", j.Path, empty, j.MTime, j.Size, j.CTime, j.ATime, v.cfg.Mu)
+			HandleChunk(v.cfg.Chunks, v.cfg.Engine, "text", "", j.Path, empty, j.MTime, j.Size, j.CTime, j.ATime)
 		}
 	}
 }
