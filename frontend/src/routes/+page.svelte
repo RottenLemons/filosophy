@@ -4,13 +4,15 @@
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
-  import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity } from 'lucide-svelte';
+  import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity, MessageSquare } from 'lucide-svelte';
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import SettingsModal from '$lib/components/SettingsModal.svelte';
+  import Chat from '$lib/components/Chat.svelte';
   import { indexingStatus } from '../stores/indexer';
 
   let showSettings = false;
+  let showChat = false;
 
   /** @type {string} */
   let searchQuery = "";
@@ -277,6 +279,14 @@
 <div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
     <button
+      on:click={() => showChat = !showChat}
+      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
+      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+      aria-label="Toggle Chat"
+    >
+      <MessageSquare class="w-5 h-5" />
+    </button>
+    <button
       on:click={() => showSettings = true}
       class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
       style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
@@ -525,9 +535,18 @@
       </div>
     </div>
     
-    <!-- Task 3: Mobile overlay lg:relative vs absolute inset-0 -->
-    {#if selectedFile}
-      <aside 
+    <!-- Chat panel -->
+    {#if showChat}
+      <Chat
+        contextFile={selectedFile}
+        fileContent={textContent}
+        on:close={() => showChat = false}
+      />
+    {/if}
+
+    <!-- File preview — hidden when chat is open -->
+    {#if selectedFile && !showChat}
+      <aside
         transition:slide={{ axis: 'x', duration: 400 }}
         class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
       >

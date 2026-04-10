@@ -393,6 +393,9 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 					if progressPct%10 == 0 && progressPct != lastLoggedPct {
 						log.Printf("[Indexer] Phase 2/2 progress: %d%%", progressPct)
 						lastLoggedPct = progressPct
+						// Flush WAL pages back to the main DB file so the WAL
+						// never grows large enough to cause slow recovery on next start.
+						sc.Checkpoint()
 					}
 
 					a.setStatus(true, statusMsg, progressPct)
@@ -675,11 +678,12 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 
 // App struct holds the application state
 type App struct {
-	ctx           context.Context
-	engine        *shared.Engine
-	config        *shared.AppConfig
-	hasGPU        atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
-	
+	ctx              context.Context
+	engine           *shared.Engine
+	config           *shared.AppConfig
+	hasGPU           atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
+	engineInitializing atomic.Bool // true while engine is being initialized (WAL recovery etc.)
+
 	// Thread-safe state tracking for the frontend fetch
 	statusMutex   sync.RWMutex
 	isIndexing    bool
@@ -820,46 +824,49 @@ func (a *App) startup(ctx context.Context) {
 		os.MkdirAll(d, 0755)
 	}
 
-	// Launch Engine
-	log.Println("[Boot 5] Spawning Engine initialization...")
-	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Printf("[Boot Error] CRITICAL initialization failed: %v", err)
-		log.Printf("The application will continue with search backend disabled.")
-	} else {
+	idxCtx, cancel := context.WithCancel(a.ctx)
+	a.indexerCancel = cancel
+
+	// Launch Engine asynchronously so the UI is never blocked by WAL recovery.
+	// On a large database this can take several minutes; the frontend will receive
+	// an "engine_status" event when it is ready (or failed).
+	log.Println("[Boot 5] Spawning Engine initialization (async)...")
+	a.engineInitializing.Store(true)
+	go func() {
+		engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+		a.engineInitializing.Store(false)
+		if err != nil {
+			log.Printf("[Boot Error] CRITICAL initialization failed: %v", err)
+			log.Printf("The application will continue with search backend disabled.")
+			wailsruntime.EventsEmit(a.ctx, "engine_status", "offline")
+			if !dbMissing {
+				log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
+				launchDaemon(cwd)
+			}
+			return
+		}
+
+		a.mu.Lock()
 		a.engine = engine
+		a.mu.Unlock()
 		log.Println("[Boot 6] Engine initialized successfully")
+		wailsruntime.EventsEmit(a.ctx, "engine_status", "ready")
+
 		if forceIndex {
 			if err := a.engine.ResetContentIndex(); err != nil {
 				log.Println("reset index error:", err)
 			}
 		}
-	}
 
-	idxCtx, cancel := context.WithCancel(a.ctx)
-	a.indexerCancel = cancel
-
-	if a.engine != nil {
 		log.Println("[Boot 7] Initializing background indexing...")
-		// Always launch indexing in the background on boot to synchronize changes and resume partial scans
-		go func() {
-			log.Println("[Boot 8] Running background metadata sync...")
-			// runPass1 checks for new/deleted files (Metadata)
-			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
-			// runPass2 processes any unindexed content (Semantic)
-			a.runPass2(idxCtx, a.engine)
-			
-			log.Println("[Boot 9] Initial sync complete. Launching daemon...")
-			launchDaemon(cwd)
-			go runSystemPathIndex(idxCtx, a.engine)
-		}()
-	} else {
-		// Even if engine is nil, launch daemon if it's not a fresh install (best effort)
-		if !dbMissing {
-			log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
-			launchDaemon(cwd)
-		}
-	}
+		log.Println("[Boot 8] Running background metadata sync...")
+		a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+		a.runPass2(idxCtx, a.engine)
+
+		log.Println("[Boot 9] Initial sync complete. Launching daemon...")
+		launchDaemon(cwd)
+		go runSystemPathIndex(idxCtx, a.engine)
+	}()
 
 	// Watch home dir top level so the frontend can react to new/deleted folders.
 	a.homeWatchStop = make(chan struct{})
@@ -868,28 +875,39 @@ func (a *App) startup(ctx context.Context) {
 }
 
 // RetryEngineInit attempts to initialize the engine if it previously failed.
+// It runs asynchronously and emits engine_status events on completion.
 func (a *App) RetryEngineInit() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.engine != nil {
-		return nil // Already initialized
+	if a.engine != nil || a.engineInitializing.Load() {
+		a.mu.Unlock()
+		return nil
 	}
+	a.mu.Unlock()
 
 	cwd, _ := os.Getwd()
 	dbPath := filepath.Join(cwd, "filosophy.db")
 	textModelPath := filepath.Join(cwd, "text")
 	imageModelPath := filepath.Join(cwd, "image")
 
-	log.Println("[Retry] Attempting manual Engine re-initialization...")
-	engine, err := shared.New(dbPath, textModelPath, imageModelPath)
-	if err != nil {
-		log.Printf("[Retry Error] Re-initialization failed: %v", err)
-		return fmt.Errorf("initialization failed: %w", err)
-	}
+	a.engineInitializing.Store(true)
+	wailsruntime.EventsEmit(a.ctx, "engine_status", "initializing")
 
-	a.engine = engine
-	log.Println("[Retry Success] Engine is now online")
+	go func() {
+		log.Println("[Retry] Attempting manual Engine re-initialization...")
+		engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+		a.engineInitializing.Store(false)
+		if err != nil {
+			log.Printf("[Retry Error] Re-initialization failed: %v", err)
+			wailsruntime.EventsEmit(a.ctx, "engine_status", "offline")
+			return
+		}
+		a.mu.Lock()
+		a.engine = engine
+		a.mu.Unlock()
+		log.Println("[Retry Success] Engine is now online")
+		wailsruntime.EventsEmit(a.ctx, "engine_status", "ready")
+	}()
+
 	return nil
 }
 
@@ -962,8 +980,31 @@ func (a *App) setStatus(isIndexing bool, message string, progress int) {
 	})
 }
 
-func (a *App) GetEngineStatus() bool {
-	return a.engine != nil
+// GetEngineStatus returns "ready", "initializing", or "offline".
+func (a *App) GetEngineStatus() string {
+	if a.engine != nil {
+		return "ready"
+	}
+	if a.engineInitializing.Load() {
+		return "initializing"
+	}
+	return "offline"
+}
+
+// TestLLMEndpoint performs a GET request from the Go side (bypasses WebView2
+// loopback restrictions) and returns an empty string on success or an error
+// message on failure.
+func (a *App) TestLLMEndpoint(url string) string {
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Sprintf("HTTP %d %s", resp.StatusCode, resp.Status)
+	}
+	return ""
 }
 
 func (a *App) Search(query string) ([]shared.SearchResult, error) {

@@ -158,6 +158,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		"PRAGMA mmap_size=536870912",
 		fmt.Sprintf("PRAGMA cache_size=-%d", cacheKB),
 		"PRAGMA busy_timeout=10000",
+		// Checkpoint every 500 pages (~2 MB) so the WAL never grows huge.
+		// A large WAL causes multi-minute recovery on next open after a crash.
+		"PRAGMA wal_autocheckpoint=500",
 	} {
 		if _, err := sqlDB.Exec(pragma); err != nil {
 			log.Printf("pragma warning: %v", err)
@@ -1159,6 +1162,15 @@ func (s *Engine) UnindexedFiles() (paths []string, mtimes []int64, err error) {
 		mtimes = append(mtimes, m)
 	}
 	return paths, mtimes, rows.Err()
+}
+
+// Checkpoint runs a passive WAL checkpoint, flushing written pages back into
+// the main database file. Call this periodically during long indexing runs to
+// prevent the WAL from growing so large that the next startup hangs on recovery.
+func (s *Engine) Checkpoint() {
+	if _, err := s.sqlDB.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		log.Printf("wal_checkpoint warning: %v", err)
+	}
 }
 
 // ResetContentIndex clears content_indexed/hashes and paths_fts, forcing a full
