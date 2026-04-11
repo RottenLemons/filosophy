@@ -16,7 +16,6 @@
 
   let showSettings = false;
   let showChat = false;
-  let showWhatsApp = false;
 
   // ── API confirm dialog ──────────────────────────────────────────────────────
   let apiConfirmRequest: { id: string; query: string } | null = null;
@@ -58,7 +57,6 @@
   let searchQuery = "";
   let selectedFile: any = null;
   let files: any[] = [];
-  let waMessages: any[] = [];
   let searching = false;
   let searchErrorMsg: string | null = null;
 
@@ -166,11 +164,10 @@
 
   let searchTimeout: ReturnType<typeof setTimeout> | undefined = undefined;
 
-  // Ticket-based concurrency and Reset renderLimit
+  // Task 1 & Task 2: Ticket-based concurrency and Reset renderLimit
   async function performingSearch() {
     if (!searchQuery.trim()) {
       files = [];
-      waMessages = [];
       selectedFile = null;
       searching = false;
       searchErrorMsg = null;
@@ -180,25 +177,19 @@
 
     currentSearchTicket++;
     const localTicket = currentSearchTicket;
-
+    
     try {
-      const [fileResult, waResult] = await Promise.allSettled([
-        Search(searchQuery),
-        WAStatus().then(s => s === 'connected' ? WASearchMessages(searchQuery) : []),
-      ]);
-
+      const result = await Search(searchQuery);
       if (localTicket === currentSearchTicket) {
-        files = fileResult.status === 'fulfilled' ? (fileResult.value || []) : [];
-        waMessages = waResult.status === 'fulfilled' ? (waResult.value || []) : [];
-        selectedFile = null;
-        searchErrorMsg = fileResult.status === 'rejected' ? String((fileResult as PromiseRejectedResult).reason) : null;
+        files = result || [];
+        selectedFile = null; 
+        searchErrorMsg = null;
       }
     } catch (error) {
       if (localTicket === currentSearchTicket) {
         console.error("Search failed:", error);
         searchErrorMsg = String(error);
         files = [];
-        waMessages = [];
         selectedFile = null;
       }
     } finally {
@@ -212,7 +203,6 @@
     clearTimeout(searchTimeout);
     if (!searchQuery.trim()) {
         files = [];
-        waMessages = [];
         selectedFile = null;
         searching = false;
         searchErrorMsg = null;
@@ -309,15 +299,7 @@
 <div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
     <button
-      on:click={() => { showWhatsApp = !showWhatsApp; if (showWhatsApp) showChat = false; }}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showWhatsApp ? 'opacity-100 text-green-600 dark:text-green-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Toggle WhatsApp"
-    >
-      <MessageCircle class="w-5 h-5" />
-    </button>
-    <button
-      on:click={() => { showChat = !showChat; if (showChat) showWhatsApp = false; }}
+      on:click={() => showChat = !showChat}
       class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
       style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
       aria-label="Toggle Chat"
@@ -559,7 +541,7 @@
                 </button>
               {/if}
             </div>
-          {:else if searchQuery.trim() !== '' && waMessages.length === 0}
+          {:else if searchQuery.trim() !== ''}
              <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">
                No relevant documents found.
                {#if isFilterActive}
@@ -570,46 +552,9 @@
              </div>
           {/if}
         </div>
-
-        <!-- WhatsApp message results -->
-        {#if waMessages.length > 0}
-          <div class="space-y-4 pt-2 border-t border-gray-100 dark:border-[#2a2a2a]" transition:fade>
-            <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pt-4 pb-2 border-b border-gray-100 dark:border-[#2a2a2a]">
-              <span class="flex items-center gap-2">
-                <MessageCircle size={12} class="text-green-500" />
-                {waMessages.length} WhatsApp Message{waMessages.length !== 1 ? 's' : ''}
-              </span>
-            </div>
-            <div class="flex flex-col gap-4">
-              {#each waMessages as msg (msg.messageId)}
-                <div class="group p-5 bg-white dark:bg-transparent border border-gray-100 dark:border-[#2a2a2a] hover:border-green-200 dark:hover:border-green-900/40 transition-colors">
-                  <div class="flex items-start justify-between gap-4 mb-2">
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-[10px] font-bold uppercase tracking-widest text-green-600 dark:text-green-400">
-                        {msg.chatName || msg.chatJid}
-                      </span>
-                      {#if msg.isGroup}
-                        <span class="px-1.5 py-0.5 bg-gray-100 dark:bg-[#1a1a1a] text-[9px] font-bold uppercase tracking-widest text-gray-500">Group</span>
-                      {/if}
-                    </div>
-                    <span class="text-[10px] text-gray-400 dark:text-gray-500 shrink-0">{formatDate(msg.timestamp)}</span>
-                  </div>
-                  <p class="text-[11px] font-semibold text-gray-500 dark:text-gray-400 mb-1">{msg.senderName || msg.sender}</p>
-                  <p class="text-sm font-serif text-slate-700 dark:text-gray-200 leading-relaxed">{msg.text}</p>
-                  {#if msg.mediaType}
-                    <span class="mt-2 inline-flex items-center gap-1 px-2 py-0.5 bg-gray-100 dark:bg-[#1a1a1a] text-[9px] font-bold uppercase tracking-widest text-gray-500">
-                      {msg.mediaType}{msg.mediaName ? ' · ' + msg.mediaName : ''}
-                    </span>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
       </div>
     </div>
-
+    
     <!-- Chat panel -->
     {#if showChat}
       <Chat
@@ -619,25 +564,8 @@
       />
     {/if}
 
-    <!-- WhatsApp panel -->
-    {#if showWhatsApp && !showChat}
-      <aside
-        transition:slide={{ axis: 'x', duration: 300 }}
-        class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[320px] lg:min-w-[280px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
-      >
-        <button
-          class="absolute top-3 right-3 p-1.5 text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 transition-colors rounded-full z-10"
-          on:click={() => showWhatsApp = false}
-          aria-label="Close WhatsApp"
-        >
-          <X class="w-4 h-4" />
-        </button>
-        <WhatsAppTab />
-      </aside>
-    {/if}
-
-    <!-- File preview — hidden when chat or whatsapp is open -->
-    {#if selectedFile && !showChat && !showWhatsApp}
+    <!-- File preview — hidden when chat is open -->
+    {#if selectedFile && !showChat}
       <aside
         transition:slide={{ axis: 'x', duration: 400 }}
         class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"

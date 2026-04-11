@@ -395,6 +395,16 @@
             <span class="uppercase tracking-widest text-[10px]">Access</span>
           </button>
 
+          <button
+            on:click={() => activeTab = 'whatsapp'}
+            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
+                   {activeTab === 'whatsapp'
+                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
+                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+          >
+            <MessageCircle class="w-4 h-4" />
+            <span class="uppercase tracking-widest text-[10px]">WhatsApp</span>
+          </button>
         </nav>
 
         <!-- Sidebar Footer Status -->
@@ -455,7 +465,7 @@
         <!-- Header -->
         <header class="h-20 flex items-center justify-between px-10 shrink-0">
           <h3 class="text-[#acabab] text-xs uppercase tracking-widest font-sans font-bold">
-            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : activeTab === 'connections' ? 'LLM & MCP Connections' : 'API & MCP Access'}
+            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : activeTab === 'connections' ? 'LLM & MCP Connections' : activeTab === 'access' ? 'API & MCP Access' : 'WhatsApp'}
           </h3>
           <button 
             on:click={close}
@@ -1005,6 +1015,10 @@
 
             </div>
 
+          {:else if activeTab === 'whatsapp'}
+            <div in:fade={{ duration: 200 }}>
+              <WhatsAppTab />
+            </div>
           {/if}
         </div>
       </main>

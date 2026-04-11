@@ -24,6 +24,7 @@ import (
 
 	"filosophy/daemon"
 	"filosophy/shared"
+	"filosophy/whatsapp"
 
 	"github.com/syncthing/notify"
 	"github.com/wailsapp/wails/v2"
@@ -639,6 +640,11 @@ type App struct {
 
 	// External API server
 	apiServer *APIServer
+
+	// WhatsApp
+	waClient  *whatsapp.Client
+	waStore   *whatsapp.Store
+	waIndexer *whatsapp.Indexer
 }
 
 func NewApp() *App {
@@ -866,6 +872,24 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
+	// Initialise WhatsApp store (message DB). The client itself is lazy — it
+	// only connects when the user calls WAConnect() from the frontend.
+	if waStore, err := whatsapp.OpenStore(cwd); err != nil {
+		log.Printf("[WhatsApp] Failed to open store: %v", err)
+	} else {
+		a.waStore = waStore
+		a.waClient = whatsapp.NewClient(
+			cwd,
+			waStore,
+			func(update whatsapp.QRUpdate) {
+				wailsruntime.EventsEmit(a.ctx, "wa_qr", update)
+			},
+			func(status whatsapp.Status) {
+				wailsruntime.EventsEmit(a.ctx, "wa_status", status)
+			},
+		)
+	}
+
 	log.Println("[Boot 13] Startup sequence complete (Main Thread Released)")
 }
 
@@ -950,6 +974,15 @@ func (a *App) shutdown(ctx context.Context) {
 		a.engine.Close()
 	}
 	a.apiServer.stop()
+	if a.waIndexer != nil {
+		a.waIndexer.Stop()
+	}
+	if a.waClient != nil {
+		a.waClient.Disconnect()
+	}
+	if a.waStore != nil {
+		a.waStore.Close()
+	}
 }
 
 // GetIndexingStatus allows the frontend to fetch the exact state on mount
@@ -1303,6 +1336,93 @@ func (a *App) RegenerateAPIKey() (string, error) {
 	return a.config.APIKey, a.config.Save()
 }
 
+// ── WhatsApp bindings ─────────────────────────────────────────────────────────
+
+// WAStatus returns the current WhatsApp connection status.
+func (a *App) WAStatus() string {
+	if a.waClient == nil {
+		return string(whatsapp.StatusDisconnected)
+	}
+	return string(a.waClient.Status())
+}
+
+// WAGetLastQR returns the most recently generated QR code as a base64 PNG data URI.
+// The frontend calls this after WAConnect() to display the QR immediately,
+// rather than relying solely on the wa_qr event which may fire before listeners attach.
+func (a *App) WAGetLastQR() string {
+	if a.waClient == nil {
+		return ""
+	}
+	return a.waClient.LastQR()
+}
+
+// WAConnect initialises the WhatsApp client and either reconnects an existing
+// session or begins QR pairing. QR updates are streamed via the "wa_qr" Wails
+// event; status changes via "wa_status".
+func (a *App) WAConnect() error {
+	if a.waClient == nil {
+		return fmt.Errorf("whatsapp store not initialised")
+	}
+
+	// Start indexer if not already running.
+	if a.waIndexer == nil && a.engine != nil {
+		a.waIndexer = whatsapp.NewIndexer(a.waStore, a.engine)
+		a.waIndexer.Start()
+	}
+
+	if err := a.waClient.Connect(a.ctx); err != nil {
+		return err
+	}
+
+	// Kick off a full index pass in the background (covers pre-existing data
+	// from a history sync that already happened in a previous session).
+	if a.waIndexer != nil {
+		go a.waIndexer.IndexAll()
+	}
+
+	return nil
+}
+
+// WADisconnect disconnects the WhatsApp client without logging out.
+// The session is preserved and WAConnect will reconnect without a new QR scan.
+func (a *App) WADisconnect() {
+	if a.waClient != nil {
+		a.waClient.Disconnect()
+	}
+}
+
+// WALogout logs out of WhatsApp and deletes the local session.
+// The next WAConnect call will require a new QR scan.
+func (a *App) WALogout() error {
+	if a.waClient == nil {
+		return nil
+	}
+	return a.waClient.Logout(a.ctx)
+}
+
+// WASearchMessages performs a full-text search over indexed WhatsApp messages.
+func (a *App) WASearchMessages(query string) ([]whatsapp.Message, error) {
+	if a.waStore == nil {
+		return nil, fmt.Errorf("whatsapp store not initialised")
+	}
+	return a.waStore.SearchMessages(query, 30)
+}
+
+// WAGetChats returns all known chats, most-recently-active first.
+func (a *App) WAGetChats() ([]whatsapp.Chat, error) {
+	if a.waStore == nil {
+		return nil, fmt.Errorf("whatsapp store not initialised")
+	}
+	return a.waStore.GetChats()
+}
+
+// WAGetChatMessages returns recent messages from a specific chat.
+func (a *App) WAGetChatMessages(chatJID string) ([]whatsapp.Message, error) {
+	if a.waStore == nil {
+		return nil, fmt.Errorf("whatsapp store not initialised")
+	}
+	return a.waStore.GetChatMessages(chatJID, 50)
+}
 
 func main() {
 	app := NewApp()
