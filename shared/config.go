@@ -15,6 +15,16 @@ type AppConfig struct {
 	GPUEnabled      bool     `json:"GPUEnabled"`
 	HasGPU          bool     `json:"HasGPU"`
 	HasCheckedGPU   bool     `json:"HasCheckedGPU"`
+
+	// External REST API
+	APIEnabled bool   `json:"APIEnabled"`
+	APIPort    int    `json:"APIPort"`
+	APIKey     string `json:"APIKey"`
+
+	// MCP SSE server (shares APIPort, separate key)
+	MCPEnabled bool   `json:"MCPEnabled"`
+	MCPKey     string `json:"MCPKey"`
+
 	path            string
 	mu              sync.RWMutex
 	normalizedPaths []string `json:"-"`
@@ -42,7 +52,9 @@ func LoadConfig(dir string) *AppConfig {
 		GPUEnabled:    false,
 		HasGPU:        false,
 		HasCheckedGPU: false,
-		path:         path,
+		APIEnabled:    false,
+		APIPort:       7700,
+		path:          path,
 	}
 
 	data, err := os.ReadFile(path)

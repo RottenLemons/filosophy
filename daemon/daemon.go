@@ -2,7 +2,6 @@
 package daemon
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -15,8 +14,6 @@ import (
 
 	"github.com/cespare/xxhash"
 	"github.com/syncthing/notify"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 const (
@@ -97,22 +94,14 @@ func (t *tracker) getHash(path string) (int64, error) {
 	if h, ok := t.hashes[path]; ok {
 		return h, nil
 	}
-	// Cache miss — query DB
-	if t.conn == nil {
-		conn, err := sqlite.OpenConn(t.dbPath, sqlite.OpenReadOnly)
-		if err != nil {
-			return 0, err
-		}
-		t.conn = conn
+	// Cache miss — query via the shared engine
+	if t.engine == nil {
+		return 0, nil
 	}
-	var hash int64
-	_ = sqlitex.Execute(t.conn, "SELECT hash FROM files WHERE path = ?", &sqlitex.ExecOptions{
-		Args: []any{path},
-		ResultFunc: func(stmt *sqlite.Stmt) error {
-			hash = stmt.ColumnInt64(0)
-			return nil
-		},
-	})
+	hash, err := t.engine.GetFileHash(path)
+	if err != nil {
+		return 0, err
+	}
 	if hash != 0 {
 		t.hashes[path] = hash // cache it
 	}
@@ -123,8 +112,7 @@ type tracker struct {
 	mu      sync.Mutex
 	changes map[string]*fileChanges
 	hashes  map[string]int64 // path → cached hash (write-through from DB)
-	dbPath  string
-	conn    *sqlite.Conn     // Persistent SQLite connection
+	engine  *shared.Engine
 	prev    notify.EventInfo
 	count   int
 }
@@ -262,9 +250,7 @@ func (d *Daemon) isDirectChild(path string) bool {
 }
 
 func (d *Daemon) flush() {
-	fmt.Println("[FLUSH] attempting lock...")
 	if !d.flushMu.TryLock() {
-		fmt.Println("[FLUSH] skipped — another flush in progress")
 		return // another flush is already in progress
 	}
 	defer d.flushMu.Unlock()
@@ -273,7 +259,6 @@ func (d *Daemon) flush() {
 	changes := d.t.drain()
 	d.t.mu.Unlock()
 
-	fmt.Printf("[FLUSH] drained %d changed paths\n", len(changes))
 	if len(changes) == 0 {
 		return
 	}
@@ -308,11 +293,8 @@ func (d *Daemon) flush() {
 		}
 	}
 
-	fmt.Printf("[FLUSH] deletes=%d, renames=%d, adds=%d\n", len(deletePaths), len(renamePairs), len(addPaths))
-
 	// 1. Delete all references for removed/modified files
 	if len(deletePaths) > 0 {
-		fmt.Println("[FLUSH] deleting:", deletePaths)
 		if err := d.sc.DeletePaths(deletePaths); err != nil {
 			log.Println("flush delete error:", err)
 		}
@@ -326,7 +308,6 @@ func (d *Daemon) flush() {
 
 	// 2. Rename paths in DB
 	if len(renamePairs) > 0 {
-		fmt.Println("[FLUSH] renaming:", renamePairs)
 		oldPaths := make([]string, len(renamePairs))
 		newPaths := make([]string, len(renamePairs))
 		for i, pair := range renamePairs {
@@ -340,7 +321,6 @@ func (d *Daemon) flush() {
 
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
-		fmt.Println("[FLUSH] indexing:", addPaths)
 		cfg, err := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
 		if err != nil {
 			log.Println("[FLUSH] NewProcessorConfig error:", err)
@@ -379,29 +359,22 @@ func (d *Daemon) Start() error {
 }
 
 func (d *Daemon) run() {
-	// DB path for the tracker — derive from Engine's working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		log.Fatal("cannot get working directory:", err)
-	}
-	dbPath := filepath.Join(cwd, "filosophy.db")
-
 	// Do work here
 	d.t = &tracker{
 		changes: make(map[string]*fileChanges),
 		hashes:  make(map[string]int64),
-		dbPath:  dbPath,
+		engine:  d.sc,
 		prev:    sentinel{},
 	}
 	// Watch all configured base directories.
 	for _, baseDir := range d.baseDirs {
 		if err := notify.Watch(baseDir, d.structureChan, structureEventMask); err != nil {
-			fmt.Println("Error watching structure for", baseDir, ":", err)
+			log.Println("Error watching structure for", baseDir, ":", err)
 			continue
 		}
 		entries, err := os.ReadDir(baseDir)
 		if err != nil {
-			fmt.Println("Error reading base directory:", baseDir, err)
+			log.Println("Error reading base directory:", baseDir, err)
 			continue
 		}
 		for _, entry := range entries {
@@ -504,11 +477,6 @@ func (d *Daemon) run() {
 
 func (d *Daemon) Stop() error {
 	// Stop should not block. Return with a few seconds.
-	if d.t != nil {
-		if d.t.conn != nil {
-			d.t.conn.Close()
-		}
-	}
 	close(d.exit)
 	if d.structureChan != nil {
 		notify.Stop(d.structureChan)

@@ -1,16 +1,16 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { fade, slide, fly } from 'svelte/transition';
-  import { X, Folder, Cpu, Settings, Activity, AlertCircle, Network, Plus, Trash2, CheckCircle, Circle, RefreshCw, Clock } from 'lucide-svelte';
+  import { X, Folder, Cpu, Settings, Activity, AlertCircle, Network, Plus, Trash2, CheckCircle, Circle, RefreshCw, Clock, Key, Copy, Globe, Lock } from 'lucide-svelte';
   import { themeStore } from '../../stores/theme';
   import { indexingStatus, initIndexerStore } from '../../stores/indexer';
-  import { GetHomeFolders, GetEngineStatus, RetryEngineInit, CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration, TestLLMEndpoint } from '$lib/wailsjs/go/main/App';
+  import { GetHomeFolders, GetEngineStatus, RetryEngineInit, CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration, TestLLMEndpoint, GetAPIConfig, SetAPIEnabled, SetAPIPort, RegenerateAPIKey, SetMCPEnabled, SetMCPKey } from '$lib/wailsjs/go/main/App';
   import Indexer from './Indexer.svelte';
 
   const dispatch = createEventDispatcher();
   export let show = false;
 
-  let activeTab = 'folders'; // 'folders' | 'hardware' | 'connections'
+  let activeTab = 'folders'; // 'folders' | 'hardware' | 'connections' | 'access'
   let hasGPU = false;
   let gpuAcceleration = false;
   let loading = true;
@@ -142,6 +142,81 @@
     saveMCP();
   }
 
+  // ── Access (API / MCP server) state ────────────────────────────────────────
+
+  let apiEnabled = false;
+  let apiPort = 7700;
+  let apiKey = '';
+  let mcpEnabled = false;
+  let mcpKey = '';
+  let apiKeyCopied = false;
+  let apiPortInput = '7700';
+  let accessLoading = true;
+  let accessSaving = false;
+
+  async function loadAccess() {
+    try {
+      const cfg = await GetAPIConfig();
+      apiEnabled = cfg.enabled;
+      apiPort = cfg.port;
+      apiKey = cfg.apiKey;
+      mcpEnabled = cfg.mcpEnabled;
+      mcpKey = cfg.mcpKey ?? '';
+      apiPortInput = String(cfg.port);
+    } catch {}
+    accessLoading = false;
+  }
+
+  async function toggleAPI() {
+    apiEnabled = !apiEnabled;
+    try { await SetAPIEnabled(apiEnabled); } catch { apiEnabled = !apiEnabled; }
+  }
+
+  async function savePort() {
+    const p = parseInt(apiPortInput, 10);
+    if (isNaN(p) || p < 1 || p > 65535) { apiPortInput = String(apiPort); return; }
+    if (p === apiPort) return;
+    apiPort = p;
+    try { await SetAPIPort(p); } catch {}
+  }
+
+  async function regenKey() {
+    const newKey = await RegenerateAPIKey();
+    apiKey = newKey;
+  }
+
+  async function copyKey() {
+    if (!apiKey) return;
+    await navigator.clipboard.writeText(apiKey);
+    apiKeyCopied = true;
+    setTimeout(() => apiKeyCopied = false, 2000);
+  }
+
+  async function toggleMCP() {
+    mcpEnabled = !mcpEnabled;
+    try { await SetMCPEnabled(mcpEnabled); } catch { mcpEnabled = !mcpEnabled; }
+  }
+
+  async function saveMCPKey() {
+    try { await SetMCPKey(mcpKey); } catch {}
+  }
+
+  $: claudeDesktopSnippet = JSON.stringify({
+    mcpServers: {
+      filosophy: {
+        url: `http://127.0.0.1:${apiPort}/mcp/sse`,
+        ...(mcpKey ? { headers: { Authorization: `Bearer ${mcpKey}` } } : {}),
+      }
+    }
+  }, null, 2);
+
+  let snippetCopied = false;
+  async function copySnippet() {
+    await navigator.clipboard.writeText(claudeDesktopSnippet);
+    snippetCopied = true;
+    setTimeout(() => snippetCopied = false, 2000);
+  }
+
   let engineStatusUnsubscribe: (() => void) | null = null;
 
   onMount(async () => {
@@ -150,9 +225,16 @@
 
     // Listen for async engine_status events (emitted when WAL recovery finishes)
     if (window['runtime']?.EventsOn) {
-      engineStatusUnsubscribe = window['runtime'].EventsOn('engine_status', (status: string) => {
+      engineStatusUnsubscribe = window['runtime'].EventsOn('engine_status', async (status: string) => {
         engineStatus = status as typeof engineStatus;
-        if (status === 'ready') window.location.reload();
+        if (status === 'ready') {
+          initIndexerStore();
+          try {
+            hasGPU = await CheckSystemGPU();
+            gpuAcceleration = await GetGPUAcceleration();
+            if (!hasGPU) gpuAcceleration = false;
+          } catch {}
+        }
       });
     }
 
@@ -168,6 +250,7 @@
     } finally {
       loading = false;
     }
+    loadAccess();
   });
 
   onDestroy(() => {
@@ -181,7 +264,14 @@
       await RetryEngineInit();
       const status = await GetEngineStatus();
       engineStatus = status as typeof engineStatus;
-      if (status === 'ready') window.location.reload();
+      if (status === 'ready') {
+        initIndexerStore();
+        try {
+          hasGPU = await CheckSystemGPU();
+          gpuAcceleration = await GetGPUAcceleration();
+          if (!hasGPU) gpuAcceleration = false;
+        } catch {}
+      }
     } catch (e) {
       console.error('Retry failed:', e);
     } finally {
@@ -293,6 +383,17 @@
             <Network class="w-4 h-4" />
             <span>Connections</span>
           </button>
+
+          <button
+            on:click={() => activeTab = 'access'}
+            class="w-full flex items-center gap-3 px-3 py-2.5 text-xs font-semibold rounded-md transition-all
+                   {activeTab === 'access'
+                     ? 'bg-white dark:bg-[#1a1a1a] text-blue-600 dark:text-white shadow-sm border border-gray-200 dark:border-[#333]'
+                     : 'text-gray-500 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-[#151515]'}"
+          >
+            <Key class="w-4 h-4" />
+            <span>Access</span>
+          </button>
         </nav>
 
         <!-- Sidebar Footer Status -->
@@ -349,7 +450,7 @@
         <!-- Header -->
         <header class="h-16 flex items-center justify-between px-8 border-b border-gray-100 dark:border-[#1a1a1a] shrink-0">
           <h3 class="text-sm font-bold text-gray-900 dark:text-white uppercase tracking-wider">
-            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : 'LLM & MCP Connections'}
+            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : activeTab === 'connections' ? 'LLM & MCP Connections' : 'API & MCP Access'}
           </h3>
           <button 
             on:click={close}
@@ -572,8 +673,9 @@
                           />
                         </div>
                         <div class="w-40">
-                          <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Args <span class="normal-case font-normal">(optional)</span></label>
+                          <label for="new-server-args" class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Args <span class="normal-case font-normal">(optional)</span></label>
                           <input
+                            id="new-server-args"
                             type="text"
                             bind:value={newServer.args}
                             placeholder="/path/to/dir"
@@ -583,8 +685,9 @@
                       </div>
                     {:else}
                       <div transition:slide={{ duration: 150 }}>
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">URL</label>
+                        <label for="new-server-url" class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">URL</label>
                         <input
+                          id="new-server-url"
                           type="text"
                           bind:value={newServer.url}
                           placeholder="http://localhost:3000/mcp"
@@ -714,6 +817,187 @@
                    Enabling GPU acceleration can reduce search latency by up to 80% on large collections, but may increase power consumption on laptops.
                  </p>
               </section>
+            </div>
+
+          {:else if activeTab === 'access'}
+            <div in:fade={{ duration: 200 }} class="space-y-10">
+
+              <!-- REST API -->
+              <section>
+                <div class="mb-5 flex items-start justify-between">
+                  <div>
+                    <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-1">REST API</h4>
+                    <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
+                      Expose a local HTTP endpoint so external tools and scripts can search your files programmatically.
+                    </p>
+                  </div>
+                  <!-- Toggle -->
+                  <button
+                    on:click={toggleAPI}
+                    disabled={accessLoading}
+                    aria-label="Toggle REST API"
+                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 mt-1
+                           {apiEnabled ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                  >
+                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out {apiEnabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+                  </button>
+                </div>
+
+                {#if apiEnabled}
+                  <div class="space-y-4" transition:slide={{ duration: 200 }}>
+                    <!-- Port -->
+                    <div class="bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl p-5 space-y-4">
+                      <div class="flex items-end gap-3">
+                        <div class="flex-1">
+                          <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Port</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="65535"
+                            bind:value={apiPortInput}
+                            on:blur={savePort}
+                            on:keydown={e => e.key === 'Enter' && savePort()}
+                            class="w-32 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                          />
+                        </div>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500 pb-2">
+                          Listening on <span class="font-mono">http://127.0.0.1:{apiPort}</span>
+                        </p>
+                      </div>
+
+                      <!-- API Key -->
+                      <div>
+                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">
+                          API Key <span class="normal-case font-normal">(empty = no auth)</span>
+                        </label>
+                        <div class="flex items-center gap-2">
+                          <div class="flex-1 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-500 dark:text-gray-400 font-mono truncate select-all">
+                            {apiKey || '(no key — open access)'}
+                          </div>
+                          {#if apiKey}
+                            <button
+                              on:click={copyKey}
+                              title="Copy key"
+                              class="shrink-0 p-2 rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#161616] text-gray-500 hover:text-blue-600 transition-colors"
+                            >
+                              {#if apiKeyCopied}
+                                <CheckCircle class="w-4 h-4 text-green-500" />
+                              {:else}
+                                <Copy class="w-4 h-4" />
+                              {/if}
+                            </button>
+                          {/if}
+                          <button
+                            on:click={regenKey}
+                            title="{apiKey ? 'Regenerate key' : 'Generate key'}"
+                            class="shrink-0 p-2 rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#161616] text-gray-500 hover:text-blue-600 transition-colors"
+                          >
+                            <RefreshCw class="w-4 h-4" />
+                          </button>
+                        </div>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
+                          Pass as <span class="font-mono">Authorization: Bearer &lt;key&gt;</span>
+                        </p>
+                      </div>
+                    </div>
+
+                    <!-- CLI hint -->
+                    <div class="px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-gray-100 dark:border-[#1a1a1a] rounded-xl">
+                      <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">CLI Usage</p>
+                      <code class="text-[11px] font-mono text-gray-600 dark:text-gray-400">
+                        filo --key $FILOSOPHY_API_KEY search "books by camus"
+                      </code>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="flex items-center gap-3 px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-dashed border-gray-200 dark:border-[#2a2a2a] rounded-xl text-gray-400 dark:text-gray-600" transition:slide={{ duration: 150 }}>
+                    <Globe class="w-4 h-4 shrink-0" />
+                    <span class="text-[11px]">Enable to expose a local HTTP API on port {apiPort}</span>
+                  </div>
+                {/if}
+              </section>
+
+              <!-- MCP Server -->
+              <section>
+                <div class="mb-5 flex items-start justify-between">
+                  <div>
+                    <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-1">MCP Server</h4>
+                    <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
+                      Serve Filosophy as an MCP tool over HTTP+SSE so Claude Desktop and other agents can call <code class="font-mono">search_files</code> natively.
+                    </p>
+                  </div>
+                  <button
+                    on:click={toggleMCP}
+                    disabled={accessLoading}
+                    aria-label="Toggle MCP Server"
+                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 mt-1
+                           {mcpEnabled ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                  >
+                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out {mcpEnabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+                  </button>
+                </div>
+
+                {#if mcpEnabled}
+                  <div class="space-y-4" transition:slide={{ duration: 200 }}>
+                    <div class="bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl p-5 space-y-4">
+                      <!-- MCP Key -->
+                      <div>
+                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">
+                          MCP Key <span class="normal-case font-normal">(empty = no auth)</span>
+                        </label>
+                        <div class="flex items-center gap-2">
+                          <input
+                            type="text"
+                            bind:value={mcpKey}
+                            on:blur={saveMCPKey}
+                            on:keydown={e => e.key === 'Enter' && saveMCPKey()}
+                            placeholder="Leave empty to disable auth"
+                            class="flex-1 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          />
+                        </div>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
+                          Independent from the REST API key. Pass as <span class="font-mono">Authorization: Bearer &lt;key&gt;</span>
+                        </p>
+                      </div>
+
+                      <!-- Endpoint info -->
+                      <div>
+                        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">SSE Endpoint</p>
+                        <p class="text-[11px] font-mono text-gray-600 dark:text-gray-400">http://127.0.0.1:{apiPort}/mcp/sse</p>
+                      </div>
+                    </div>
+
+                    <!-- Claude Desktop snippet -->
+                    <div class="space-y-2">
+                      <div class="flex items-center justify-between">
+                        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Claude Desktop Config</p>
+                        <button
+                          on:click={copySnippet}
+                          class="flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold rounded-full border border-gray-200 dark:border-[#2a2a2a] text-gray-500 hover:text-blue-600 transition-colors"
+                        >
+                          {#if snippetCopied}
+                            <CheckCircle class="w-3 h-3 text-green-500" />
+                            <span class="text-green-600">Copied</span>
+                          {:else}
+                            <Copy class="w-3 h-3" />
+                            <span>Copy</span>
+                          {/if}
+                        </button>
+                      </div>
+                      <pre class="px-4 py-3 text-[10px] font-mono text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-[#0d0d0d] border border-gray-100 dark:border-[#1a1a1a] rounded-xl overflow-x-auto whitespace-pre leading-relaxed">{claudeDesktopSnippet}</pre>
+                      <p class="text-[10px] text-gray-400 dark:text-gray-500">
+                        Add this to your <span class="font-mono">claude_desktop_config.json</span>
+                      </p>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="flex items-center gap-3 px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-dashed border-gray-200 dark:border-[#2a2a2a] rounded-xl text-gray-400 dark:text-gray-600" transition:slide={{ duration: 150 }}>
+                    <Lock class="w-4 h-4 shrink-0" />
+                    <span class="text-[11px]">Enable to serve Filosophy as an MCP tool on <span class="font-mono">http://127.0.0.1:{apiPort}/mcp/sse</span></span>
+                  </div>
+                {/if}
+              </section>
+
             </div>
           {/if}
         </div>

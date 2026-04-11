@@ -110,32 +110,63 @@ type Engine struct {
 	rerankerTok       *tokenizers.Tokenizer       // WordPiece tokenizer for reranker
 	textCollectionID  int                         // cached collection ID for text embeddings
 	imageCollectionID int                         // cached collection ID for image embeddings
-	mu                sync.RWMutex // RWMutex: concurrent reads (Search) don't block each other
-	initTableOnce     sync.Once    // ensures InitIndexTables runs at most once per Engine
+	vDB               *sql.DB                     // connection to vectors.db
+	initTableOnce     sync.Once                   // ensures InitIndexTables runs at most once per Engine
+	writeChan         chan WriteOperation
+	writerWg          sync.WaitGroup
+}
+
+type WriteOpType int
+
+const (
+	OpIndexText WriteOpType = iota
+	OpIndexImage
+	OpIndexMetadata
+	OpMarkContentIndexed
+	OpIndexPathsFTS
+	OpDeletePaths
+	OpRenamePaths
+	OpResetContentIndex
+	OpFlush
+)
+
+type WriteOperation struct {
+	Op         WriteOpType
+	Paths      []string
+	FilePaths  []string
+	FileHashes []int64
+	FileMtimes []int64
+	FileSizes  []int64
+	FileCtimes []int64
+	FileAtimes []int64
+	Contents   []string
+	SqEmbs     []*core.Embedding
+	OldPaths   []string
+	NewPaths   []string
+	Done       chan struct{}
 }
 
 // New initializes the Engine with the given database path and ONNX model paths.
 // textModelPath and imageModelPath should point to directories containing the ONNX model files.
 func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
-	log.Println("[Engine 1] Opening sqvect database at", dbPath)
-	// Open sqvect database for vector operations
-	cfg := sqvect.Config{
-		Path:         dbPath,
-		Dimensions:   0, // auto-detect
-		SimilarityFn: core.CosineSimilarity,
-		IndexType:    core.IndexTypeHNSW,
+	dir := filepath.Dir(dbPath)
+	base := filepath.Base(dbPath)
+	vectorsBase := "vectors.db"
+	if base != "filosophy.db" {
+		vectorsBase = strings.TrimSuffix(base, filepath.Ext(base)) + "_vectors" + filepath.Ext(base)
 	}
-	db, err := sqvect.Open(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqvect database: %w", err)
-	}
+	vectorsDBPath := filepath.Join(dir, vectorsBase)
 
-	// Open a separate sql.DB for the files dedup table
-	log.Println("[Engine 2] Opening companion SQL database...")
+	log.Println("[Engine 1] Opening SQL databases...")
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		db.Close()
 		return nil, fmt.Errorf("failed to open sql database: %w", err)
+	}
+	
+	vDB, err := sql.Open("sqlite", vectorsDBPath)
+	if err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("failed to open vectors sql database: %w", err)
 	}
 
 	_, availBytes := GetMemoryInfo()
@@ -150,8 +181,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		tempStore = "FILE"
 	}
 
-	// WAL mode and pragmas for concurrency
-	for _, pragma := range []string{
+	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		fmt.Sprintf("PRAGMA temp_store=%s", tempStore),
@@ -161,14 +191,31 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		// Checkpoint every 500 pages (~2 MB) so the WAL never grows huge.
 		// A large WAL causes multi-minute recovery on next open after a crash.
 		"PRAGMA wal_autocheckpoint=500",
-	} {
-		if _, err := sqlDB.Exec(pragma); err != nil {
-			log.Printf("pragma warning: %v", err)
-		}
 	}
-	// Allow parallel SQLite readers across goroutines (WAL supports concurrent reads).
-	sqlDB.SetMaxOpenConns(4)
-	sqlDB.SetMaxIdleConns(4)
+
+	for _, dbConn := range []*sql.DB{sqlDB, vDB} {
+		for _, pragma := range pragmas {
+			if _, err := dbConn.Exec(pragma); err != nil {
+				log.Printf("pragma warning: %v", err)
+			}
+		}
+		dbConn.SetMaxOpenConns(4)
+		dbConn.SetMaxIdleConns(4)
+	}
+
+	log.Println("[Engine 2] Opening sqvect database at", vectorsDBPath)
+	cfg := sqvect.Config{
+		Path:         vectorsDBPath,
+		Dimensions:   0, // auto-detect
+		SimilarityFn: core.CosineSimilarity,
+		IndexType:    core.IndexTypeHNSW,
+	}
+	db, err := sqvect.Open(cfg)
+	if err != nil {
+		sqlDB.Close()
+		vDB.Close()
+		return nil, fmt.Errorf("failed to open sqvect database: %w", err)
+	}
 
 	ctx := context.Background()
 
@@ -349,9 +396,10 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		}
 	}
 
-	return &Engine{
+	engine := &Engine{
 		db:                db,
 		sqlDB:             sqlDB,
+		vDB:               vDB,
 		staticEmb:         staticEmb,
 		clipTok:           clipTok,
 		clipTextSession:   clipTextSession,
@@ -360,11 +408,177 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		rerankerTok:       rerankerTok,
 		textCollectionID:  textCol.ID,
 		imageCollectionID: imageCol.ID,
-	}, nil
+		writeChan:         make(chan WriteOperation, 10000),
+	}
+	go engine.runWriter()
+	return engine, nil
 }
+
+func (s *Engine) runWriter() {
+	s.writerWg.Add(1)
+	defer s.writerWg.Done()
+
+	var batch []WriteOperation
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		ctx := context.Background()
+		tx, err := s.sqlDB.BeginTx(ctx, nil)
+		if err != nil {
+			log.Printf("writer begin tx error: %v", err)
+			batch = batch[:0]
+			return
+		}
+
+		var sqEmbsBatch []*core.Embedding
+		var deletePathIDs []string
+
+		for _, op := range batch {
+			switch op.Op {
+			case OpIndexText, OpIndexImage:
+				const query = `
+					INSERT INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
+					VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+					ON CONFLICT(path) DO UPDATE SET
+						hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1,
+						ext=excluded.ext, atime=excluded.atime`
+				for i := range op.FilePaths {
+					ext := strings.ToLower(filepath.Ext(op.FilePaths[i]))
+					tx.ExecContext(ctx, query, op.FilePaths[i], op.FileHashes[i], op.FileMtimes[i], op.FileSizes[i], ext, op.FileCtimes[i], op.FileAtimes[i])
+				}
+				sqEmbsBatch = append(sqEmbsBatch, op.SqEmbs...)
+
+			case OpIndexMetadata:
+				const qFiles = `
+					INSERT OR IGNORE INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
+					VALUES (?, 0, ?, ?, 0, ?, ?, ?)`
+				const qFTS = `INSERT OR IGNORE INTO paths_fts(searchable, path) VALUES (?, ?)`
+				for i := range op.Paths {
+					ext := strings.ToLower(filepath.Ext(op.Paths[i]))
+					tx.ExecContext(ctx, qFiles, op.Paths[i], op.FileMtimes[i], op.FileSizes[i], ext, op.FileCtimes[i], op.FileAtimes[i])
+					tx.ExecContext(ctx, qFTS, pathUnescape(op.Paths[i]), op.Paths[i])
+				}
+
+			case OpMarkContentIndexed:
+				const query = `UPDATE files SET content_indexed=1 WHERE path=?`
+				for _, p := range op.Paths {
+					tx.ExecContext(ctx, query, p)
+				}
+
+			case OpIndexPathsFTS:
+				const query = `INSERT INTO paths_fts(searchable, path) VALUES (?, ?)`
+				for _, p := range op.Paths {
+					tx.ExecContext(ctx, query, pathUnescape(p), p)
+				}
+
+			case OpDeletePaths:
+				for _, path := range op.Paths {
+					rows, errQ := s.vDB.QueryContext(ctx, "SELECT id FROM embeddings WHERE json_extract(metadata, '$.path') = ?", path)
+					if errQ == nil && rows != nil {
+						var ids []string
+						for rows.Next() {
+							var id string
+							rows.Scan(&id)
+							ids = append(ids, id)
+						}
+						rows.Close()
+						deletePathIDs = append(deletePathIDs, ids...)
+					}
+					tx.ExecContext(ctx, "DELETE FROM files WHERE path = ?", path)
+					tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", path)
+				}
+
+			case OpRenamePaths:
+				for i, oldPath := range op.OldPaths {
+					newPath := op.NewPaths[i]
+					s.vDB.ExecContext(ctx, `UPDATE embeddings SET metadata = json_set(metadata, '$.path', ?) WHERE json_extract(metadata, '$.path') = ?`, newPath, oldPath)
+					tx.ExecContext(ctx, "UPDATE files SET path = ? WHERE path = ?", newPath, oldPath)
+					tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", oldPath)
+					tx.ExecContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)", pathUnescape(newPath), newPath)
+				}
+
+			case OpResetContentIndex:
+				tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`)
+				tx.ExecContext(ctx, `DELETE FROM paths_fts`)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("writer commit error: %v", err)
+		}
+
+		if len(sqEmbsBatch) > 0 {
+			if err := s.db.Vector().UpsertBatch(ctx, sqEmbsBatch); err != nil {
+				log.Printf("writer sqvect upsert error: %v", err)
+			}
+		}
+
+		if len(deletePathIDs) > 0 {
+			if err := s.db.Vector().DeleteBatch(ctx, deletePathIDs); err != nil {
+				log.Printf("writer sqvect delete error: %v", err)
+			}
+		}
+
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case op, ok := <-s.writeChan:
+			if !ok {
+				flush()
+				return
+			}
+			if op.Op == OpFlush {
+				flush()
+				if op.Done != nil {
+					close(op.Done)
+				}
+				continue
+			}
+			batch = append(batch, op)
+			if len(batch) >= 50 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// Flush deterministically blocks until all queued operations are committed.
+func (s *Engine) Flush() error {
+	done := make(chan struct{})
+	s.writeChan <- WriteOperation{
+		Op:   OpFlush,
+		Done: done,
+	}
+	<-done
+	return nil
+}
+
+
 
 // Close shuts down the Engine, releasing all resources.
 func (s *Engine) Close() error {
+	if s.writeChan != nil {
+		close(s.writeChan)
+		s.writerWg.Wait()
+	}
+
+	ctx := context.Background()
+	if s.sqlDB != nil {
+		s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	}
+	if s.vDB != nil {
+		s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	}
+
 	var errs []error
 	if s.clipVisionSession != nil {
 		if err := s.clipVisionSession.Destroy(); err != nil {
@@ -395,6 +609,11 @@ func (s *Engine) Close() error {
 	if err := ort.DestroyEnvironment(); err != nil {
 		errs = append(errs, err)
 	}
+	if s.vDB != nil {
+		if err := s.vDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.sqlDB != nil {
 		if err := s.sqlDB.Close(); err != nil {
 			errs = append(errs, err)
@@ -415,11 +634,13 @@ func (s *Engine) Close() error {
 // generated by batched inserts.
 func (s *Engine) TruncateWAL() error {
 	ctx := context.Background()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	_, err := s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
 		log.Printf("WAL truncate error: %v", err)
+	}
+	_, errV := s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	if errV != nil && err == nil {
+		err = errV
 	}
 	return err
 }
@@ -820,50 +1041,13 @@ func getStats(startCPU int64, startTime time.Time) string {
 // Indexing
 // ---------------------------------------------------------------------------
 
-// upsertFiles inserts or updates file-level hashes, mtimes, sizes, and marks the file as content-indexed.
-// ext/ctime/atime are populated on insert; ctime is intentionally not overwritten on conflict
-// (creation time doesn't change), while atime and ext are updated to stay current.
-// Callers must hold s.mu (write lock) before calling.
-func (s *Engine) upsertFiles(ctx context.Context, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
-	if len(filePaths) == 0 {
-		return nil
-	}
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
-		VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-		ON CONFLICT(path) DO UPDATE SET
-			hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1,
-			ext=excluded.ext, atime=excluded.atime`)
-	// ctime is intentionally omitted from the UPDATE: creation time never changes.
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for i := range filePaths {
-		ext := strings.ToLower(filepath.Ext(filePaths[i]))
-		ct := fileCtimes[i]
-		at := fileAtimes[i]
-		if _, err := stmt.ExecContext(ctx, filePaths[i], fileHashes[i], fileMtimes[i], fileSizes[i], ext, ct, at); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
 
 // IndexText generates text embeddings and stores them in the vector DB.
 // contents and paths must have the same length.
 // filePaths/fileHashes are optional file-level metadata for deduplication.
 // Embedding generation runs outside the write lock; only the DB writes are locked.
 func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
-	ctx := context.Background()
-
 	// Generate embeddings outside the lock — staticEmb is read-only (pure Go).
 	embs, err := s.embedText(contents)
 	if err != nil {
@@ -884,15 +1068,15 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 		}
 	}
 
-	// Acquire write lock only for the database writes.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes); err != nil {
-		return fmt.Errorf("upsert files failed: %w", err)
-	}
-	if err := s.db.Vector().UpsertBatch(ctx, sqEmbs); err != nil {
-		return fmt.Errorf("vector upsert failed: %w", err)
+	s.writeChan <- WriteOperation{
+		Op:         OpIndexText,
+		FilePaths:  filePaths,
+		FileHashes: fileHashes,
+		FileMtimes: fileMtimes,
+		FileSizes:  fileSizes,
+		FileCtimes: fileCtimes,
+		FileAtimes: fileAtimes,
+		SqEmbs:     sqEmbs,
 	}
 	return nil
 }
@@ -902,8 +1086,6 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 // paths are the logical paths stored as metadata.
 // Embedding generation runs outside the write lock; only the DB writes are locked.
 func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
-	ctx := context.Background()
-
 	// Generate image embeddings outside the lock.
 	// In practice IndexImage is always called from a single draining goroutine
 	// (HandleChunk/DrainRemaining), never concurrently, so clipVisionSession is safe.
@@ -926,15 +1108,15 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 		}
 	}
 
-	// Acquire write lock only for the database writes.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.upsertFiles(ctx, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes); err != nil {
-		return fmt.Errorf("upsert files failed: %w", err)
-	}
-	if err := s.db.Vector().UpsertBatch(ctx, sqEmbs); err != nil {
-		return fmt.Errorf("vector upsert failed: %w", err)
+	s.writeChan <- WriteOperation{
+		Op:         OpIndexText,
+		FilePaths:  filePaths,
+		FileHashes: fileHashes,
+		FileMtimes: fileMtimes,
+		FileSizes:  fileSizes,
+		FileCtimes: fileCtimes,
+		FileAtimes: fileAtimes,
+		SqEmbs:     sqEmbs,
 	}
 	return nil
 }
@@ -945,28 +1127,10 @@ func (s *Engine) IndexPathsFTS(paths []string) {
 	if len(paths) == 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ctx := context.Background()
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("paths_fts: failed to begin tx: %v", err)
-		return
+	s.writeChan <- WriteOperation{
+		Op:    OpIndexPathsFTS,
+		Paths: paths,
 	}
-	stmt, err := tx.PrepareContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)")
-	if err != nil {
-		tx.Rollback()
-		log.Printf("paths_fts: failed to prepare stmt: %v", err)
-		return
-	}
-	defer stmt.Close()
-	for _, p := range paths {
-		decoded := pathUnescape(p)
-		if _, err := stmt.ExecContext(ctx, decoded, p); err != nil {
-			log.Printf("paths_fts insert warning: %v", err)
-		}
-	}
-	tx.Commit()
 }
 
 // InitIndexTables creates the necessary SQLite tables for indexing (files, paths_fts).
@@ -1039,42 +1203,15 @@ func (s *Engine) IndexMetadata(paths []string, mtimes, sizes, ctimes, atimes []i
 	if len(paths) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ctx := context.Background()
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	s.writeChan <- WriteOperation{
+		Op:         OpIndexMetadata,
+		Paths:      paths,
+		FileMtimes: mtimes,
+		FileSizes:  sizes,
+		FileCtimes: ctimes,
+		FileAtimes: atimes,
 	}
-	defer tx.Rollback()
-
-	filesStmt, err := tx.PrepareContext(ctx, `
-		INSERT OR IGNORE INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
-		VALUES (?, 0, ?, ?, 0, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer filesStmt.Close()
-
-	// IX-5 fix: populate the searchable column so FTS5 can index paths immediately.
-	// Previously only path was inserted (searchable=NULL), making all Pass-1 files
-	// invisible to path keyword search until Pass 2 re-ran IndexPathsFTS.
-	ftsStmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO paths_fts(searchable, path) VALUES (?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer ftsStmt.Close()
-
-	for i := range paths {
-		ext := strings.ToLower(filepath.Ext(paths[i]))
-		if _, err := filesStmt.ExecContext(ctx, paths[i], mtimes[i], sizes[i], ext, ctimes[i], atimes[i]); err != nil {
-			return err
-		}
-		if _, err := ftsStmt.ExecContext(ctx, pathUnescape(paths[i]), paths[i]); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 // PruneStale removes index entries for paths that no longer exist on disk.
@@ -1122,25 +1259,11 @@ func (s *Engine) MarkContentIndexed(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	ctx := context.Background()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	s.writeChan <- WriteOperation{
+		Op:    OpMarkContentIndexed,
+		Paths: paths,
 	}
-	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `UPDATE files SET content_indexed=1 WHERE path=?`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, p := range paths {
-		if _, err := stmt.ExecContext(ctx, p); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 // UnindexedFiles returns all files that have not yet been content-indexed, ordered
@@ -1176,19 +1299,10 @@ func (s *Engine) Checkpoint() {
 // ResetContentIndex clears content_indexed/hashes and paths_fts, forcing a full
 // re-index on the next run. Called when --index is passed.
 func (s *Engine) ResetContentIndex() error {
-	ctx := context.Background()
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	s.writeChan <- WriteOperation{
+		Op: OpResetContentIndex,
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM paths_fts`); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,12 +1346,6 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	imageQueryVec := clipEmbs[0]
 
-	// Acquire read lock for all DB operations.
-	// RLock allows concurrent Search() calls to proceed in parallel;
-	// write operations (IndexText/IndexImage) only block briefly during UpsertBatch.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	// Vector search both collections. Images are capped lower than text: they add
 	// semantic coverage but shouldn't flood rankings for text-heavy queries.
 	textResults, err := s.db.Vector().Search(ctx, textQueryVec, core.SearchOptions{
@@ -1275,6 +1383,8 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}()
 
 	// Group B: content FTS signals; fuzzy only runs when exact search finds few docs.
+	contentScores := make(map[string]float64)
+	var contentMu sync.Mutex
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
@@ -1284,6 +1394,11 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		if len(m) < 5 {
 			s.addContentFTSFuzzyRRF(ctx, query, m)
 		}
+		contentMu.Lock()
+		for p, v := range m {
+			contentScores[p] += v
+		}
+		contentMu.Unlock()
 		sigCh <- m
 	}()
 
@@ -1298,6 +1413,11 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		for i, res := range imageResults {
 			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
 		}
+		contentMu.Lock()
+		for p, v := range m {
+			contentScores[p] += v
+		}
+		contentMu.Unlock()
 		sigCh <- m
 	}()
 
@@ -1313,6 +1433,20 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
 	addFilenameBoosts(query, scores)
 	addFuzzyPathBoosts(query, scores)
+
+	// Idea 2: cap path-only results. Any path with zero content signal (no vector
+	// hit, no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
+	// Cap these at pathOnlyScoreCap so they can never beat a real content match.
+	const pathOnlyScoreCap = 0.12
+	for path, score := range scores {
+		if _, hasContent := contentScores[path]; !hasContent && score > pathOnlyScoreCap {
+			scores[path] = pathOnlyScoreCap
+		}
+	}
+
+	// Idea 3: penalize binary/system files that have no business appearing in
+	// document searches. Apply a multiplier based on extension and path prefix.
+	applyNoisePenalties(scores)
 
 	// Batch-fetch size/mtime from the files table — replaces per-result os.Stat.
 	results := s.buildResultsFromScores(ctx, scores)
@@ -1383,10 +1517,6 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("text query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-
-	// Acquire read lock for all DB operations.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: textCollection,
@@ -1464,9 +1594,6 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 	}
 	queryVec := embs[0]
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: imageCollection,
 		TopK:       50,
@@ -1494,81 +1621,27 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 
 // DeletePaths removes all embeddings for the given file paths.
 func (s *Engine) DeletePaths(paths []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ctx := context.Background()
-
-	for _, path := range paths {
-		// Find embedding IDs by path in sqvect's embeddings table
-		rows, err := s.sqlDB.QueryContext(ctx,
-			"SELECT id FROM embeddings WHERE json_extract(metadata, '$.path') = ?", path)
-		if err != nil {
-			return fmt.Errorf("query embeddings by path failed: %w", err)
-		}
-
-		var ids []string
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			ids = append(ids, id)
-		}
-		rows.Close()
-
-		// Delete from sqvect
-		if len(ids) > 0 {
-			if err := s.db.Vector().DeleteBatch(ctx, ids); err != nil {
-				return fmt.Errorf("delete embeddings failed: %w", err)
-			}
-		}
-
-		// Delete from files table
-		if _, err := s.sqlDB.ExecContext(ctx, "DELETE FROM files WHERE path = ?", path); err != nil {
-			return fmt.Errorf("delete files failed: %w", err)
-		}
-
-		// Delete from paths FTS5
-		if _, err := s.sqlDB.ExecContext(ctx,
-			"DELETE FROM paths_fts WHERE path = ?", path); err != nil {
-			log.Printf("paths_fts delete warning: %v", err)
-		}
+	if len(paths) == 0 {
+		return nil
+	}
+	s.writeChan <- WriteOperation{
+		Op:    OpDeletePaths,
+		Paths: paths,
 	}
 	return nil
 }
 
 // RenamePaths updates path references in sqvect embeddings and the files table.
 func (s *Engine) RenamePaths(oldPaths, newPaths []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ctx := context.Background()
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	if len(oldPaths) == 0 {
+		return nil
 	}
-	defer tx.Rollback()
-
-	for i, oldPath := range oldPaths {
-		newPath := newPaths[i]
-		// Update path in sqvect's embeddings metadata JSON
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE embeddings SET metadata = json_set(metadata, '$.path', ?) WHERE json_extract(metadata, '$.path') = ?`,
-			newPath, oldPath); err != nil {
-			return fmt.Errorf("rename embedding paths failed: %w", err)
-		}
-		// Update files table
-		if _, err := tx.ExecContext(ctx, "UPDATE files SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
-			return fmt.Errorf("rename files failed: %w", err)
-		}
-		// Update paths FTS5 (delete old, insert new)
-		tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", oldPath)
-		tx.ExecContext(ctx, "INSERT INTO paths_fts(searchable, path) VALUES (?, ?)", pathUnescape(newPath), newPath)
+	s.writeChan <- WriteOperation{
+		Op:       OpRenamePaths,
+		OldPaths: oldPaths,
+		NewPaths: newPaths,
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 // GetFileHash returns the stored hash for a file path, or 0 if not found.
@@ -1695,10 +1768,13 @@ func (s *Engine) addPathFTSShortPrefixScores(ctx context.Context, query string, 
 	words := strings.Fields(strings.ToLower(query))
 	anchors := make([]string, 0, len(words))
 	for _, w := range words {
-		if len(w) < 3 {
+		// Use 4-char prefix minimum so "camus" → "camu*" only matches near-exact
+		// tokens (camus, camusian…) and not unrelated "cam"-prefix words like
+		// camera, camembert, camouflage.
+		if len(w) < 4 {
 			continue
 		}
-		escaped := strings.ReplaceAll(w[:3], `"`, `""`)
+		escaped := strings.ReplaceAll(w[:4], `"`, `""`)
 		anchors = append(anchors, `"`+escaped+`"*`)
 	}
 	if len(anchors) == 0 {
@@ -1741,7 +1817,7 @@ func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[
 	}
 	ftsQuery := strings.Join(quoted, " OR ")
 
-	rows, err := s.sqlDB.QueryContext(ctx, `
+	rows, err := s.vDB.QueryContext(ctx, `
 		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
 		FROM chunks_fts
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
@@ -1770,7 +1846,7 @@ func (s *Engine) addContentFTSPhraseRRF(ctx context.Context, query string, score
 	escaped := strings.ReplaceAll(query, `"`, `""`)
 	ftsQuery := `"` + escaped + `"`
 
-	rows, err := s.sqlDB.QueryContext(ctx, `
+	rows, err := s.vDB.QueryContext(ctx, `
 		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
 		FROM chunks_fts
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
@@ -1807,7 +1883,7 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 	}
 	ftsQuery := strings.Join(anchors, " ") // AND semantics
 
-	rows, err := s.sqlDB.QueryContext(ctx, `
+	rows, err := s.vDB.QueryContext(ctx, `
 		SELECT json_extract(e.metadata, '$.path'), -bm25(chunks_fts)
 		FROM chunks_fts
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
@@ -2054,12 +2130,30 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 		return
 	}
 
+	// Total query characters (only words ≥ 3 chars participate).
+	queryCharTotal := 0
+	for _, qw := range queryWords {
+		if len(qw) >= 3 {
+			queryCharTotal += len(qw)
+		}
+	}
+	if queryCharTotal == 0 {
+		return
+	}
+
 	for path := range scores {
-		pathWords := splitWords(filepath.Base(path))
+		base := filepath.Base(path)
+		baseLen := len(base)
+		if baseLen == 0 {
+			continue
+		}
+		pathWords := splitWords(base)
 		if len(pathWords) == 0 {
 			continue
 		}
+
 		totalSim := 0.0
+		matchedQueryChars := 0
 		for _, qw := range queryWords {
 			if len(qw) < 3 {
 				continue
@@ -2074,10 +2168,63 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 				}
 			}
 			totalSim += best
+			matchedQueryChars += len(qw)
 		}
 		avgSim := totalSim / float64(len(queryWords))
-		if avgSim >= fuzzyMinWordSim {
-			scores[path] += fuzzyPathBoost * avgSim
+		if avgSim < fuzzyMinWordSim {
+			continue
+		}
+
+		// Coverage ratio: matched query chars vs filename length.
+		// A 5-char query matching inside a 30-char filename scores ~0.17×,
+		// while a 5-char query matching a 6-char filename scores ~0.83×.
+		// This prevents long unrelated paths from cheating via a short
+		// incidental substring match.
+		coverageRatio := float64(matchedQueryChars) / float64(baseLen)
+		if coverageRatio > 1.0 {
+			coverageRatio = 1.0
+		}
+
+		scores[path] += fuzzyPathBoost * avgSim * coverageRatio
+	}
+}
+
+// applyNoisePenalties multiplies down scores for files that are unlikely to be
+// useful document search results:
+//   - Known binary/compiled extensions (.class, .exe, .dll, .inf, .sys, etc.)
+//   - System path prefixes (C:\Windows, C:\Program Files, /usr/lib, etc.)
+func applyNoisePenalties(scores map[string]float64) {
+	// Extensions that are never useful document results — heavy penalty
+	binaryExts := map[string]bool{
+		".class": true, ".exe": true, ".dll": true, ".sys": true,
+		".inf": true, ".ini": true, ".dat": true, ".bin": true,
+		".obj": true, ".lib": true, ".pdb": true, ".ilk": true,
+		".so": true, ".dylib": true, ".o": true, ".a": true,
+		".pyc": true, ".pyo": true, ".wasm": true, ".node": true,
+	}
+
+	// Path prefixes that are system/runtime noise
+	systemPrefixes := []string{
+		`c:\windows\`,
+		`c:\program files\`,
+		`c:\program files (x86)\`,
+		`/usr/lib/`, `/usr/share/`, `/System/Library/`,
+	}
+
+	for path, score := range scores {
+		ext := strings.ToLower(filepath.Ext(path))
+		lower := strings.ToLower(filepath.ToSlash(path))
+
+		if binaryExts[ext] {
+			scores[path] = score * 0.1
+			continue
+		}
+
+		for _, pfx := range systemPrefixes {
+			if strings.HasPrefix(lower, pfx) {
+				scores[path] = score * 0.05
+				break
+			}
 		}
 	}
 }
@@ -2209,7 +2356,7 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 	// Fetch up to maxSnippetsPerDoc best BM25 chunks per path; extractSnippets will then
 	// find all query-term positions within each chunk and extract 800-char windows around
 	// them, covering spread-out occurrences without truncating to an arbitrary prefix.
-	rows, err := s.sqlDB.QueryContext(context.Background(), `
+	rows, err := s.vDB.QueryContext(context.Background(), `
 		SELECT json_extract(e.metadata, '$.path'), content
 		FROM chunks_fts
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid

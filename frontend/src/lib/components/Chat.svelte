@@ -1,7 +1,8 @@
 <script lang="ts">
   import { afterUpdate, createEventDispatcher } from 'svelte';
   import { fade, slide } from 'svelte/transition';
-  import { X, Trash2, AlertCircle, Send, FileText, Settings } from 'lucide-svelte';
+  import { X, Trash2, AlertCircle, Send, FileText, Settings, Search as SearchIcon, Shield, Check } from 'lucide-svelte';
+  import { Search } from '$lib/wailsjs/go/main/App';
 
   const dispatch = createEventDispatcher();
 
@@ -9,8 +10,14 @@
   export let fileContent: string = '';
 
   interface Message {
-    role: 'user' | 'assistant';
+    role: 'user' | 'assistant' | 'tool';
     content: string;
+    tool_call_id?: string;
+    // display-only fields (not sent to API)
+    _searchQuery?: string;
+    _searchResults?: string[];
+    _pendingConfirm?: boolean;
+    _denied?: boolean;
   }
 
   interface LLMConfig {
@@ -30,6 +37,41 @@
   let textareaEl: HTMLTextAreaElement;
   let abortController: AbortController | null = null;
 
+  // Privacy confirm gate
+  let alwaysAllow = false;
+  interface ConfirmState {
+    query: string;
+    results: string[];
+    resolve: (allowed: boolean) => void;
+  }
+  let pendingConfirm: ConfirmState | null = null;
+
+
+  function confirmAllow() {
+    if (!pendingConfirm) return;
+    pendingConfirm.resolve(true);
+    pendingConfirm = null;
+  }
+
+  function confirmDeny() {
+    if (!pendingConfirm) return;
+    pendingConfirm.resolve(false);
+    pendingConfirm = null;
+  }
+
+  function confirmAlwaysAllow() {
+    alwaysAllow = true;
+    confirmAllow();
+  }
+
+  // Pause the agentic loop until user approves/denies sharing results with the LLM
+  function requestConfirm(query: string, results: string[]): Promise<boolean> {
+    if (alwaysAllow) return Promise.resolve(true);
+    return new Promise<boolean>(resolve => {
+      pendingConfirm = { query, results, resolve };
+    });
+  }
+
   function getLLMConfig(): LLMConfig {
     try {
       const stored = localStorage.getItem(LLM_STORAGE_KEY);
@@ -48,6 +90,102 @@
     textareaEl.style.height = Math.min(textareaEl.scrollHeight, 160) + 'px';
   }
 
+  const SEARCH_TOOL = {
+    type: 'function',
+    function: {
+      name: 'search_files',
+      description: `Search the user's locally indexed files using semantic + keyword search.
+Use this whenever the user asks to find, look for, or search files.
+
+QUERY CONSTRUCTION RULES — follow these carefully:
+- Use SHORT, SPECIFIC queries: 1–4 keywords max. Never pass the full user sentence.
+- For author searches: search the author's last name or full name (e.g. "Camus", "Albert Camus").
+- For topic searches: use the core noun/concept (e.g. "existentialism", "climate change").
+- For known titles: search the exact title (e.g. "The Stranger", "The Plague").
+- You can call this tool MULTIPLE TIMES with different queries to improve coverage.
+  Example for "books by Albert Camus": call once with "Albert Camus", then again with "The Stranger" and "The Plague" if needed.
+- The index contains file paths and content — filename matches are strong signals.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Short, specific search query (1–4 keywords). NOT the full user message.',
+          },
+        },
+        required: ['query'],
+      },
+    },
+  };
+
+  async function callLLM(apiMessages: any[], stream: boolean, signal: AbortSignal): Promise<Response> {
+    const cfg = getLLMConfig();
+    let llmEndpoint: string;
+    if (cfg.provider === 'ollama') {
+      llmEndpoint = `${cfg.baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
+    } else {
+      llmEndpoint = `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
+    }
+    const endpoint = `/llmproxy/?url=${encodeURIComponent(llmEndpoint)}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
+    const cfg2 = getLLMConfig();
+    return fetch(endpoint, {
+      method: 'POST',
+      headers,
+      signal,
+      body: JSON.stringify({
+        model: cfg2.model || undefined,
+        messages: apiMessages,
+        tools: [SEARCH_TOOL],
+        tool_choice: 'auto',
+        stream,
+      }),
+    });
+  }
+
+  async function streamResponse(res: Response, assistantMsg: Message): Promise<{ toolCalls: any[] }> {
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    // Accumulate tool call deltas keyed by index
+    const toolCallAccum: Record<number, { id: string; name: string; args: string }> = {};
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta;
+          if (!delta) continue;
+          // Content token
+          if (delta.content) {
+            assistantMsg.content += delta.content;
+            messages = [...messages.slice(0, -1), { ...assistantMsg }];
+          }
+          // Tool call deltas
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0;
+              if (!toolCallAccum[idx]) toolCallAccum[idx] = { id: '', name: '', args: '' };
+              if (tc.id) toolCallAccum[idx].id = tc.id;
+              if (tc.function?.name) toolCallAccum[idx].name += tc.function.name;
+              if (tc.function?.arguments) toolCallAccum[idx].args += tc.function.arguments;
+            }
+          }
+        } catch {}
+      }
+    }
+    return { toolCalls: Object.values(toolCallAccum) };
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || streaming) return;
@@ -63,9 +201,21 @@
     input = '';
     if (textareaEl) { textareaEl.style.height = 'auto'; }
     streaming = true;
+    abortController = new AbortController();
 
     // Build system prompt
-    let systemContent = 'You are a helpful assistant embedded in Filosophy, a local AI-powered file search app. Be concise and helpful.';
+    let systemContent = `You are a helpful file search assistant embedded in Filosophy, a local AI-powered file search app running entirely on the user's machine.
+
+You have access to a search_files tool that searches the user's locally indexed files.
+
+HOW TO USE search_files:
+- Always decompose the user's request into focused, short queries before searching.
+- For "books by Albert Camus": search "Albert Camus" first. If few results, also try known titles like "The Stranger", "The Plague", "The Fall".
+- For "my tax documents from 2023": search "tax 2023", then "invoice 2023" if needed.
+- Never pass the raw user message as the query — extract the key terms.
+- Call the tool multiple times if one query isn't enough.
+- After getting results, tell the user what you found with file names (not full paths). If nothing was found, say so clearly.
+- Be concise. Don't make up files that weren't in the search results.`;
     if (contextFile) {
       systemContent += `\n\nContext: the user has selected the file "${contextFile.Path}".`;
       if (fileContent) {
@@ -74,66 +224,93 @@
       }
     }
 
-    const apiMessages = [
+    // apiMessages mirrors what we send to the LLM (includes tool messages not shown in UI)
+    const apiMessages: any[] = [
       { role: 'system', content: systemContent },
-      ...messages,
+      ...messages.filter(m => m.role !== 'tool' || m.tool_call_id).map(m => {
+        if (m.role === 'tool') return { role: 'tool', content: m.content, tool_call_id: m.tool_call_id };
+        return { role: m.role, content: m.content };
+      }),
     ];
 
-    let endpoint: string;
-    if (cfg.provider === 'ollama') {
-      endpoint = `${cfg.baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
-    } else {
-      endpoint = `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    }
-
-    const assistantMsg: Message = { role: 'assistant', content: '' };
-    messages = [...messages, assistantMsg];
-
-    abortController = new AbortController();
-
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
-
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        signal: abortController.signal,
-        body: JSON.stringify({
-          model: cfg.model || undefined,
-          messages: apiMessages,
-          stream: true,
-        }),
-      });
-
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status} — ${body || res.statusText}`);
-      }
-
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
+      // Agentic loop: keep going until LLM stops calling tools
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
-          try {
-            const json = JSON.parse(data);
-            const delta = json.choices?.[0]?.delta?.content ?? '';
-            if (delta) {
-              assistantMsg.content += delta;
-              messages = [...messages.slice(0, -1), { ...assistantMsg }];
-            }
-          } catch {}
+        const assistantMsg: Message = { role: 'assistant', content: '' };
+        messages = [...messages, assistantMsg];
+
+        const res = await callLLM(apiMessages, true, abortController.signal);
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          throw new Error(`HTTP ${res.status} — ${body || res.statusText}`);
         }
+
+        const { toolCalls } = await streamResponse(res, assistantMsg);
+
+        // Append the assistant turn to apiMessages
+        const assistantApiMsg: any = { role: 'assistant', content: assistantMsg.content || null };
+        if (toolCalls.length > 0) {
+          assistantApiMsg.tool_calls = toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: tc.args },
+          }));
+        }
+        apiMessages.push(assistantApiMsg);
+
+        if (toolCalls.length === 0) break; // LLM is done with tools
+
+        // Execute each tool call
+        for (const tc of toolCalls) {
+          if (tc.name !== 'search_files') continue;
+          let query = '';
+          try { query = JSON.parse(tc.args).query ?? ''; } catch {}
+
+          // Show a search indicator in the UI
+          const searchMsg: Message = {
+            role: 'tool',
+            content: '',
+            tool_call_id: tc.id,
+            _searchQuery: query,
+            _searchResults: [],
+          };
+          messages = [...messages, searchMsg];
+
+          let resultText = 'No results found.';
+          let resultPaths: string[] = [];
+          try {
+            const results = await Search(query);
+            if (results && results.length > 0) {
+              resultPaths = results.slice(0, 10).map(r => r.Path);
+              resultText = resultPaths.join('\n');
+            }
+          } catch (e) {
+            resultText = 'Search failed: ' + String(e);
+          }
+
+          // Privacy gate — ask user before sending file paths to the LLM
+          if (resultPaths.length > 0) {
+            searchMsg._searchResults = resultPaths;
+            searchMsg._pendingConfirm = true;
+            messages = [...messages.slice(0, -1), { ...searchMsg }];
+
+            const allowed = await requestConfirm(query, resultPaths);
+
+            searchMsg._pendingConfirm = false;
+            if (!allowed) {
+              searchMsg._denied = true;
+              messages = [...messages.slice(0, -1), { ...searchMsg }];
+              resultText = 'User denied sharing these results with the AI.';
+            } else {
+              messages = [...messages.slice(0, -1), { ...searchMsg }];
+            }
+          } else {
+            messages = [...messages.slice(0, -1), { ...searchMsg }];
+          }
+
+          apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
+        }
+        // Loop — LLM will now respond with the search results in context
       }
     } catch (e: any) {
       if (e?.name === 'AbortError') {
@@ -270,6 +447,59 @@
           <div class="flex justify-end" in:fade={{ duration: 150 }}>
             <div class="max-w-[80%] px-4 py-3 bg-slate-900 dark:bg-white text-white dark:text-black text-[13px] leading-relaxed font-sans whitespace-pre-wrap">
               {msg.content}
+            </div>
+          </div>
+        {:else if msg.role === 'tool'}
+          <!-- Search tool call indicator -->
+          <div class="flex gap-2 items-start" in:fade={{ duration: 150 }}>
+            <div class="w-6 h-6 shrink-0 mt-0.5 flex items-center justify-center text-gray-400 dark:text-gray-500">
+              <SearchIcon class="w-3.5 h-3.5" />
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-1.5">
+                Searched: <span class="text-blue-500 dark:text-blue-400 normal-case font-mono">{msg._searchQuery}</span>
+              </p>
+
+              {#if msg._searchResults && msg._searchResults.length > 0}
+                <div class="border border-gray-100 dark:border-[#2a2a2a] divide-y divide-gray-100 dark:divide-[#2a2a2a] mb-2">
+                  {#each msg._searchResults as path}
+                    <p class="px-3 py-1.5 text-[10px] text-gray-500 dark:text-gray-400 font-mono truncate">{path.split(/[\\/]/).pop()}<span class="text-gray-300 dark:text-gray-600 ml-1 text-[9px]">{path.split(/[\\/]/).slice(0,-1).join('/')}</span></p>
+                  {/each}
+                </div>
+
+                {#if msg._pendingConfirm}
+                  <!-- Confirm gate -->
+                  <div class="border border-amber-200 dark:border-amber-900/40 bg-amber-50/50 dark:bg-amber-950/10 p-3" transition:slide={{ duration: 150 }}>
+                    <div class="flex items-center gap-1.5 mb-2">
+                      <Shield class="w-3 h-3 text-amber-500 shrink-0" />
+                      <p class="text-[10px] font-bold text-amber-700 dark:text-amber-400 uppercase tracking-widest">Share these files with the AI?</p>
+                    </div>
+                    <p class="text-[10px] text-amber-600 dark:text-amber-500 mb-3 leading-relaxed">
+                      The file paths above will be sent to your LLM to answer your question.
+                    </p>
+                    <div class="flex gap-2">
+                      <button
+                        on:click={confirmDeny}
+                        class="flex-1 py-1.5 border border-gray-200 dark:border-[#2a2a2a] text-[9px] font-bold uppercase tracking-widest text-gray-500 hover:bg-gray-50 dark:hover:bg-[#1a1a1a] transition-colors"
+                      >Deny</button>
+                      <button
+                        on:click={confirmAllow}
+                        class="flex-1 py-1.5 bg-slate-900 dark:bg-white text-white dark:text-black text-[9px] font-bold uppercase tracking-widest hover:bg-slate-700 dark:hover:bg-gray-200 transition-colors flex items-center justify-center gap-1.5"
+                      ><Check class="w-3 h-3" /> Allow</button>
+                    </div>
+                    <button
+                      on:click={confirmAlwaysAllow}
+                      class="mt-2 w-full text-[9px] text-gray-400 dark:text-gray-600 hover:text-gray-600 dark:hover:text-gray-400 transition-colors"
+                    >Always allow (don't ask again)</button>
+                  </div>
+                {:else if msg._denied}
+                  <p class="text-[10px] text-red-400 dark:text-red-500 italic">Sharing denied — results not sent to AI</p>
+                {:else}
+                  <p class="text-[10px] text-green-600 dark:text-green-500 flex items-center gap-1"><Check class="w-3 h-3" /> Shared with AI</p>
+                {/if}
+              {:else}
+                <p class="text-[10px] text-gray-400 italic">No results found</p>
+              {/if}
             </div>
           </div>
         {:else}

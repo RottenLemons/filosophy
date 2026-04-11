@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"filosophy/daemon"
 	"filosophy/shared"
 
 	"github.com/syncthing/notify"
@@ -29,18 +30,19 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
-	"golang.org/x/sys/windows"
 )
 
 //go:embed all:frontend/build
 var assets embed.FS
+
+//go:embed cmd/daemon/icon.ico
+var trayIcon []byte
 
 // Pass-2 file extraction (kreuzberg) is I/O-bound: 2×CPU keeps the pipeline
 // saturated while half the goroutines wait on disk reads.
 var maxConcurrency = runtime.NumCPU() * 2
 var imageBatchSize = 100 // Defaults, adapted at startup
 
-const daemonPidFile = "filosophy-daemon.pid"
 const appPidFile = "filosophy-app.pid"
 
 // FolderState describes a directory and whether it is content-indexed.
@@ -56,6 +58,16 @@ type IndexingStatus struct {
 	IsIndexing    bool   `json:"isIndexing"`
 	StatusMessage string `json:"statusMessage"`
 	Progress      int    `json:"progress"`
+}
+
+// filteredWriter drops log lines that contain noisy strings we never want in the log file.
+type filteredWriter struct{ w *os.File }
+
+func (fw *filteredWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "http: proxy error: context canceled") {
+		return len(p), nil
+	}
+	return fw.w.Write(p)
 }
 
 // getHomeSubdirs returns the names of all non-hidden, non-system direct subdirectories
@@ -140,80 +152,10 @@ func (a *App) makeFolderState(name, path string) FolderState {
 	}
 }
 
-// isDaemonRunning checks whether a previously launched daemon process is still alive.
-func isDaemonRunning(cwd string) bool {
-	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return false
-	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
-	if err != nil {
-		return false
-	}
-	defer windows.CloseHandle(h)
-	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil {
-		return false
-	}
-	return code == 259 // STILL_ACTIVE
-}
 
-// stopDaemonProcess kills the daemon process recorded in the PID file.
-func stopDaemonProcess(cwd string) {
-	data, err := os.ReadFile(filepath.Join(cwd, daemonPidFile))
-	if err != nil {
-		return
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return
-	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		proc.Kill()
-	}
-	os.Remove(filepath.Join(cwd, daemonPidFile))
-}
-
-// launchDaemon starts filosophy-daemon.exe as a detached process.
-func launchDaemon(cwd string) {
-	if isDaemonRunning(cwd) {
-		log.Println("daemon already running, skipping launch")
-		return
-	}
-
-	exe, _ := os.Executable()
-	daemonExe := filepath.Join(filepath.Dir(exe), "filosophy-daemon.exe")
-	if _, err := os.Stat(daemonExe); err != nil {
-		daemonExe = ""
-	}
-
-	var cmd *exec.Cmd
-	if daemonExe != "" {
-		cmd = exec.Command(daemonExe)
-	} else {
-		cmd = exec.Command("go", "run", "./cmd/daemon")
-	}
-	cmd.Dir = cwd
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("failed to launch daemon: %v", err)
-		return
-	}
-	log.Printf("daemon launched (pid %d)", cmd.Process.Pid)
-	cmd.Process.Release()
-}
 
 func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
-	if ctx != nil {
-		a.setStatus(true, "Phase 1/2: Scanning directories...", 0)
-	}
 
 	cfg, err := shared.NewProcessorConfig(8096, 4000, imageBatchSize, sc)
 	if err != nil {
@@ -283,9 +225,6 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	}
 
 	if pruneStale && sc != nil {
-		if ctx != nil {
-			a.setStatus(true, "Phase 1/2: Pruning stale files...", 0)
-		}
 		log.Println("[Indexer] Phase 1/2: Pruning stale files...")
 		if err := sc.PruneStale(paths); err != nil {
 			log.Println("pass1 prune error:", err)
@@ -293,9 +232,6 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	}
 
 	if sc != nil {
-		if ctx != nil {
-			a.setStatus(true, "Phase 1/2: Indexing metadata...", 0)
-		}
 		log.Println("[Indexer] Phase 1/2: Indexing metadata...")
 		if err := sc.IndexMetadata(paths, mtimes, sizes, ctimes, atimes); err != nil {
 			log.Println("pass1 metadata index error:", err)
@@ -678,10 +614,10 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 
 // App struct holds the application state
 type App struct {
-	ctx              context.Context
-	engine           *shared.Engine
-	config           *shared.AppConfig
-	hasGPU           atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
+	ctx                context.Context
+	engine             *shared.Engine
+	config             *shared.AppConfig
+	hasGPU             atomic.Bool // atomic: written from GPU-detection goroutine, read from CheckSystemGPU
 	engineInitializing atomic.Bool // true while engine is being initialized (WAL recovery etc.)
 
 	// Thread-safe state tracking for the frontend fetch
@@ -690,15 +626,27 @@ type App struct {
 	statusMessage string
 	progress      int
 
+	// trayStatusCh receives tray label strings from setStatus so the tray
+	// goroutine can update its menu item without polling. Buffered to avoid blocking.
+	trayStatusCh chan string
+
 	indexerCancel context.CancelFunc
 	cwd           string
 	home          string
 	homeWatchStop chan struct{}
 	mu            sync.Mutex
+	daemon        *daemon.Daemon
+
+	// External API server
+	apiServer *APIServer
 }
 
 func NewApp() *App {
-	return &App{}
+	a := &App{
+		trayStatusCh: make(chan string, 4),
+	}
+	a.apiServer = newAPIServer(a)
+	return a
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -765,7 +713,7 @@ func (a *App) startup(ctx context.Context) {
 	imageModelPath := filepath.Join(cwd, "image")
 
 	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		log.SetOutput(lf)
+		log.SetOutput(&filteredWriter{w: lf})
 	}
 
 	// Write app PID so the daemon's tray "Exit" can close us too.
@@ -793,7 +741,11 @@ func (a *App) startup(ctx context.Context) {
 				out, err := exec.Command("wmic", "path", "Win32_VideoController", "get", "Name").Output()
 				if err == nil {
 					lower := strings.ToLower(string(out))
-					for _, kw := range []string{"nvidia", "amd", "radeon", "geforce", "quadro", "arc "} {
+					// Match dedicated GPUs only:
+					//   Nvidia: any GeForce/RTX/GTX/Quadro (Nvidia has no iGPUs)
+					//   AMD: "radeon rx" — integrated Radeon (780M, 760M…) never carry "rx"
+					//   Intel: "arc" dedicated (not UHD/Iris which are integrated)
+					for _, kw := range []string{"nvidia", "geforce", "quadro", "radeon rx", "arc a"} {
 						if strings.Contains(lower, kw) {
 							hasGPU = true
 							break
@@ -841,7 +793,8 @@ func (a *App) startup(ctx context.Context) {
 			wailsruntime.EventsEmit(a.ctx, "engine_status", "offline")
 			if !dbMissing {
 				log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
-				launchDaemon(cwd)
+				a.daemon = daemon.NewDaemon(dirs, a.engine)
+				a.daemon.Start()
 			}
 			return
 		}
@@ -858,19 +811,61 @@ func (a *App) startup(ctx context.Context) {
 			}
 		}
 
-		log.Println("[Boot 7] Initializing background indexing...")
-		log.Println("[Boot 8] Running background metadata sync...")
-		a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
-		a.runPass2(idxCtx, a.engine)
+		// Push the initial "ready" tray label now the engine is up.
+		select {
+		case a.trayStatusCh <- "Filosophy — Ready":
+		default:
+		}
 
-		log.Println("[Boot 9] Initial sync complete. Launching daemon...")
-		launchDaemon(cwd)
-		go runSystemPathIndex(idxCtx, a.engine)
+		log.Println("[Boot 7] Initializing background indexing...")
+		// Always launch indexing in the background on boot to synchronize changes and resume partial scans
+		go func() {
+			log.Println("[Boot 8] Running background metadata sync...")
+			// runPass1 checks for new/deleted files (Metadata)
+			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+
+			// Deterministically block until pass 1 metadata has landed on disk
+			a.engine.Flush()
+
+			// runPass2 processes any unindexed content (Semantic)
+			a.runPass2(idxCtx, a.engine)
+
+			// Indexing complete — update the tray to reflect idle state.
+			select {
+			case a.trayStatusCh <- "Filosophy — Indexing complete":
+			default:
+			}
+			// Revert to idle label after a few seconds so it doesn't stay "complete" forever.
+			go func() {
+				time.Sleep(8 * time.Second)
+				select {
+				case a.trayStatusCh <- "Filosophy — Idle":
+				default:
+				}
+			}()
+
+			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon...")
+			a.daemon = daemon.NewDaemon(dirs, a.engine)
+			a.daemon.Start()
+			go runSystemPathIndex(idxCtx, a.engine)
+		}()
 	}()
 
 	// Watch home dir top level so the frontend can react to new/deleted folders.
 	a.homeWatchStop = make(chan struct{})
 	go a.watchHomeFolders()
+
+	// Start external API/MCP server if either is enabled
+	if a.config.APIEnabled || a.config.MCPEnabled {
+		if a.config.APIEnabled && a.config.APIKey == "" {
+			a.config.APIKey = GenerateAPIKey()
+			a.config.Save()
+		}
+		if err := a.apiServer.start(); err != nil {
+			log.Println("API server failed to start:", err)
+		}
+	}
+
 	log.Println("[Boot 13] Startup sequence complete (Main Thread Released)")
 }
 
@@ -948,9 +943,13 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.indexerCancel != nil {
 		a.indexerCancel()
 	}
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
 	if a.engine != nil {
 		a.engine.Close()
 	}
+	a.apiServer.stop()
 }
 
 // GetIndexingStatus allows the frontend to fetch the exact state on mount
@@ -978,6 +977,17 @@ func (a *App) setStatus(isIndexing bool, message string, progress int) {
 		StatusMessage: message,
 		Progress:      progress,
 	})
+
+	// Push a tray label — non-blocking: drop the update if the channel is full
+	// (the tray goroutine will catch the next one).
+	label := "Filosophy — Idle"
+	if isIndexing {
+		label = fmt.Sprintf("Filosophy — Indexing %d%%", progress)
+	}
+	select {
+	case a.trayStatusCh <- label:
+	default:
+	}
 }
 
 // GetEngineStatus returns "ready", "initializing", or "offline".
@@ -1091,11 +1101,14 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	}
 
 	// Restart daemon with updated dir list.
-	stopDaemonProcess(a.cwd)
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
 
 	if !indexed {
 		// Just disable — restart daemon and done.
-		launchDaemon(a.cwd)
+		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+		a.daemon.Start()
 		return nil
 	}
 
@@ -1114,7 +1127,8 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
-			launchDaemon(a.cwd)
+			a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+			a.daemon.Start()
 		}()
 		return nil
 	}
@@ -1131,7 +1145,8 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	go func() {
 		a.runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
 		a.runPass2(idxCtx, a.engine)
-		launchDaemon(a.cwd)
+		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+		a.daemon.Start()
 	}()
 
 	return nil
@@ -1172,9 +1187,11 @@ func (a *App) RemoveExtraDirectory(dirPath string) error {
 		return err
 	}
 	log.Printf("Removed extra directory: %s", dirPath)
-	// Restart daemon so it stops watching the removed directory.
-	stopDaemonProcess(a.cwd)
-	launchDaemon(a.cwd)
+	if a.daemon != nil {
+		a.daemon.Stop()
+	}
+	a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
+	a.daemon.Start()
 	return nil
 }
 
@@ -1202,13 +1219,105 @@ func (a *App) SetGPUAcceleration(enabled bool) error {
 	return a.config.Save()
 }
 
+// ── External API management ───────────────────────────────────────────────────
+
+type APIConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Port       int    `json:"port"`
+	APIKey     string `json:"apiKey"`
+	MCPEnabled bool   `json:"mcpEnabled"`
+	MCPKey     string `json:"mcpKey"`
+}
+
+func (a *App) GetAPIConfig() APIConfig {
+	return APIConfig{
+		Enabled:    a.config.APIEnabled,
+		Port:       a.config.APIPort,
+		APIKey:     a.config.APIKey,
+		MCPEnabled: a.config.MCPEnabled,
+		MCPKey:     a.config.MCPKey,
+	}
+}
+
+func (a *App) SetAPIEnabled(enabled bool) error {
+	a.config.APIEnabled = enabled
+	if enabled {
+		if a.config.APIKey == "" {
+			a.config.APIKey = GenerateAPIKey()
+		}
+		if err := a.config.Save(); err != nil {
+			return err
+		}
+		return a.apiServer.restart()
+	}
+	if !a.config.MCPEnabled {
+		a.apiServer.stop()
+	}
+	return a.config.Save()
+}
+
+func (a *App) SetMCPEnabled(enabled bool) error {
+	a.config.MCPEnabled = enabled
+	if enabled {
+		if a.config.MCPKey == "" {
+			a.config.MCPKey = GenerateAPIKey()
+		}
+		if err := a.config.Save(); err != nil {
+			return err
+		}
+		return a.apiServer.restart()
+	}
+	if !a.config.APIEnabled {
+		a.apiServer.stop()
+	}
+	return a.config.Save()
+}
+
+func (a *App) SetMCPKey(key string) error {
+	a.config.MCPKey = key
+	if err := a.config.Save(); err != nil {
+		return err
+	}
+	if a.config.MCPEnabled {
+		return a.apiServer.restart()
+	}
+	return nil
+}
+
+func (a *App) SetAPIPort(port int) error {
+	if port < 1024 || port > 65535 {
+		return fmt.Errorf("port must be between 1024 and 65535")
+	}
+	a.config.APIPort = port
+	if err := a.config.Save(); err != nil {
+		return err
+	}
+	if a.config.APIEnabled {
+		return a.apiServer.restart()
+	}
+	return nil
+}
+
+func (a *App) RegenerateAPIKey() (string, error) {
+	a.config.APIKey = GenerateAPIKey()
+	return a.config.APIKey, a.config.Save()
+}
+
+
 func main() {
 	app := NewApp()
+
+	// Run the system tray on a dedicated goroutine locked to its own OS thread.
+	// The custom Windows implementation (tray_windows.go) fixes:
+	//   - right-click stopping after first use (missing SetForegroundWindow+WM_NULL)
+	//   - double-click to show the window (WM_LBUTTONDBLCLK)
+	go runTray(app)
 
 	err := wails.Run(&options.App{
 		Title:  "Filosophy",
 		Width:  1280,
 		Height: 800,
+		HideWindowOnClose: true,
 		AssetServer: &assetserver.Options{
 			Assets:  assets,
 			Handler: &LocalFileHandler{},
@@ -1230,6 +1339,55 @@ type LocalFileHandler struct {
 }
 
 func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /llmproxy/?url=<encoded-url> — forwards POST bodies and streams responses back.
+	// Used by Chat.svelte to bypass WebView2 loopback network restrictions.
+	if r.URL.Path == "/llmproxy/" || r.URL.Path == "/llmproxy" {
+		target := r.URL.Query().Get("url")
+		if target == "" {
+			http.Error(w, "missing url param", http.StatusBadRequest)
+			return
+		}
+		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		// Forward relevant headers (content-type, authorization)
+		for _, hdr := range []string{"Content-Type", "Authorization"} {
+			if v := r.Header.Get(hdr); v != "" {
+				proxyReq.Header.Set(hdr, v)
+			}
+		}
+		resp, err := http.DefaultClient.Do(proxyReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		// Copy response headers then body (supports streaming/SSE)
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		buf := make([]byte, 4096)
+		flusher, canFlush := w.(http.Flusher)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				if canFlush {
+					flusher.Flush()
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		return
+	}
+
 	if strings.HasPrefix(r.URL.Path, "/loadfile/") {
 		filePath := strings.TrimPrefix(r.URL.Path, "/loadfile/")
 		decodedPath := filePath
