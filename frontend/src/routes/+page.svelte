@@ -610,37 +610,29 @@
     
   </main>
   
-  <!-- Task 10: Persistent Engine Health Badge (UX Remediation H1) -->
+  <!-- Task 3: The "Engine Ready" Status (Curator Style) -->
   {#if searchErrorMsg !== 'backend engine not initialized'}
     <div 
-      class="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-2"
-      transition:fade={{ duration: 300 }}
+      class="fixed bottom-8 right-8 z-[1000] flex flex-col items-end gap-2"
+      transition:fade={{ duration: 400 }}
     >
-      <div class="bg-white/80 dark:bg-black/50 backdrop-blur-md border border-gray-200/50 dark:border-white/10 px-4 py-2 rounded-2xl shadow-2xl flex items-center gap-3">
+      <div class="bg-[#2b2c2c]/80 backdrop-blur-[20px] rounded-md px-3 py-1.5 flex items-center gap-3 border border-[#474848]/20 shadow-[0_16px_32px_-12px_rgba(0,0,0,0.5)]">
         <div class="relative flex items-center justify-center">
-            <Activity class="w-4 h-4 {$indexingStatus.isIndexing ? 'text-blue-500 animate-pulse' : 'text-emerald-500 dark:text-emerald-400'}" />
-            {#if $indexingStatus.isIndexing}
-              <div class="absolute inset-0 bg-blue-500/20 blur-lg rounded-full animate-pulse"></div>
-            {/if}
+            <div class="w-1.5 h-1.5 rounded-full bg-[#bfc8ca] animate-pulse shadow-[0_0_8px_rgba(191,200,202,0.8)]"></div>
         </div>
-        <div class="flex flex-col">
-          <span class="text-[10px] font-black {$indexingStatus.isIndexing ? 'text-blue-600 dark:text-blue-400' : 'text-emerald-600 dark:text-emerald-500'} uppercase tracking-tighter leading-none mb-0.5">
-            {$indexingStatus.isIndexing ? 'Backend Engine Busy' : 'Filosophy Engine'}
-          </span>
-          <span class="text-[11px] font-bold text-gray-900 dark:text-gray-100 tracking-tight leading-none">
-            {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Syncing...') : 'System Ready'}
-          </span>
-        </div>
+        <span class="font-sans text-xs text-[#e7e5e5] tracking-wide">
+          {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Indexing...') : 'Engine Online'}
+        </span>
       </div>
       
-      <!-- Micro-progress bar (only visible when indexing) -->
+      <!-- TASK 2: Micro-progress bar -->
       {#if $indexingStatus.isIndexing}
         <div 
-            class="w-48 h-1 bg-gray-200/50 dark:bg-white/5 rounded-full overflow-hidden backdrop-blur-sm border border-white/5"
+            class="w-48 h-1 bg-[#252626] rounded-sm overflow-hidden border border-[#474848]/10"
             transition:slide={{ axis: 'y' }}
         >
             <div 
-            class="h-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.6)] transition-all duration-500 ease-out"
+            class="h-full bg-gradient-to-br from-[#bfc8ca] to-[#3f484a] transition-all duration-300 ease-out"
             style="width: {$indexingStatus.progress}%"
             ></div>
         </div>

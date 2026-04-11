@@ -111,97 +111,101 @@
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div 
-    class="fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
+    class="fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
     transition:fade={{ duration: 200 }}
     on:click|self={close}
   >
     <div 
       bind:this={modalElement}
-      class="w-full max-w-4xl h-[640px] bg-[#FAF9F6] dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-2xl flex overflow-hidden rounded-lg"
+      class="w-full max-w-4xl h-[640px] bg-[#0e0e0e] border border-[#474848]/20 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.8)] flex overflow-hidden rounded-sm"
       transition:fly={{ y: 20, duration: 400, opacity: 0 }}
       role="dialog"
       aria-modal="true"
     >
       <!-- Sidebar Navigation -->
-      <aside class="w-64 border-r border-gray-200 dark:border-[#2a2a2a] bg-gray-50/50 dark:bg-[#0a0a0a] flex flex-col pt-12">
+      <aside class="w-64 bg-[#131313] flex flex-col pt-12 border-r border-[#474848]/10">
         <div class="px-6 mb-8">
-          <h2 class="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 dark:text-gray-500">Settings</h2>
-          <div class="mt-1 h-px w-8 bg-blue-500"></div>
+          <h2 class="text-[#acabab] text-xs uppercase tracking-widest font-sans font-bold">Settings</h2>
+          <div class="mt-2 h-0.5 w-6 bg-[#bfc8ca]"></div>
         </div>
 
         <nav class="flex-1 px-3 space-y-1">
           <button 
             on:click={() => activeTab = 'folders'}
-            class="w-full flex items-center gap-3 px-3 py-2.5 text-xs font-semibold rounded-md transition-all
+            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
                    {activeTab === 'folders' 
-                     ? 'bg-white dark:bg-[#1a1a1a] text-blue-600 dark:text-white shadow-sm border border-gray-200 dark:border-[#333]' 
-                     : 'text-gray-500 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-[#151515]'}"
+                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner' 
+                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
           >
             <Folder class="w-4 h-4" />
-            <span>Indexed Folders</span>
+            <span class="uppercase tracking-widest text-[10px]">Indexed Folders</span>
           </button>
 
           <button 
             on:click={() => activeTab = 'hardware'}
-            class="w-full flex items-center gap-3 px-3 py-2.5 text-xs font-semibold rounded-md transition-all
+            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
                    {activeTab === 'hardware' 
-                     ? 'bg-white dark:bg-[#1a1a1a] text-blue-600 dark:text-white shadow-sm border border-gray-200 dark:border-[#333]' 
-                     : 'text-gray-500 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-[#151515]'}"
+                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner' 
+                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
           >
             <Cpu class="w-4 h-4" />
-            <span>Hardware</span>
+            <span class="uppercase tracking-widest text-[10px]">Hardware</span>
           </button>
         </nav>
 
         <!-- Sidebar Footer Status -->
-        <div class="p-6 space-y-4 border-t border-gray-100 dark:border-[#1a1a1a]">
+        <div class="p-6 space-y-4 bg-[#0e0e0e]">
           {#if $indexingStatus.isIndexing}
-            <div class="space-y-2" transition:slide>
-              <div class="flex items-center justify-between text-[9px] font-bold uppercase tracking-wider text-blue-600 dark:text-blue-400">
-                <div class="flex items-center gap-1.5">
-                  <Activity class="w-3 h-3 animate-pulse" />
+            <div class="space-y-3" transition:slide>
+              <div class="flex items-center justify-between text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab]">
+                <div class="flex items-center gap-2">
+                  <Activity class="w-3 h-3 animate-pulse text-[#bfc8ca]" />
                   <span>Indexing</span>
                 </div>
-                <span>{Math.round($indexingStatus.progress)}%</span>
+                <span class="text-[#e7e5e5]">{Math.round($indexingStatus.progress)}%</span>
               </div>
-              <div class="h-1 w-full bg-gray-200 dark:bg-[#222] rounded-full overflow-hidden">
-                <div class="h-full bg-blue-500 transition-all duration-300" style="width: {$indexingStatus.progress}%"></div>
+              <!-- TASK 2: Loading Bar -->
+              <div class="h-1.5 w-full bg-[#252626] rounded-sm overflow-hidden">
+                <div 
+                  class="h-full bg-gradient-to-br from-[#bfc8ca] to-[#3f484a] transition-all duration-300 ease-out" 
+                  style="width: {$indexingStatus.progress}%"
+                ></div>
               </div>
-              <div class="text-[8px] text-gray-400 dark:text-gray-500 font-medium truncate">
+              <div class="text-[9px] text-[#acabab] font-sans tracking-tight truncate opacity-60">
                 {$indexingStatus.statusMessage}
               </div>
             </div>
           {/if}
           
           {#if engineError}
-            <div class="space-y-2" transition:slide>
-              <div class="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+            <div class="p-3 bg-[#252626] rounded-sm space-y-2 border-l-2 border-[#bfc8ca]" transition:slide>
+              <div class="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-widest text-[#bfc8ca]">
                 <AlertCircle class="w-3 h-3" />
                 <span>Backend Offline</span>
               </div>
-              <div class="text-[8px] text-gray-400 dark:text-gray-500 font-medium leading-tight">
-                AI search engine failed to initialize.
+              <div class="text-[9px] text-[#acabab] leading-tight">
+                AI engine failed to initialize. Check logs.
               </div>
             </div>
           {/if}
           
-          <div class="flex items-center gap-2 text-[9px] font-medium text-gray-400 uppercase tracking-widest">
+          <div class="flex items-center gap-2 text-[9px] font-sans font-bold text-[#acabab] uppercase tracking-widest opacity-40">
             <Settings class="w-3 h-3" />
-            <span>v1.2.0 Stable</span>
+            <span>v1.2.0 stable</span>
           </div>
         </div>
       </aside>
 
       <!-- Main Content Area -->
-      <main class="flex-1 flex flex-col relative bg-white dark:bg-[#111]">
+      <main class="flex-1 flex flex-col relative bg-[#0e0e0e]">
         <!-- Header -->
-        <header class="h-16 flex items-center justify-between px-8 border-b border-gray-100 dark:border-[#1a1a1a] shrink-0">
-          <h3 class="text-sm font-bold text-gray-900 dark:text-white uppercase tracking-wider">
+        <header class="h-20 flex items-center justify-between px-10 shrink-0">
+          <h3 class="text-[#acabab] text-xs uppercase tracking-widest font-sans font-bold">
             {activeTab === 'folders' ? 'Indexing Preferences' : 'System & Performance'}
           </h3>
           <button 
             on:click={close}
-            class="p-2 text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+            class="p-2 text-[#acabab] hover:text-[#e7e5e5] transition-colors"
             aria-label="Close Settings"
           >
             <X class="w-5 h-5" />
@@ -209,32 +213,29 @@
         </header>
 
         <!-- Body -->
-        <div class="flex-1 overflow-y-auto p-10 scrollbar-custom">
+        <div class="flex-1 overflow-y-auto px-10 pb-10 scrollbar-custom">
           {#if activeTab === 'folders'}
-            <div in:fade={{ duration: 200 }} class="flex flex-col h-full">
-              <div class="mb-6 shrink-0">
-                <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-2">Content Libraries</h4>
-                <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
+            <div in:fade={{ duration: 200 }} class="flex flex-col h-full space-y-8">
+              <div class="shrink-0">
+                <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3 text-pretty">Content Libraries</h4>
+                <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
                   Select the directories you want Filosophy to monitor. Folders are recursively indexed for semantic search and metadata extraction.
                 </p>
               </div>
 
               {#if engineError}
-                <div class="flex-1 flex flex-col items-center justify-center p-10 bg-amber-50/50 dark:bg-amber-950/10 border border-amber-100 dark:border-amber-900/30 rounded-xl text-center space-y-4">
-                  <Activity class="w-12 h-12 text-amber-500 animate-pulse" />
+                <div class="flex-1 flex flex-col items-center justify-center p-12 bg-[#131313] rounded-sm text-center space-y-6 border border-[#474848]/20">
+                  <Activity class="w-12 h-12 text-[#bfc8ca] animate-pulse opacity-40" />
                   <div class="space-y-2">
-                    <h5 class="text-lg font-serif font-bold text-amber-900 dark:text-amber-400">Search Engine Offline</h5>
-                    <p class="text-xs text-amber-700 dark:text-amber-500/80 max-w-xs leading-relaxed">
+                    <h5 class="text-xl font-serif text-[#e7e5e5] tracking-tight">Search Engine Offline</h5>
+                    <p class="text-xs text-[#acabab] font-sans leading-relaxed max-w-xs opacity-60">
                       The AI backend failed to initialize. Indexing operations and vector search are currently disabled.
-                    </p>
-                    <p class="text-[10px] font-mono text-amber-600/60 dark:text-amber-500/40 pt-2">
-                      Please check <code>filosophy.log</code> for errors and restart the application.
                     </p>
                   </div>
                   <button 
                     on:click={retryEngine}
                     disabled={retrying}
-                    class="mt-2 px-6 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-full transition-all shadow-lg shadow-amber-900/20 disabled:opacity-50 flex items-center gap-2"
+                    class="px-8 py-3 bg-[#252626] hover:bg-[#2b2c2c] text-[#e7e5e5] text-[10px] uppercase tracking-widest font-bold rounded-sm transition-all border border-[#474848]/30 disabled:opacity-50 flex items-center gap-3"
                   >
                     {#if retrying}
                       <Activity class="w-3 h-3 animate-spin" />
@@ -245,38 +246,38 @@
                   </button>
                 </div>
               {:else}
-                <div class="flex-1 min-h-0 bg-gray-50/50 dark:bg-[#0a0a0a] rounded-xl border border-gray-100 dark:border-[#1a1a1a] overflow-hidden p-6">
+                <div class="flex-1 min-h-0 bg-[#131313] rounded-sm overflow-hidden p-8 border border-[#474848]/10 shadow-inner">
                   <Indexer flat={true} />
                 </div>
               {/if}
             </div>
           {:else if activeTab === 'hardware'}
-            <div in:fade={{ duration: 200 }} class="space-y-12">
+            <div in:fade={{ duration: 200 }} class="space-y-10">
               <section>
-                <div class="mb-6">
-                  <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-2">GPU Acceleration</h4>
-                  <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
+                <div class="mb-8">
+                  <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">GPU Acceleration</h4>
+                  <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
                     Leverage your dedicated graphics card to speed up vector embedding and AI-based reranking.
                   </p>
                 </div>
 
-                <div class="bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl p-6 flex items-center justify-between shadow-sm">
-                  <div class="space-y-1">
-                    <div class="flex items-center gap-2">
-                       <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Hardware Acceleration</span>
+                <div class="bg-[#131313] rounded-sm p-8 flex items-center justify-between border border-[#474848]/10 shadow-sm">
+                  <div class="space-y-2">
+                    <div class="flex items-center gap-3">
+                       <span class="text-sm font-sans font-medium text-[#e7e5e5] uppercase tracking-widest">Hardware Acceleration</span>
                        {#if !hasGPU && !loading}
-                         <span class="px-2 py-0.5 bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400 text-[9px] font-bold uppercase tracking-wider rounded">Unavailable</span>
+                         <span class="px-2 py-0.5 bg-[#252626] text-[#acabab] text-[9px] font-bold uppercase tracking-wider rounded-sm border border-[#474848]/30">Unavailable</span>
                        {:else if hasGPU}
-                         <span class="px-2 py-0.5 bg-green-100 dark:bg-green-950/30 text-green-600 dark:text-green-400 text-[9px] font-bold uppercase tracking-wider rounded">Compatible</span>
+                         <span class="px-2 py-0.5 bg-[#bfc8ca]/10 text-[#bfc8ca] text-[9px] font-bold uppercase tracking-wider rounded-sm border border-[#bfc8ca]/20">Compatible</span>
                        {/if}
                     </div>
-                    <p class="text-[11px] text-gray-400 dark:text-gray-500 italic">
+                    <p class="text-[11px] font-sans text-[#acabab] italic opacity-60">
                       {#if loading}
                         Analyzing hardware components...
                       {:else if !hasGPU}
                         No compatible NVIDIA, AMD, or Apple Silicon GPU detected.
                       {:else}
-                        Dedicated GPU detected. <span class="text-blue-500">(Requires app restart)</span>
+                        Dedicated GPU detected. <span class="text-[#bfc8ca] font-semibold tracking-wide">Requires app restart.</span>
                       {/if}
                     </p>
                   </div>
@@ -285,21 +286,21 @@
                     on:click={toggleGPU}
                     disabled={!hasGPU || loading}
                     aria-label="Toggle GPU Acceleration"
-                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed
-                           {hasGPU && gpuAcceleration ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                    class="relative inline-flex h-6 w-12 shrink-0 cursor-pointer rounded-sm border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-20 disabled:cursor-not-allowed
+                           {hasGPU && gpuAcceleration ? 'bg-[#bfc8ca]' : 'bg-[#252626]'}"
                   >
                     <span 
-                      class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out
-                             {hasGPU && gpuAcceleration ? 'translate-x-5' : 'translate-x-0'}"
+                      class="pointer-events-none inline-block h-5 w-5 transform rounded-sm bg-[#0e0e0e] shadow-lg transition duration-200 ease-in-out
+                             {hasGPU && gpuAcceleration ? 'translate-x-6' : 'translate-x-0'}"
                     ></span>
                   </button>
                 </div>
               </section>
 
-              <section class="p-6 bg-blue-50/50 dark:bg-blue-950/10 border border-blue-100/50 dark:border-blue-900/20 rounded-xl">
-                 <h5 class="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest mb-2">Performance Tip</h5>
-                 <p class="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">
-                   Enabling GPU acceleration can reduce search latency by up to 80% on large collections, but may increase power consumption on laptops.
+              <section class="p-8 bg-[#131313] rounded-sm border-l-2 border-[#bfc8ca] shadow-sm">
+                 <h5 class="text-[#bfc8ca] text-[10px] font-bold uppercase tracking-widest mb-3">Performance Note</h5>
+                 <p class="text-[11px] font-sans text-[#acabab] leading-relaxed opacity-80">
+                   Enabling GPU acceleration can reduce search latency by up to 80% on large collections. This is highly recommended for users with dedicated NVIDIA or AMD hardware.
                  </p>
               </section>
             </div>
@@ -311,8 +312,8 @@
 {/if}
 
 <style>
-  :global(.scrollbar-custom::-webkit-scrollbar) { width: 6px; }
+  :global(.scrollbar-custom::-webkit-scrollbar) { width: 4px; }
   :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
-  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #E2E8F0; border-radius: 4px; }
-  :global(.dark .scrollbar-custom::-webkit-scrollbar-thumb) { background: #222; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #252626; border-radius: 0px; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb:hover) { background: #474848; }
 </style>

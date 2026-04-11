@@ -165,8 +165,8 @@
     gap: 0.45rem;
     padding: 0.35rem 0.85rem;
     background: transparent;
-    border: 1px solid rgba(191, 200, 202, 0.2);
-    border-radius: 4px;
+    border: 1px solid rgba(71, 72, 72, 0.2);
+    border-radius: 0.125rem;
     color: #bfc8ca;
     font-family: 'Inter', sans-serif;
     font-size: 0.7rem;
@@ -177,7 +177,7 @@
   }
   .btn-folders:hover {
     background: rgba(191, 200, 202, 0.06);
-    border-color: rgba(191, 200, 202, 0.4);
+    border-color: rgba(191, 200, 202, 0.2);
   }
 
   .chevron {
@@ -201,10 +201,10 @@
     width: 280px;
     max-height: 400px;
     overflow-y: auto;
-    background: #111;
-    border: 1px solid #2a2a2a;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-    border-radius: 4px;
+    background: #131313;
+    border: 1px solid rgba(71, 72, 72, 0.2);
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8);
+    border-radius: 0.125rem;
     display: flex;
     flex-direction: column;
   }
@@ -214,7 +214,7 @@
     justify-content: space-between;
     align-items: baseline;
     padding: 0.6rem 0.75rem 0.4rem;
-    border-bottom: 1px solid #1e1e1e;
+    border-bottom: 1px solid rgba(71, 72, 72, 0.1);
     flex-shrink: 0;
   }
 
@@ -257,29 +257,23 @@
 
   .search-bar {
     padding: 0 0 1rem 0;
-    border-bottom: 1px solid #e5e7eb;
-  }
-  :global(.dark) .search-bar {
-    border-bottom-color: #1a1a1a;
+    border-bottom: 1px solid rgba(71, 72, 72, 0.1);
   }
 
   .search-input-wrap {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    background: #f9fafb;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-  :global(.dark) .search-input-wrap {
-    background: #0a0a0a;
-    border-color: #1a1a1a;
+    padding: 0.75rem 1rem;
+    background: #252626;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0.125rem;
+    transition: border-color 0.2s, background 0.2s;
   }
   .search-input-wrap:focus-within {
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+    border-bottom-color: #b1babc;
+    background: #2b2c2c;
   }
 
   .folder-search-input {
@@ -289,13 +283,11 @@
     outline: none;
     font-size: 0.75rem;
     font-family: 'Inter', sans-serif;
-    color: #111;
-  }
-  :global(.dark) .folder-search-input {
-    color: #eee;
+    color: #e7e5e5;
   }
   .folder-search-input::placeholder {
-    color: #9ca3af;
+    color: #acabab;
+    opacity: 0.5;
   }
 
   .search-row {
@@ -309,10 +301,10 @@
     align-items: center;
     gap: 0.35rem;
     padding: 0.5rem 0.75rem;
-    background: transparent;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    color: #6b7280;
+    background: #252626;
+    border: 1px solid rgba(71, 72, 72, 0.2);
+    border-radius: 0.125rem;
+    color: #acabab;
     font-family: 'Inter', sans-serif;
     font-size: 0.7rem;
     font-weight: 600;
@@ -321,18 +313,9 @@
     transition: all 0.2s ease;
   }
   .btn-add-folder:hover {
-    background: #f3f4f6;
-    border-color: #3b82f6;
-    color: #3b82f6;
-  }
-  :global(.dark) .btn-add-folder {
-    border-color: #1a1a1a;
-    color: #9ca3af;
-  }
-  :global(.dark) .btn-add-folder:hover {
-    background: #1a1a1a;
-    border-color: #3b82f6;
-    color: #3b82f6;
+    background: #2b2c2c;
+    border-color: #bfc8ca;
+    color: #e7e5e5;
   }
 
   .flat-view .folder-tree {
@@ -354,6 +337,7 @@
     font-family: 'Inter', sans-serif;
     font-size: 0.62rem;
     text-transform: uppercase;
+    letter-spacing: 0.05em;
     color: #acabab;
     white-space: nowrap;
     flex-shrink: 0;
@@ -361,14 +345,16 @@
 
   .progress-track {
     flex-grow: 1;
-    height: 2px;
+    height: 4px;
     background-color: #252626;
+    border-radius: 0.125rem;
     overflow: hidden;
   }
 
   .progress-fill {
     height: 100%;
-    background-color: #bfc8ca;
+    background: linear-gradient(to bottom right, #bfc8ca, #3f484a);
+    border-radius: 0.125rem;
     transition: width 0.3s ease-out;
   }
 
