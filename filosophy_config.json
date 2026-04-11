@@ -1,0 +1,16 @@
+{
+  "ExcludedPaths": [
+    ".git",
+    "anaconda3",
+    "miniconda3",
+    "node_modules"
+  ],
+  "GPUEnabled": true,
+  "HasGPU": true,
+  "HasCheckedGPU": true,
+  "APIEnabled": false,
+  "APIPort": 7700,
+  "APIKey": "",
+  "MCPEnabled": false,
+  "MCPKey": ""
+}

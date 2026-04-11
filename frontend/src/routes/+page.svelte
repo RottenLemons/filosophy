@@ -318,24 +318,50 @@
 </script>
 
 <div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
-  <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
-    <button
-      on:click={() => showChat = !showChat}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Toggle Chat"
-    >
-      <MessageSquare class="w-5 h-5" />
-    </button>
-    <button
-      on:click={() => showSettings = true}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Open Settings"
-    >
-      <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
-    </button>
-    <ThemeToggle />
+  <div class="absolute top-6 right-8 flex items-center gap-6 z-[9999]">
+    <!-- Engine Status (Integrated) -->
+    {#if searchErrorMsg !== 'backend engine not initialized'}
+      <div 
+        class="flex items-center gap-3 px-3 py-1.5 bg-gray-100/50 dark:bg-[#252626]/50 backdrop-blur-md rounded-sm border border-gray-200 dark:border-[#474848]/20 transition-all"
+        transition:fade={{ duration: 400 }}
+      >
+        <div class="relative flex items-center justify-center">
+            <div class="w-1.5 h-1.5 rounded-full bg-[#bfc8ca] animate-pulse"></div>
+        </div>
+        <span class="font-sans text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-[#acabab]">
+          {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Indexing') : 'Ready'}
+        </span>
+        
+        {#if $indexingStatus.isIndexing}
+          <div class="w-12 h-0.5 bg-gray-200 dark:bg-[#131313] rounded-full overflow-hidden">
+            <div 
+              class="h-full bg-[#bfc8ca] transition-all duration-300"
+              style="width: {$indexingStatus.progress}%"
+            ></div>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    <div class="flex items-center gap-3">
+      <button
+        on:click={() => showChat = !showChat}
+        class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
+        style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+        aria-label="Toggle Chat"
+      >
+        <MessageSquare class="w-5 h-5" />
+      </button>
+      <button
+        on:click={() => showSettings = true}
+        class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
+        style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+        aria-label="Open Settings"
+      >
+        <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
+      </button>
+      <ThemeToggle />
+    </div>
   </div>
 
   <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
@@ -351,15 +377,15 @@
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
         <div class="space-y-4">
-          <div class="flex items-center gap-4 w-full border-b border-gray-300 dark:border-[#2a2a2a] pb-3 transition-colors focus-within:border-blue-500">
+          <div class="flex items-center gap-4 w-full border-b border-gray-200 dark:border-[#2a2a2a] pb-2 transition-colors focus-within:border-blue-500">
             <div class="text-gray-400">
-              <SearchIcon size={24} />
+              <SearchIcon size={20} />
             </div>
             <input 
               bind:value={searchQuery}
               on:input={debouncedSearch}
               on:keyup={onKeyUp}
-              class="flex-1 bg-transparent border-none focus:ring-0 text-3xl font-serif placeholder:text-gray-200 dark:placeholder:text-gray-600 pb-1 outline-none text-slate-700 dark:text-gray-100" 
+              class="flex-1 bg-transparent border-none focus:ring-0 text-2xl font-serif placeholder:text-gray-300 dark:placeholder:text-gray-600 pb-0.5 outline-none text-slate-700 dark:text-gray-100" 
               placeholder="Search the collection..." 
               type="text"
             />
@@ -670,35 +696,8 @@
     
   </main>
   
-  <!-- Task 3: The "Engine Ready" Status (Curator Style) -->
-  {#if searchErrorMsg !== 'backend engine not initialized'}
-    <div 
-      class="fixed bottom-8 right-8 z-[1000] flex flex-col items-end gap-2"
-      transition:fade={{ duration: 400 }}
-    >
-      <div class="bg-[#2b2c2c]/80 backdrop-blur-[20px] rounded-md px-3 py-1.5 flex items-center gap-3 border border-[#474848]/20 shadow-[0_16px_32px_-12px_rgba(0,0,0,0.5)]">
-        <div class="relative flex items-center justify-center">
-            <div class="w-1.5 h-1.5 rounded-full bg-[#bfc8ca] animate-pulse shadow-[0_0_8px_rgba(191,200,202,0.8)]"></div>
-        </div>
-        <span class="font-sans text-xs text-[#e7e5e5] tracking-wide">
-          {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Indexing...') : 'Engine Online'}
-        </span>
-      </div>
-      
-      <!-- TASK 2: Micro-progress bar -->
-      {#if $indexingStatus.isIndexing}
-        <div 
-            class="w-48 h-1 bg-[#252626] rounded-sm overflow-hidden border border-[#474848]/10"
-            transition:slide={{ axis: 'y' }}
-        >
-            <div 
-            class="h-full bg-gradient-to-br from-[#bfc8ca] to-[#3f484a] transition-all duration-300 ease-out"
-            style="width: {$indexingStatus.progress}%"
-            ></div>
-        </div>
-      {/if}
-    </div>
-  {/if}
+  <!-- Task 3: The "Engine Ready" Status (Obsolete Fixed Position) -->
+  <!-- Status moved to header for better visibility and to prevent blocking content -->
 </div>
 
 <APIConfirmDialog request={apiConfirmRequest} on:reply={handleConfirmReply} />

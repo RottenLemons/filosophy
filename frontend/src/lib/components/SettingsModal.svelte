@@ -525,15 +525,17 @@
 
               <!-- Local LLM -->
               <section>
-                <div class="mb-6">
-                  <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-2">Local LLM</h4>
-                  <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
-                    Connect Filosophy to a locally running language model for AI-powered search summaries and chat.
-                  </p>
+                <div class="mb-8 flex items-center justify-between">
+                  <div>
+                    <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">Local LLM</h4>
+                    <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
+                      Connect Filosophy to a locally running language model for AI-powered search summaries and chat.
+                    </p>
+                  </div>
                 </div>
 
                 <!-- Provider selector -->
-                <div class="grid grid-cols-4 gap-2 mb-6">
+                <div class="flex flex-wrap gap-2 mb-8">
                   {#each [
                     { id: 'none', label: 'None' },
                     { id: 'ollama', label: 'Ollama' },
@@ -542,10 +544,10 @@
                   ] as p}
                     <button
                       on:click={() => providerDefaults(p.id as LLMConfig['provider'])}
-                      class="py-2 px-3 text-[11px] font-semibold rounded-lg border transition-all
+                      class="px-4 py-2 text-[10px] font-sans font-bold uppercase tracking-widest rounded-sm transition-all border
                              {llmConfig.provider === p.id
-                               ? 'bg-blue-600 text-white border-blue-600 shadow'
-                               : 'bg-white dark:bg-[#161616] text-gray-600 dark:text-gray-400 border-gray-200 dark:border-[#2a2a2a] hover:border-blue-400'}"
+                               ? 'bg-[#252626] text-[#e7e5e5] border-[#474848]/30 shadow-inner'
+                               : 'bg-[#131313] text-[#acabab] border-transparent hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
                     >
                       {p.label}
                     </button>
@@ -553,67 +555,70 @@
                 </div>
 
                 {#if llmConfig.provider !== 'none'}
-                  <div class="space-y-3" transition:slide={{ duration: 200 }}>
-                    <div class="flex gap-3">
+                  <div class="space-y-4 p-8 bg-[#131313] rounded-sm border border-[#474848]/10 shadow-inner" transition:slide={{ duration: 200 }}>
+                    <div class="flex gap-4">
                       <div class="flex-1">
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Base URL</label>
+                        <label for="llm-base-url" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Base URL</label>
                         <input
+                          id="llm-base-url"
                           type="text"
                           bind:value={llmConfig.baseUrl}
                           on:change={saveLLM}
                           placeholder="http://localhost:11434"
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-sans rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                         />
                       </div>
-                      <div class="w-40">
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Model</label>
+                      <div class="w-48">
+                        <label for="llm-model" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Model</label>
                         <input
+                          id="llm-model"
                           type="text"
                           bind:value={llmConfig.model}
                           on:change={saveLLM}
                           placeholder="llama3"
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-sans rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                         />
                       </div>
                     </div>
 
                     {#if llmConfig.provider === 'openai-compatible'}
                       <div transition:slide={{ duration: 150 }}>
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">API Key <span class="normal-case font-normal">(optional)</span></label>
+                        <label for="llm-api-key" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">API Key <span class="normal-case opacity-50">(optional)</span></label>
                         <input
+                          id="llm-api-key"
                           type="password"
                           bind:value={llmConfig.apiKey}
                           on:change={saveLLM}
                           placeholder="sk-..."
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-sans rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                         />
                       </div>
                     {/if}
 
-                    <div class="flex items-center gap-3 pt-1">
+                    <div class="flex items-center gap-4 pt-4 border-t border-[#474848]/10 mt-4">
                       <button
                         on:click={testLLMConnection}
                         disabled={llmTestStatus === 'testing'}
-                        class="flex items-center gap-2 px-4 py-1.5 text-[11px] font-semibold rounded-full border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#161616] text-gray-700 dark:text-gray-300 hover:border-blue-400 transition-all disabled:opacity-50"
+                        class="px-6 py-2.5 bg-[#252626] hover:bg-[#2b2c2c] text-[#e7e5e5] text-[10px] font-sans uppercase tracking-widest font-bold rounded-sm transition-all border border-[#474848]/30 hover:border-[#bfc8ca]/50 disabled:opacity-50 flex items-center gap-2"
                       >
                         {#if llmTestStatus === 'testing'}
-                          <RefreshCw class="w-3 h-3 animate-spin" />
-                          <span>Testing…</span>
+                          <RefreshCw class="w-3.5 h-3.5 animate-spin text-[#bfc8ca]" />
+                          <span>Testing...</span>
                         {:else}
-                          <RefreshCw class="w-3 h-3" />
+                          <RefreshCw class="w-3.5 h-3.5" />
                           <span>Test Connection</span>
                         {/if}
                       </button>
 
                       {#if llmTestStatus === 'ok'}
-                        <span class="flex items-center gap-1.5 text-[11px] text-green-600 dark:text-green-400" transition:fade>
+                        <span class="flex items-center gap-1.5 text-[10px] font-sans font-bold uppercase tracking-widest text-[#bfc8ca]" transition:fade>
                           <CheckCircle class="w-3.5 h-3.5" />
                           {llmTestMessage}
                         </span>
                       {:else if llmTestStatus === 'error'}
-                        <span class="flex items-center gap-1.5 text-[11px] text-red-500" transition:fade>
+                        <span class="flex items-center gap-1.5 text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab]" transition:fade>
                           <AlertCircle class="w-3.5 h-3.5" />
-                          {llmTestMessage}
+                          <span class="truncate max-w-xs">{llmTestMessage}</span>
                         </span>
                       {/if}
                     </div>
@@ -623,16 +628,17 @@
 
               <!-- MCP Servers -->
               <section>
-                <div class="mb-6 flex items-center justify-between">
-                  <div>
-                    <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-2">MCP Servers</h4>
-                    <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
-                      Register Model Context Protocol servers to extend Filosophy with tools, prompts, and data sources.
-                    </p>
-                  </div>
+                <div class="mb-4">
+                  <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">MCP Servers</h4>
+                  <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
+                    Register Model Context Protocol servers to extend Filosophy with tools, prompts, and data sources.
+                  </p>
+                </div>
+
+                <div class="mb-8">
                   <button
                     on:click={() => showAddServer = !showAddServer}
-                    class="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-full bg-blue-600 text-white hover:bg-blue-700 transition-colors shrink-0"
+                    class="flex items-center gap-2 px-6 py-2.5 bg-[#252626] hover:bg-[#2b2c2c] text-[#e7e5e5] text-[10px] font-sans uppercase tracking-widest font-bold rounded-sm border border-[#474848]/20 transition-all w-fit"
                   >
                     <Plus class="w-3.5 h-3.5" />
                     <span>Add Server</span>
@@ -641,22 +647,24 @@
 
                 <!-- Add server form -->
                 {#if showAddServer}
-                  <div class="mb-4 p-4 bg-blue-50/40 dark:bg-blue-950/10 border border-blue-100 dark:border-blue-900/30 rounded-xl space-y-3" transition:slide={{ duration: 200 }}>
-                    <div class="flex gap-3">
+                  <div class="mb-6 p-8 bg-[#131313] rounded-sm border border-[#474848]/10 shadow-inner space-y-4" transition:slide={{ duration: 200 }}>
+                    <div class="flex gap-4">
                       <div class="flex-1">
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Name</label>
+                        <label for="mcp-name" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Name</label>
                         <input
+                          id="mcp-name"
                           type="text"
                           bind:value={newServer.name}
                           placeholder="My MCP Server"
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-sans rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                         />
                       </div>
-                      <div class="w-36">
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Type</label>
+                      <div class="w-40">
+                        <label for="mcp-type" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Type</label>
                         <select
+                          id="mcp-type"
                           bind:value={newServer.type}
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-sans rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all appearance-none"
                         >
                           <option value="stdio">stdio</option>
                           <option value="sse">SSE</option>
@@ -666,53 +674,54 @@
                     </div>
 
                     {#if newServer.type === 'stdio'}
-                      <div class="flex gap-3" transition:slide={{ duration: 150 }}>
+                      <div class="flex gap-4" transition:slide={{ duration: 150 }}>
                         <div class="flex-1">
-                          <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Command</label>
+                          <label for="mcp-command" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Command</label>
                           <input
+                            id="mcp-command"
                             type="text"
                             bind:value={newServer.command}
                             placeholder="npx -y @modelcontextprotocol/server-filesystem"
-                            class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            class="w-full px-4 py-3 text-xs font-mono rounded-sm bg-[#0e0e0e] text-[#bfc8ca] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                           />
                         </div>
-                        <div class="w-40">
-                          <label for="new-server-args" class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Args <span class="normal-case font-normal">(optional)</span></label>
+                        <div class="w-48">
+                          <label for="mcp-args" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Args <span class="normal-case opacity-50">(optional)</span></label>
                           <input
-                            id="new-server-args"
+                            id="mcp-args"
                             type="text"
                             bind:value={newServer.args}
                             placeholder="/path/to/dir"
-                            class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            class="w-full px-4 py-3 text-xs font-mono rounded-sm bg-[#0e0e0e] text-[#bfc8ca] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                           />
                         </div>
                       </div>
                     {:else}
                       <div transition:slide={{ duration: 150 }}>
-                        <label for="new-server-url" class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">URL</label>
+                        <label for="mcp-url" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">URL</label>
                         <input
-                          id="new-server-url"
+                          id="mcp-url"
                           type="text"
                           bind:value={newServer.url}
                           placeholder="http://localhost:3000/mcp"
-                          class="w-full px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          class="w-full px-4 py-3 text-xs font-mono rounded-sm bg-[#0e0e0e] text-[#bfc8ca] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                         />
                       </div>
                     {/if}
 
-                    <div class="flex justify-end gap-2 pt-1">
+                    <div class="flex justify-end gap-3 pt-4 border-t border-[#474848]/10 mt-4">
                       <button
                         on:click={() => { showAddServer = false; newServer = { type: 'stdio', enabled: true }; }}
-                        class="px-4 py-1.5 text-[11px] font-semibold rounded-full border border-gray-200 dark:border-[#2a2a2a] text-gray-500 hover:text-gray-800 dark:hover:text-gray-200 transition-colors"
+                        class="px-5 py-2 text-[10px] font-sans uppercase tracking-widest font-bold rounded-sm text-[#acabab] hover:text-[#e7e5e5] transition-colors"
                       >
                         Cancel
                       </button>
                       <button
                         on:click={addMCPServer}
                         disabled={!newServer.name}
-                        class="px-4 py-1.5 text-[11px] font-semibold rounded-full bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-40"
+                        class="px-6 py-2 bg-[#252626] hover:bg-[#2b2c2c] text-[#e7e5e5] text-[10px] font-sans uppercase tracking-widest font-bold rounded-sm border border-[#474848]/30 hover:border-[#bfc8ca]/50 transition-all disabled:opacity-50"
                       >
-                        Add
+                        Save Server
                       </button>
                     </div>
                   </div>
@@ -720,20 +729,20 @@
 
                 <!-- Server list -->
                 {#if mcpServers.length === 0 && !showAddServer}
-                  <div class="flex flex-col items-center justify-center py-10 text-center text-gray-400 dark:text-gray-600 border border-dashed border-gray-200 dark:border-[#2a2a2a] rounded-xl">
-                    <Network class="w-8 h-8 mb-3 opacity-40" />
-                    <p class="text-xs font-medium">No MCP servers configured</p>
-                    <p class="text-[10px] mt-1">Add a server above to get started</p>
+                  <div class="flex flex-col items-center justify-center p-12 bg-[#131313] rounded-sm text-center border border-[#474848]/10 shadow-inner">
+                    <Network class="w-8 h-8 mb-4 text-[#acabab] opacity-40" />
+                    <p class="text-sm font-sans font-medium text-[#e7e5e5]">No MCP servers configured</p>
+                    <p class="text-[10px] font-sans text-[#acabab] mt-1 opacity-60">Use the button above to extend your AI tools</p>
                   </div>
                 {:else}
                   <div class="space-y-2">
                     {#each mcpServers as server (server.id)}
-                      <div class="flex items-center gap-3 px-4 py-3 bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl group transition-all" transition:slide={{ duration: 150 }}>
+                      <div class="flex items-center gap-4 px-5 py-4 bg-[#131313] rounded-sm group transition-all" transition:slide={{ duration: 150 }}>
                         <!-- Enable toggle -->
                         <button
                           on:click={() => toggleMCPServer(server.id)}
                           aria-label="{server.enabled ? 'Disable' : 'Enable'} {server.name}"
-                          class="shrink-0 transition-colors {server.enabled ? 'text-blue-500' : 'text-gray-300 dark:text-gray-600'}"
+                          class="shrink-0 transition-colors {server.enabled ? 'text-[#bfc8ca]' : 'text-[#acabab] opacity-50'}"
                         >
                           {#if server.enabled}
                             <CheckCircle class="w-4 h-4" />
@@ -744,11 +753,11 @@
 
                         <!-- Info -->
                         <div class="flex-1 min-w-0">
-                          <div class="flex items-center gap-2">
-                            <span class="text-xs font-semibold text-gray-800 dark:text-gray-200 truncate">{server.name}</span>
-                            <span class="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded bg-gray-100 dark:bg-[#222] text-gray-500 dark:text-gray-400">{server.type}</span>
+                          <div class="flex items-center gap-3">
+                            <span class="text-sm font-sans font-medium text-[#e7e5e5] truncate">{server.name}</span>
+                            <span class="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest rounded-sm bg-[#0e0e0e] text-[#acabab]">{server.type}</span>
                           </div>
-                          <p class="text-[10px] font-mono text-gray-400 dark:text-gray-500 truncate mt-0.5">
+                          <p class="text-[10px] font-mono text-[#bfc8ca] opacity-70 truncate mt-1.5">
                             {server.type === 'stdio' ? [server.command, server.args].filter(Boolean).join(' ') : server.url}
                           </p>
                         </div>
@@ -757,7 +766,7 @@
                         <button
                           on:click={() => removeMCPServer(server.id)}
                           aria-label="Remove {server.name}"
-                          class="shrink-0 text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                          class="shrink-0 text-[#acabab] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-2"
                         >
                           <Trash2 class="w-4 h-4" />
                         </button>
@@ -828,10 +837,10 @@
 
               <!-- REST API -->
               <section>
-                <div class="mb-5 flex items-start justify-between">
+                <div class="mb-8 flex items-center justify-between">
                   <div>
-                    <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-1">REST API</h4>
-                    <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
+                    <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">REST API</h4>
+                    <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
                       Expose a local HTTP endpoint so external tools and scripts can search your files programmatically.
                     </p>
                   </div>
@@ -840,52 +849,53 @@
                     on:click={toggleAPI}
                     disabled={accessLoading}
                     aria-label="Toggle REST API"
-                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 mt-1
-                           {apiEnabled ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                    class="relative inline-flex h-6 w-12 shrink-0 cursor-pointer rounded-sm border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30
+                           {apiEnabled ? 'bg-[#bfc8ca]' : 'bg-[#252626]'}"
                   >
-                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out {apiEnabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-sm bg-[#0e0e0e] shadow-lg transition duration-200 ease-in-out {apiEnabled ? 'translate-x-6' : 'translate-x-0'}"></span>
                   </button>
                 </div>
 
                 {#if apiEnabled}
                   <div class="space-y-4" transition:slide={{ duration: 200 }}>
                     <!-- Port -->
-                    <div class="bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl p-5 space-y-4">
-                      <div class="flex items-end gap-3">
-                        <div class="flex-1">
-                          <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">Port</label>
+                    <div class="bg-[#131313] p-8 rounded-sm border border-[#474848]/10 shadow-inner space-y-6">
+                      <div class="flex items-end gap-6">
+                        <div>
+                          <label for="api-port" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">Port</label>
                           <input
+                            id="api-port"
                             type="number"
                             min="1"
                             max="65535"
                             bind:value={apiPortInput}
                             on:blur={savePort}
                             on:keydown={e => e.key === 'Enter' && savePort()}
-                            class="w-32 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                            class="w-32 px-4 py-3 text-xs rounded-sm bg-[#0e0e0e] text-[#e7e5e5] border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 font-mono transition-all"
                           />
                         </div>
-                        <p class="text-[10px] text-gray-400 dark:text-gray-500 pb-2">
-                          Listening on <span class="font-mono">http://127.0.0.1:{apiPort}</span>
+                        <p class="text-[10px] text-[#acabab] pb-3 opacity-60 flex items-center gap-2">
+                          Listening on <span class="font-mono text-[#bfc8ca] bg-[#0e0e0e] px-2 py-1 rounded-sm">http://127.0.0.1:{apiPort}</span>
                         </p>
                       </div>
 
                       <!-- API Key -->
                       <div>
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">
-                          API Key <span class="normal-case font-normal">(empty = no auth)</span>
+                        <label for="api-key-display" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">
+                          API Key <span class="normal-case opacity-50">(empty = no auth)</span>
                         </label>
-                        <div class="flex items-center gap-2">
-                          <div class="flex-1 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-500 dark:text-gray-400 font-mono truncate select-all">
+                        <div class="flex items-center gap-3">
+                          <div id="api-key-display" class="flex-1 px-4 py-3 text-xs bg-[#0e0e0e] text-[#bfc8ca] font-mono rounded-sm truncate select-all">
                             {apiKey || '(no key — open access)'}
                           </div>
                           {#if apiKey}
                             <button
                               on:click={copyKey}
                               title="Copy key"
-                              class="shrink-0 p-2 rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#161616] text-gray-500 hover:text-blue-600 transition-colors"
+                              class="shrink-0 p-3 bg-[#252626] hover:bg-[#2b2c2c] rounded-sm transition-colors text-[#e7e5e5]"
                             >
                               {#if apiKeyCopied}
-                                <CheckCircle class="w-4 h-4 text-green-500" />
+                                <CheckCircle class="w-4 h-4 text-[#bfc8ca]" />
                               {:else}
                                 <Copy class="w-4 h-4" />
                               {/if}
@@ -894,110 +904,111 @@
                           <button
                             on:click={regenKey}
                             title="{apiKey ? 'Regenerate key' : 'Generate key'}"
-                            class="shrink-0 p-2 rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#161616] text-gray-500 hover:text-blue-600 transition-colors"
+                            class="shrink-0 p-3 bg-[#252626] hover:bg-[#2b2c2c] rounded-sm transition-colors text-[#e7e5e5]"
                           >
                             <RefreshCw class="w-4 h-4" />
                           </button>
                         </div>
-                        <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
-                          Pass as <span class="font-mono">Authorization: Bearer &lt;key&gt;</span>
+                        <p class="text-[10px] text-[#acabab] mt-2 opacity-60">
+                          Pass as <span class="font-mono text-[#bfc8ca]">Authorization: Bearer &lt;key&gt;</span>
                         </p>
                       </div>
                     </div>
 
                     <!-- CLI hint -->
-                    <div class="px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-gray-100 dark:border-[#1a1a1a] rounded-xl">
-                      <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">CLI Usage</p>
-                      <code class="text-[11px] font-mono text-gray-600 dark:text-gray-400">
+                    <div class="p-6 bg-[#131313] border-l-2 border-[#bfc8ca] rounded-sm shadow-sm">
+                      <p class="text-[10px] font-bold uppercase tracking-widest text-[#bfc8ca] mb-2">CLI Usage</p>
+                      <code class="text-xs font-mono text-[#acabab] bg-[#0e0e0e] px-3 py-2 rounded-sm block">
                         filo --key $FILOSOPHY_API_KEY search "books by camus"
                       </code>
                     </div>
                   </div>
                 {:else}
-                  <div class="flex items-center gap-3 px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-dashed border-gray-200 dark:border-[#2a2a2a] rounded-xl text-gray-400 dark:text-gray-600" transition:slide={{ duration: 150 }}>
-                    <Globe class="w-4 h-4 shrink-0" />
-                    <span class="text-[11px]">Enable to expose a local HTTP API on port {apiPort}</span>
+                  <div class="flex items-center gap-3 p-6 bg-[#131313] rounded-sm text-[#acabab] opacity-80" transition:slide={{ duration: 150 }}>
+                    <Globe class="w-4 h-4 shrink-0 opacity-60" />
+                    <span class="text-[11px] font-sans">Enable to expose a local HTTP API on port <span class="font-mono text-[#bfc8ca] bg-[#0e0e0e] px-1.5 py-0.5 rounded-sm">{apiPort}</span></span>
                   </div>
                 {/if}
               </section>
 
               <!-- MCP Server -->
               <section>
-                <div class="mb-5 flex items-start justify-between">
+                <div class="mb-8 flex items-center justify-between">
                   <div>
-                    <h4 class="text-xl font-serif text-slate-900 dark:text-gray-100 font-bold mb-1">MCP Server</h4>
-                    <p class="text-xs text-gray-400 dark:text-gray-500 leading-relaxed max-w-lg">
-                      Serve Filosophy as an MCP tool over HTTP+SSE so Claude Desktop and other agents can call <code class="font-mono">search_files</code> natively.
+                    <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">MCP Server</h4>
+                    <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
+                      Serve Filosophy as an MCP tool over HTTP+SSE so Claude Desktop and other agents can call <code class="font-mono text-[#bfc8ca] bg-[#131313] px-1.5 py-0.5 rounded-sm">search_files</code> natively.
                     </p>
                   </div>
                   <button
                     on:click={toggleMCP}
                     disabled={accessLoading}
                     aria-label="Toggle MCP Server"
-                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30 mt-1
-                           {mcpEnabled ? 'bg-blue-600' : 'bg-gray-200 dark:bg-[#333]'}"
+                    class="relative inline-flex h-6 w-12 shrink-0 cursor-pointer rounded-sm border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-30
+                           {mcpEnabled ? 'bg-[#bfc8ca]' : 'bg-[#252626]'}"
                   >
-                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out {mcpEnabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+                    <span class="pointer-events-none inline-block h-5 w-5 transform rounded-sm bg-[#0e0e0e] shadow-lg transition duration-200 ease-in-out {mcpEnabled ? 'translate-x-6' : 'translate-x-0'}"></span>
                   </button>
                 </div>
 
                 {#if mcpEnabled}
                   <div class="space-y-4" transition:slide={{ duration: 200 }}>
-                    <div class="bg-white dark:bg-[#161616] border border-gray-200 dark:border-[#222] rounded-xl p-5 space-y-4">
+                    <div class="bg-[#131313] p-8 rounded-sm border border-[#474848]/10 shadow-inner space-y-6">
                       <!-- MCP Key -->
                       <div>
-                        <label class="block text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">
-                          MCP Key <span class="normal-case font-normal">(empty = no auth)</span>
+                        <label for="mcp-server-key" class="block text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">
+                          MCP Key <span class="normal-case opacity-50">(empty = no auth)</span>
                         </label>
                         <div class="flex items-center gap-2">
                           <input
+                            id="mcp-server-key"
                             type="text"
                             bind:value={mcpKey}
                             on:blur={saveMCPKey}
                             on:keydown={e => e.key === 'Enter' && saveMCPKey()}
                             placeholder="Leave empty to disable auth"
-                            class="flex-1 px-3 py-2 text-xs rounded-lg border border-gray-200 dark:border-[#2a2a2a] bg-gray-50 dark:bg-[#0a0a0a] text-gray-800 dark:text-gray-200 font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            class="flex-1 px-4 py-3 text-xs bg-[#0e0e0e] text-[#bfc8ca] font-mono rounded-sm border-none focus:outline-none focus:ring-1 focus:ring-[#bfc8ca]/30 transition-all placeholder:text-[#acabab]/40"
                           />
                         </div>
-                        <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
-                          Independent from the REST API key. Pass as <span class="font-mono">Authorization: Bearer &lt;key&gt;</span>
+                        <p class="text-[10px] text-[#acabab] mt-2 opacity-60">
+                          Independent from the REST API key. Pass as <span class="font-mono text-[#bfc8ca]">Authorization: Bearer &lt;key&gt;</span>
                         </p>
                       </div>
 
                       <!-- Endpoint info -->
                       <div>
-                        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1">SSE Endpoint</p>
-                        <p class="text-[11px] font-mono text-gray-600 dark:text-gray-400">http://127.0.0.1:{apiPort}/mcp/sse</p>
+                        <p class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] mb-2 opacity-60">SSE Endpoint</p>
+                        <p class="text-xs font-mono text-[#bfc8ca] bg-[#0e0e0e] px-4 py-3 rounded-sm inline-block">http://127.0.0.1:{apiPort}/mcp/sse</p>
                       </div>
                     </div>
 
                     <!-- Claude Desktop snippet -->
-                    <div class="space-y-2">
+                    <div class="p-6 bg-[#131313] rounded-sm space-y-3">
                       <div class="flex items-center justify-between">
-                        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Claude Desktop Config</p>
+                        <p class="text-[10px] font-bold uppercase tracking-widest text-[#bfc8ca]">Claude Desktop Config</p>
                         <button
                           on:click={copySnippet}
-                          class="flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold rounded-full border border-gray-200 dark:border-[#2a2a2a] text-gray-500 hover:text-blue-600 transition-colors"
+                          class="flex items-center gap-2 px-3 py-1.5 bg-[#252626] hover:bg-[#2b2c2c] text-[#e7e5e5] text-[10px] font-sans uppercase tracking-widest font-bold rounded-sm transition-colors"
                         >
                           {#if snippetCopied}
-                            <CheckCircle class="w-3 h-3 text-green-500" />
-                            <span class="text-green-600">Copied</span>
+                            <CheckCircle class="w-3.5 h-3.5 text-[#bfc8ca]" />
+                            <span class="text-[#bfc8ca]">Copied</span>
                           {:else}
-                            <Copy class="w-3 h-3" />
+                            <Copy class="w-3.5 h-3.5" />
                             <span>Copy</span>
                           {/if}
                         </button>
                       </div>
-                      <pre class="px-4 py-3 text-[10px] font-mono text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-[#0d0d0d] border border-gray-100 dark:border-[#1a1a1a] rounded-xl overflow-x-auto whitespace-pre leading-relaxed">{claudeDesktopSnippet}</pre>
-                      <p class="text-[10px] text-gray-400 dark:text-gray-500">
-                        Add this to your <span class="font-mono">claude_desktop_config.json</span>
+                      <pre class="px-4 py-4 text-xs font-mono text-[#bfc8ca] bg-[#0e0e0e] rounded-sm overflow-x-auto whitespace-pre leading-relaxed">{claudeDesktopSnippet}</pre>
+                      <p class="text-[10px] text-[#acabab] opacity-60 pt-1">
+                        Add this to your <span class="font-mono text-[#bfc8ca]">claude_desktop_config.json</span>
                       </p>
                     </div>
                   </div>
                 {:else}
-                  <div class="flex items-center gap-3 px-4 py-3 bg-gray-50 dark:bg-[#0d0d0d] border border-dashed border-gray-200 dark:border-[#2a2a2a] rounded-xl text-gray-400 dark:text-gray-600" transition:slide={{ duration: 150 }}>
-                    <Lock class="w-4 h-4 shrink-0" />
-                    <span class="text-[11px]">Enable to serve Filosophy as an MCP tool on <span class="font-mono">http://127.0.0.1:{apiPort}/mcp/sse</span></span>
+                  <div class="flex items-center gap-3 p-6 bg-[#131313] rounded-sm text-[#acabab] opacity-80" transition:slide={{ duration: 150 }}>
+                    <Lock class="w-4 h-4 shrink-0 opacity-60" />
+                    <span class="text-[11px] font-sans">Enable to serve Filosophy as an MCP tool on <span class="font-mono text-[#bfc8ca] bg-[#0e0e0e] px-1.5 py-0.5 rounded-sm">http://127.0.0.1:{apiPort}/mcp/sse</span></span>
                   </div>
                 {/if}
               </section>

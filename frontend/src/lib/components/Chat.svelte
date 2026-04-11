@@ -1,7 +1,7 @@
 <script lang="ts">
   import { afterUpdate, createEventDispatcher } from 'svelte';
   import { fade, slide } from 'svelte/transition';
-  import { X, Trash2, AlertCircle, Send, FileText, Settings, Search as SearchIcon, Shield, Check } from 'lucide-svelte';
+  import { X, Trash2, AlertCircle, FileText, Search as SearchIcon, Shield, Check, Send } from 'lucide-svelte';
   import { Search } from '$lib/wailsjs/go/main/App';
 
   const dispatch = createEventDispatcher();
@@ -46,7 +46,6 @@
   }
   let pendingConfirm: ConfirmState | null = null;
 
-
   function confirmAllow() {
     if (!pendingConfirm) return;
     pendingConfirm.resolve(true);
@@ -64,7 +63,6 @@
     confirmAllow();
   }
 
-  // Pause the agentic loop until user approves/denies sharing results with the LLM
   function requestConfirm(query: string, results: string[]): Promise<boolean> {
     if (alwaysAllow) return Promise.resolve(true);
     return new Promise<boolean>(resolve => {
@@ -94,25 +92,10 @@
     type: 'function',
     function: {
       name: 'search_files',
-      description: `Search the user's locally indexed files using semantic + keyword search.
-Use this whenever the user asks to find, look for, or search files.
-
-QUERY CONSTRUCTION RULES — follow these carefully:
-- Use SHORT, SPECIFIC queries: 1–4 keywords max. Never pass the full user sentence.
-- For author searches: search the author's last name or full name (e.g. "Camus", "Albert Camus").
-- For topic searches: use the core noun/concept (e.g. "existentialism", "climate change").
-- For known titles: search the exact title (e.g. "The Stranger", "The Plague").
-- You can call this tool MULTIPLE TIMES with different queries to improve coverage.
-  Example for "books by Albert Camus": call once with "Albert Camus", then again with "The Stranger" and "The Plague" if needed.
-- The index contains file paths and content — filename matches are strong signals.`,
+      description: `Search files.`,
       parameters: {
         type: 'object',
-        properties: {
-          query: {
-            type: 'string',
-            description: 'Short, specific search query (1–4 keywords). NOT the full user message.',
-          },
-        },
+        properties: { query: { type: 'string' } },
         required: ['query'],
       },
     },
@@ -129,13 +112,12 @@ QUERY CONSTRUCTION RULES — follow these carefully:
     const endpoint = `/llmproxy/?url=${encodeURIComponent(llmEndpoint)}`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
-    const cfg2 = getLLMConfig();
     return fetch(endpoint, {
       method: 'POST',
       headers,
       signal,
       body: JSON.stringify({
-        model: cfg2.model || undefined,
+        model: cfg.model || undefined,
         messages: apiMessages,
         tools: [SEARCH_TOOL],
         tool_choice: 'auto',
@@ -148,7 +130,6 @@ QUERY CONSTRUCTION RULES — follow these carefully:
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    // Accumulate tool call deltas keyed by index
     const toolCallAccum: Record<number, { id: string; name: string; args: string }> = {};
 
     while (true) {
@@ -165,12 +146,10 @@ QUERY CONSTRUCTION RULES — follow these carefully:
           const json = JSON.parse(data);
           const delta = json.choices?.[0]?.delta;
           if (!delta) continue;
-          // Content token
           if (delta.content) {
             assistantMsg.content += delta.content;
             messages = [...messages.slice(0, -1), { ...assistantMsg }];
           }
-          // Tool call deltas
           if (delta.tool_calls) {
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;
@@ -192,39 +171,23 @@ QUERY CONSTRUCTION RULES — follow these carefully:
 
     const cfg = getLLMConfig();
     if (cfg.provider === 'none' || !cfg.baseUrl) {
-      error = 'No LLM configured. Open Settings → Connections.';
+      error = 'Configuration Missing.';
       return;
     }
 
     error = '';
     messages = [...messages, { role: 'user', content: text }];
     input = '';
-    if (textareaEl) { textareaEl.style.height = 'auto'; }
+    if (textareaEl) textareaEl.style.height = 'auto';
     streaming = true;
     abortController = new AbortController();
 
-    // Build system prompt
-    let systemContent = `You are a helpful file search assistant embedded in Filosophy, a local AI-powered file search app running entirely on the user's machine.
-
-You have access to a search_files tool that searches the user's locally indexed files.
-
-HOW TO USE search_files:
-- Always decompose the user's request into focused, short queries before searching.
-- For "books by Albert Camus": search "Albert Camus" first. If few results, also try known titles like "The Stranger", "The Plague", "The Fall".
-- For "my tax documents from 2023": search "tax 2023", then "invoice 2023" if needed.
-- Never pass the raw user message as the query — extract the key terms.
-- Call the tool multiple times if one query isn't enough.
-- After getting results, tell the user what you found with file names (not full paths). If nothing was found, say so clearly.
-- Be concise. Don't make up files that weren't in the search results.`;
+    let systemContent = `You are a professional file search assistant. Summarize results concisely.`;
     if (contextFile) {
-      systemContent += `\n\nContext: the user has selected the file "${contextFile.Path}".`;
-      if (fileContent) {
-        const preview = fileContent.slice(0, 6000);
-        systemContent += `\n\nFile content:\n---\n${preview}${fileContent.length > 6000 ? '\n[content truncated]' : '\n---'}`;
-      }
+      systemContent += `\n\nContext: ${contextFile.Path}.`;
+      if (fileContent) { systemContent += `\nContent: ${fileContent.slice(0, 4000)}`; }
     }
 
-    // apiMessages mirrors what we send to the LLM (includes tool messages not shown in UI)
     const apiMessages: any[] = [
       { role: 'system', content: systemContent },
       ...messages.filter(m => m.role !== 'tool' || m.tool_call_id).map(m => {
@@ -234,90 +197,41 @@ HOW TO USE search_files:
     ];
 
     try {
-      // Agentic loop: keep going until LLM stops calling tools
       while (true) {
         const assistantMsg: Message = { role: 'assistant', content: '' };
         messages = [...messages, assistantMsg];
-
         const res = await callLLM(apiMessages, true, abortController.signal);
-        if (!res.ok) {
-          const body = await res.text().catch(() => '');
-          throw new Error(`HTTP ${res.status} — ${body || res.statusText}`);
-        }
-
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { toolCalls } = await streamResponse(res, assistantMsg);
+        apiMessages.push({ role: 'assistant', content: assistantMsg.content || null, tool_calls: toolCalls.length ? toolCalls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) : undefined });
+        if (!toolCalls.length) break;
 
-        // Append the assistant turn to apiMessages
-        const assistantApiMsg: any = { role: 'assistant', content: assistantMsg.content || null };
-        if (toolCalls.length > 0) {
-          assistantApiMsg.tool_calls = toolCalls.map(tc => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.name, arguments: tc.args },
-          }));
-        }
-        apiMessages.push(assistantApiMsg);
-
-        if (toolCalls.length === 0) break; // LLM is done with tools
-
-        // Execute each tool call
         for (const tc of toolCalls) {
-          if (tc.name !== 'search_files') continue;
           let query = '';
           try { query = JSON.parse(tc.args).query ?? ''; } catch {}
-
-          // Show a search indicator in the UI
-          const searchMsg: Message = {
-            role: 'tool',
-            content: '',
-            tool_call_id: tc.id,
-            _searchQuery: query,
-            _searchResults: [],
-          };
+          const searchMsg: Message = { role: 'tool', content: '', tool_call_id: tc.id, _searchQuery: query, _searchResults: [] };
           messages = [...messages, searchMsg];
+          const results = await Search(query);
+          const resultPaths = results?.slice(0, 10).map(r => r.Path) || [];
+          searchMsg._searchResults = resultPaths;
+          searchMsg._pendingConfirm = resultPaths.length > 0;
+          messages = [...messages.slice(0, -1), { ...searchMsg }];
 
-          let resultText = 'No results found.';
-          let resultPaths: string[] = [];
-          try {
-            const results = await Search(query);
-            if (results && results.length > 0) {
-              resultPaths = results.slice(0, 10).map(r => r.Path);
-              resultText = resultPaths.join('\n');
-            }
-          } catch (e) {
-            resultText = 'Search failed: ' + String(e);
-          }
-
-          // Privacy gate — ask user before sending file paths to the LLM
+          let finalResult = 'No results.';
           if (resultPaths.length > 0) {
-            searchMsg._searchResults = resultPaths;
-            searchMsg._pendingConfirm = true;
-            messages = [...messages.slice(0, -1), { ...searchMsg }];
-
             const allowed = await requestConfirm(query, resultPaths);
-
+            finalResult = allowed ? resultPaths.join('\n') : 'Denied.';
             searchMsg._pendingConfirm = false;
-            if (!allowed) {
-              searchMsg._denied = true;
-              messages = [...messages.slice(0, -1), { ...searchMsg }];
-              resultText = 'User denied sharing these results with the AI.';
-            } else {
-              messages = [...messages.slice(0, -1), { ...searchMsg }];
-            }
-          } else {
+            searchMsg._denied = !allowed;
             messages = [...messages.slice(0, -1), { ...searchMsg }];
           }
-
-          apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
+          apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: finalResult });
         }
-        // Loop — LLM will now respond with the search results in context
       }
     } catch (e: any) {
-      if (e?.name === 'AbortError') {
-        // user cancelled — keep whatever streamed so far
-      } else {
+      if (e?.name !== 'AbortError') {
         messages = messages.slice(0, -1);
-        error = e?.message ?? 'Request failed';
+        error = e?.message || 'Error occurred.';
       }
     } finally {
       streaming = false;
@@ -325,200 +239,100 @@ HOW TO USE search_files:
     }
   }
 
-  function cancel() {
-    abortController?.abort();
-  }
+  function cancel() { abortController?.abort(); }
+  function onKeyDown(e: KeyboardEvent) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }
+  function clearChat() { messages = []; error = ''; }
 
-  function onKeyDown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
-  }
-
-  function clearChat() {
-    messages = [];
-    error = '';
-  }
-
-  // Format message content: handle code fences, inline code, bold, line breaks
   function formatContent(text: string): string {
-    // Escape HTML first
-    const esc = text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-
-    // Code blocks
+    const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     let out = esc.replace(/```[\w]*\n?([\s\S]*?)```/g, (_, code) =>
-      `<pre class="my-2 p-3 bg-gray-100 dark:bg-[#0a0a0a] border border-gray-200 dark:border-[#2a2a2a] rounded-lg overflow-x-auto text-[11px] font-mono leading-relaxed text-slate-800 dark:text-gray-200 whitespace-pre">${code.trimEnd()}</pre>`
+      `<pre class="my-4 p-4 bg-[#000000] border border-[#474848]/20 rounded-sm font-mono text-xs text-[#acabab] overflow-x-auto whitespace-pre">${code.trimEnd()}</pre>`
     );
-    // Inline code
     out = out.replace(/`([^`]+)`/g, (_, c) =>
-      `<code class="px-1 py-0.5 bg-gray-100 dark:bg-[#1a1a1a] rounded text-[11px] font-mono text-blue-600 dark:text-blue-400">${c}</code>`
+      `<code class="px-1.5 py-0.5 bg-[#000000] border border-[#474848]/20 rounded-sm text-[11px] font-mono text-[#bfc8ca]">${c}</code>`
     );
-    // Bold
-    out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    // Line breaks
+    out = out.replace(/\*\*(.+?)\*\*/g, '<strong class="text-[#e7e5e5]">$1</strong>');
     out = out.replace(/\n/g, '<br>');
     return out;
   }
 
   $: cfg = getLLMConfig();
-  $: providerLabel = cfg.provider !== 'none' && cfg.baseUrl
-    ? ({ ollama: 'Ollama', lmstudio: 'LM Studio', 'openai-compatible': 'API' }[cfg.provider] ?? cfg.provider) + (cfg.model ? ' · ' + cfg.model : '')
-    : null;
-  $: hasConfig = cfg.provider !== 'none' && !!cfg.baseUrl;
+  $: providerLabel = cfg.provider !== 'none' && cfg.baseUrl ? cfg.model : null;
 </script>
 
-<aside
-  class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
->
+<aside class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#0e0e0e] border-l border-[#1a1a1a] flex flex-col shadow-2xl overflow-hidden">
   <!-- Header -->
-  <header class="h-16 shrink-0 flex items-center justify-between px-8 border-b border-gray-100 dark:border-[#1a1a1a]">
+  <header class="h-14 shrink-0 flex items-center justify-between px-6 bg-[#0e0e0e] border-b border-[#1a1a1a]">
     <div class="flex items-center gap-3">
-      <span class="text-[10px] font-black uppercase tracking-[0.2em] text-slate-900 dark:text-gray-100">Chat</span>
+      <span class="text-[10px] font-bold uppercase tracking-[0.2em] text-[#acabab]">Session</span>
       {#if providerLabel}
-        <span class="px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded border border-blue-100 dark:border-blue-900/30" transition:fade>
-          {providerLabel}
-        </span>
+        <span class="text-[9px] font-medium text-[#474848] uppercase tracking-widest">{providerLabel}</span>
       {/if}
     </div>
     <div class="flex items-center gap-1">
       {#if messages.length > 0}
-        <button
-          on:click={clearChat}
-          class="p-2 text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 transition-colors"
-          aria-label="Clear conversation"
-        >
-          <Trash2 class="w-4 h-4" />
-        </button>
+        <button on:click={clearChat} class="p-2 text-[#474848] hover:text-[#acabab] transition-colors"><Trash2 class="w-4 h-4" /></button>
       {/if}
-      <button
-        on:click={() => dispatch('close')}
-        class="p-2 text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 transition-colors"
-        aria-label="Close chat"
-      >
-        <X class="w-5 h-5" />
-      </button>
+      <button on:click={() => dispatch('close')} class="p-2 text-[#474848] hover:text-[#acabab] transition-colors"><X class="w-5 h-5" /></button>
     </div>
   </header>
 
-  <!-- Context file badge -->
-  {#if contextFile}
-    <div class="shrink-0 px-6 py-2.5 border-b border-gray-100 dark:border-[#1a1a1a] bg-blue-50/50 dark:bg-blue-950/10 flex items-center gap-2" transition:slide={{ duration: 200 }}>
-      <FileText class="w-3.5 h-3.5 text-blue-500 shrink-0" />
-      <span class="text-[10px] font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-widest truncate">
-        Context: {contextFile.Path.split(/[\\/]/).pop()}
-      </span>
-    </div>
-  {/if}
-
-  <!-- Messages -->
-  <div
-    bind:this={messagesEl}
-    class="flex-1 overflow-y-auto px-6 py-6 space-y-6 scrollbar-custom"
-  >
-    {#if !hasConfig}
-      <!-- No config state -->
-      <div class="h-full flex flex-col items-center justify-center text-center gap-4 px-8">
-        <div class="w-12 h-12 border border-gray-200 dark:border-[#2a2a2a] flex items-center justify-center text-gray-300 dark:text-gray-600">
-          <Settings class="w-6 h-6" />
-        </div>
-        <div class="space-y-1.5">
-          <p class="text-sm font-serif font-bold text-slate-800 dark:text-gray-200">No LLM Connected</p>
-          <p class="text-[11px] text-gray-400 dark:text-gray-500 leading-relaxed max-w-xs">
-            Go to <strong>Settings → Connections</strong> and add a local LLM like Ollama or LM Studio to start chatting.
-          </p>
-        </div>
-      </div>
+  <!-- Message Feed -->
+  <div bind:this={messagesEl} class="flex-1 overflow-y-auto px-6 py-6 space-y-6 scrollbar-custom pb-28">
+    {#if !cfg.provider || cfg.provider === 'none'}
+       <div class="h-full flex flex-col items-center justify-center text-center px-12 gap-4">
+          <p class="text-sm font-serif text-[#e7e5e5]">Inference Engine Offline</p>
+          <p class="text-[11px] text-[#474848] leading-relaxed">Configure a local provider in settings to enable assistant responses.</p>
+       </div>
     {:else if messages.length === 0}
-      <!-- Empty state -->
-      <div class="h-full flex flex-col items-center justify-center text-center gap-3 px-8">
-        <p class="text-2xl font-serif font-bold text-slate-900 dark:text-gray-100">How can I help?</p>
-        <p class="text-[11px] text-gray-400 dark:text-gray-500 leading-relaxed max-w-xs">
-          Ask anything — or select a file on the left to include it as context.
-        </p>
-      </div>
+       <div class="h-full flex flex-col items-center justify-center text-center px-12 gap-2">
+          <p class="text-xl font-serif text-[#e7e5e5] tracking-tight">Filosophy Ready.</p>
+          <p class="text-[10px] text-[#474848] uppercase tracking-[0.2em]">Idle // Awaiting Input</p>
+       </div>
     {:else}
       {#each messages as msg, i (i)}
         {#if msg.role === 'user'}
-          <!-- User bubble -->
+          <!-- Task 1: User Message Block -->
           <div class="flex justify-end" in:fade={{ duration: 150 }}>
-            <div class="max-w-[80%] px-4 py-3 bg-slate-900 dark:bg-white text-white dark:text-black text-[13px] leading-relaxed font-sans whitespace-pre-wrap">
+            <div class="max-w-[85%] px-4 py-3 bg-[#252626] rounded-md text-sm font-sans text-[#e7e5e5] leading-relaxed shadow-sm">
               {msg.content}
             </div>
           </div>
         {:else if msg.role === 'tool'}
-          <!-- Search tool call indicator -->
-          <div class="flex gap-2 items-start" in:fade={{ duration: 150 }}>
-            <div class="w-6 h-6 shrink-0 mt-0.5 flex items-center justify-center text-gray-400 dark:text-gray-500">
-              <SearchIcon class="w-3.5 h-3.5" />
-            </div>
-            <div class="flex-1 min-w-0">
-              <p class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-1.5">
-                Searched: <span class="text-blue-500 dark:text-blue-400 normal-case font-mono">{msg._searchQuery}</span>
-              </p>
-
-              {#if msg._searchResults && msg._searchResults.length > 0}
-                <div class="border border-gray-100 dark:border-[#2a2a2a] divide-y divide-gray-100 dark:divide-[#2a2a2a] mb-2">
-                  {#each msg._searchResults as path}
-                    <p class="px-3 py-1.5 text-[10px] text-gray-500 dark:text-gray-400 font-mono truncate">{path.split(/[\\/]/).pop()}<span class="text-gray-300 dark:text-gray-600 ml-1 text-[9px]">{path.split(/[\\/]/).slice(0,-1).join('/')}</span></p>
-                  {/each}
-                </div>
-
-                {#if msg._pendingConfirm}
-                  <!-- Confirm gate -->
-                  <div class="border border-amber-200 dark:border-amber-900/40 bg-amber-50/50 dark:bg-amber-950/10 p-3" transition:slide={{ duration: 150 }}>
-                    <div class="flex items-center gap-1.5 mb-2">
-                      <Shield class="w-3 h-3 text-amber-500 shrink-0" />
-                      <p class="text-[10px] font-bold text-amber-700 dark:text-amber-400 uppercase tracking-widest">Share these files with the AI?</p>
-                    </div>
-                    <p class="text-[10px] text-amber-600 dark:text-amber-500 mb-3 leading-relaxed">
-                      The file paths above will be sent to your LLM to answer your question.
-                    </p>
+          <div class="p-5 bg-[#131313] border border-[#2a2a2a]/10 rounded-md" in:fade={{ duration: 150 }}>
+             <div class="flex items-center gap-2 mb-3">
+                <SearchIcon class="w-3.5 h-3.5 text-[#474848]" />
+                <span class="text-[10px] font-bold text-[#474848] uppercase tracking-widest">Index Search // {msg._searchQuery}</span>
+             </div>
+             {#if msg._searchResults?.length}
+               <div class="space-y-1">
+                 {#each msg._searchResults as path}
+                   <div class="text-[10px] font-mono text-[#acabab]/60 truncate">» {path.split(/[\\/]/).pop()}</div>
+                 {/each}
+               </div>
+               {#if msg._pendingConfirm}
+                  <div class="mt-4 pt-4 border-t border-[#474848]/10 flex flex-col gap-3">
+                    <p class="text-[9px] font-bold text-[#bfc8ca] uppercase tracking-widest">Approve Context Exposure</p>
                     <div class="flex gap-2">
-                      <button
-                        on:click={confirmDeny}
-                        class="flex-1 py-1.5 border border-gray-200 dark:border-[#2a2a2a] text-[9px] font-bold uppercase tracking-widest text-gray-500 hover:bg-gray-50 dark:hover:bg-[#1a1a1a] transition-colors"
-                      >Deny</button>
-                      <button
-                        on:click={confirmAllow}
-                        class="flex-1 py-1.5 bg-slate-900 dark:bg-white text-white dark:text-black text-[9px] font-bold uppercase tracking-widest hover:bg-slate-700 dark:hover:bg-gray-200 transition-colors flex items-center justify-center gap-1.5"
-                      ><Check class="w-3 h-3" /> Allow</button>
+                      <button on:click={confirmAllow} class="px-4 py-1.5 bg-[#252626] text-[#e7e5e5] text-[9px] font-bold uppercase tracking-widest rounded-sm border border-[#474848]/20">Allow</button>
+                      <button on:click={confirmDeny} class="px-4 py-1.5 border border-[#474848]/20 text-[#acabab] text-[9px] font-bold uppercase tracking-widest rounded-sm">Deny</button>
                     </div>
-                    <button
-                      on:click={confirmAlwaysAllow}
-                      class="mt-2 w-full text-[9px] text-gray-400 dark:text-gray-600 hover:text-gray-600 dark:hover:text-gray-400 transition-colors"
-                    >Always allow (don't ask again)</button>
                   </div>
-                {:else if msg._denied}
-                  <p class="text-[10px] text-red-400 dark:text-red-500 italic">Sharing denied — results not sent to AI</p>
-                {:else}
-                  <p class="text-[10px] text-green-600 dark:text-green-500 flex items-center gap-1"><Check class="w-3 h-3" /> Shared with AI</p>
-                {/if}
-              {:else}
-                <p class="text-[10px] text-gray-400 italic">No results found</p>
-              {/if}
-            </div>
+               {/if}
+             {/if}
           </div>
         {:else}
-          <!-- Assistant message -->
-          <div class="flex gap-3 items-start" in:fade={{ duration: 150 }}>
-            <div class="w-6 h-6 shrink-0 mt-0.5 bg-blue-600 flex items-center justify-center text-white text-[9px] font-black tracking-widest rounded-sm select-none">
-              AI
-            </div>
-            <div class="flex-1 min-w-0">
+          <!-- Task 1: AI Response Block -->
+          <div class="flex justify-start" in:fade={{ duration: 150 }}>
+            <div class="max-w-full w-full px-5 py-5 bg-[#131313] rounded-md shadow-sm">
               {#if msg.content}
-                <div class="text-[13px] leading-relaxed text-slate-800 dark:text-gray-100 font-sans">
+                <div class="text-base font-serif text-[#e7e5e5] leading-relaxed">
                   {@html formatContent(msg.content)}
                 </div>
               {:else if streaming && i === messages.length - 1}
-                <!-- Typing indicator -->
                 <div class="flex items-center gap-1.5 py-1">
-                  <span class="w-1.5 h-1.5 rounded-full bg-gray-400 dark:bg-gray-500 animate-bounce" style="animation-delay: 0ms"></span>
-                  <span class="w-1.5 h-1.5 rounded-full bg-gray-400 dark:bg-gray-500 animate-bounce" style="animation-delay: 150ms"></span>
-                  <span class="w-1.5 h-1.5 rounded-full bg-gray-400 dark:bg-gray-500 animate-bounce" style="animation-delay: 300ms"></span>
+                  <div class="w-1.5 h-1.5 bg-[#bfc8ca] rounded-full animate-pulse"></div>
+                  <span class="text-[9px] font-bold uppercase tracking-widest text-[#474848]">Thinking</span>
                 </div>
               {/if}
             </div>
@@ -526,52 +340,47 @@ HOW TO USE search_files:
         {/if}
       {/each}
     {/if}
-
-    <!-- Error -->
     {#if error}
-      <div class="flex items-start gap-2 p-3 bg-red-50/50 dark:bg-red-950/10 border border-red-100 dark:border-red-900/30 rounded-lg" transition:slide>
-        <AlertCircle class="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-        <p class="text-[11px] text-red-600 dark:text-red-400 leading-relaxed font-mono">{error}</p>
+      <div class="p-3 bg-red-950/10 border border-red-900/30 rounded-md flex items-center gap-3">
+        <AlertCircle class="w-4 h-4 text-red-500 shrink-0" />
+        <p class="text-[10px] font-mono text-red-400 uppercase">{error}</p>
       </div>
     {/if}
   </div>
 
-  <!-- Input area -->
-  {#if hasConfig}
-    <div class="shrink-0 border-t border-gray-100 dark:border-[#1a1a1a] px-6 py-4">
-      <div class="flex items-end gap-3 border border-gray-200 dark:border-[#2a2a2a] bg-white dark:bg-[#0a0a0a] px-4 py-3 focus-within:border-blue-400 dark:focus-within:border-blue-600 transition-colors">
+  <!-- Task 2: The Input Bar -->
+  {#if cfg.provider && cfg.provider !== 'none'}
+    <div class="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#0e0e0e] via-[#0e0e0e] to-transparent">
+      <div class="bg-[#131313] rounded-md px-4 py-3 flex items-end gap-3 shadow-xl border border-[#2a2a2a]/10">
         <textarea
           bind:this={textareaEl}
           bind:value={input}
           on:keydown={onKeyDown}
           on:input={resizeTextarea}
-          placeholder="Message…"
+          placeholder="Message engine…"
           rows="1"
           disabled={streaming}
-          class="flex-1 bg-transparent border-none outline-none resize-none text-[13px] text-slate-800 dark:text-gray-100 placeholder:text-gray-300 dark:placeholder:text-gray-600 leading-relaxed disabled:opacity-50 max-h-40 scrollbar-custom"
+          class="flex-1 bg-transparent border-none outline-none resize-none text-sm font-sans text-white placeholder:text-[#acabab]/50 leading-relaxed disabled:opacity-50 max-h-40 scrollbar-custom"
         ></textarea>
-        {#if streaming}
-          <button
-            on:click={cancel}
-            class="shrink-0 w-8 h-8 flex items-center justify-center bg-gray-200 dark:bg-[#2a2a2a] text-gray-600 dark:text-gray-400 hover:bg-red-100 dark:hover:bg-red-950/30 hover:text-red-500 transition-colors"
-            aria-label="Stop generation"
-          >
-            <span class="w-3 h-3 bg-current block"></span>
-          </button>
-        {:else}
-          <button
-            on:click={send}
-            disabled={!input.trim()}
-            class="shrink-0 w-8 h-8 flex items-center justify-center bg-slate-900 dark:bg-white text-white dark:text-black hover:bg-slate-700 dark:hover:bg-gray-200 disabled:opacity-30 transition-colors"
-            aria-label="Send message"
-          >
-            <Send class="w-3.5 h-3.5" />
-          </button>
-        {/if}
+        
+        <div class="flex pb-0.5">
+          {#if streaming}
+            <button on:click={cancel} class="group p-1">
+              <div class="w-4 h-4 bg-[#474848] group-hover:bg-red-500 transition-colors"></div>
+            </button>
+          {:else}
+            <button on:click={send} disabled={!input.trim()} class="p-1 transition-colors text-[#474848] hover:text-[#bfc8ca] disabled:opacity-10 cursor-pointer">
+              <Send class="w-5 h-5" />
+            </button>
+          {/if}
+        </div>
       </div>
-      <p class="mt-2 text-[9px] text-gray-400 dark:text-gray-600 text-center font-medium">
-        Enter to send · Shift+Enter for new line
-      </p>
     </div>
   {/if}
 </aside>
+
+<style>
+  :global(.scrollbar-custom::-webkit-scrollbar) { width: 3px; }
+  :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
+  :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #1a1a1a; }
+</style>
