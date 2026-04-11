@@ -188,6 +188,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		"PRAGMA mmap_size=536870912",
 		fmt.Sprintf("PRAGMA cache_size=-%d", cacheKB),
 		"PRAGMA busy_timeout=10000",
+		// Checkpoint every 500 pages (~2 MB) so the WAL never grows huge.
+		// A large WAL causes multi-minute recovery on next open after a crash.
+		"PRAGMA wal_autocheckpoint=500",
 	}
 
 	for _, dbConn := range []*sql.DB{sqlDB, vDB} {
@@ -1284,6 +1287,15 @@ func (s *Engine) UnindexedFiles() (paths []string, mtimes []int64, err error) {
 	return paths, mtimes, rows.Err()
 }
 
+// Checkpoint runs a passive WAL checkpoint, flushing written pages back into
+// the main database file. Call this periodically during long indexing runs to
+// prevent the WAL from growing so large that the next startup hangs on recovery.
+func (s *Engine) Checkpoint() {
+	if _, err := s.sqlDB.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		log.Printf("wal_checkpoint warning: %v", err)
+	}
+}
+
 // ResetContentIndex clears content_indexed/hashes and paths_fts, forcing a full
 // re-index on the next run. Called when --index is passed.
 func (s *Engine) ResetContentIndex() error {
@@ -1334,8 +1346,6 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 	imageQueryVec := clipEmbs[0]
 
-
-
 	// Vector search both collections. Images are capped lower than text: they add
 	// semantic coverage but shouldn't flood rankings for text-heavy queries.
 	textResults, err := s.db.Vector().Search(ctx, textQueryVec, core.SearchOptions{
@@ -1373,6 +1383,8 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}()
 
 	// Group B: content FTS signals; fuzzy only runs when exact search finds few docs.
+	contentScores := make(map[string]float64)
+	var contentMu sync.Mutex
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
@@ -1382,6 +1394,11 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		if len(m) < 5 {
 			s.addContentFTSFuzzyRRF(ctx, query, m)
 		}
+		contentMu.Lock()
+		for p, v := range m {
+			contentScores[p] += v
+		}
+		contentMu.Unlock()
 		sigCh <- m
 	}()
 
@@ -1396,6 +1413,11 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		for i, res := range imageResults {
 			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
 		}
+		contentMu.Lock()
+		for p, v := range m {
+			contentScores[p] += v
+		}
+		contentMu.Unlock()
 		sigCh <- m
 	}()
 
@@ -1411,6 +1433,20 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
 	addFilenameBoosts(query, scores)
 	addFuzzyPathBoosts(query, scores)
+
+	// Idea 2: cap path-only results. Any path with zero content signal (no vector
+	// hit, no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
+	// Cap these at pathOnlyScoreCap so they can never beat a real content match.
+	const pathOnlyScoreCap = 0.12
+	for path, score := range scores {
+		if _, hasContent := contentScores[path]; !hasContent && score > pathOnlyScoreCap {
+			scores[path] = pathOnlyScoreCap
+		}
+	}
+
+	// Idea 3: penalize binary/system files that have no business appearing in
+	// document searches. Apply a multiplier based on extension and path prefix.
+	applyNoisePenalties(scores)
 
 	// Batch-fetch size/mtime from the files table — replaces per-result os.Stat.
 	results := s.buildResultsFromScores(ctx, scores)
@@ -1481,9 +1517,6 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("text query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-
-	// Acquire read lock for all DB operations.
-
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: textCollection,
@@ -1560,8 +1593,6 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 		return nil, fmt.Errorf("image query encoding failed: %w", err)
 	}
 	queryVec := embs[0]
-
-
 
 	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
 		Collection: imageCollection,
@@ -1737,10 +1768,13 @@ func (s *Engine) addPathFTSShortPrefixScores(ctx context.Context, query string, 
 	words := strings.Fields(strings.ToLower(query))
 	anchors := make([]string, 0, len(words))
 	for _, w := range words {
-		if len(w) < 3 {
+		// Use 4-char prefix minimum so "camus" → "camu*" only matches near-exact
+		// tokens (camus, camusian…) and not unrelated "cam"-prefix words like
+		// camera, camembert, camouflage.
+		if len(w) < 4 {
 			continue
 		}
-		escaped := strings.ReplaceAll(w[:3], `"`, `""`)
+		escaped := strings.ReplaceAll(w[:4], `"`, `""`)
 		anchors = append(anchors, `"`+escaped+`"*`)
 	}
 	if len(anchors) == 0 {
@@ -2096,12 +2130,30 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 		return
 	}
 
+	// Total query characters (only words ≥ 3 chars participate).
+	queryCharTotal := 0
+	for _, qw := range queryWords {
+		if len(qw) >= 3 {
+			queryCharTotal += len(qw)
+		}
+	}
+	if queryCharTotal == 0 {
+		return
+	}
+
 	for path := range scores {
-		pathWords := splitWords(filepath.Base(path))
+		base := filepath.Base(path)
+		baseLen := len(base)
+		if baseLen == 0 {
+			continue
+		}
+		pathWords := splitWords(base)
 		if len(pathWords) == 0 {
 			continue
 		}
+
 		totalSim := 0.0
+		matchedQueryChars := 0
 		for _, qw := range queryWords {
 			if len(qw) < 3 {
 				continue
@@ -2116,10 +2168,63 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 				}
 			}
 			totalSim += best
+			matchedQueryChars += len(qw)
 		}
 		avgSim := totalSim / float64(len(queryWords))
-		if avgSim >= fuzzyMinWordSim {
-			scores[path] += fuzzyPathBoost * avgSim
+		if avgSim < fuzzyMinWordSim {
+			continue
+		}
+
+		// Coverage ratio: matched query chars vs filename length.
+		// A 5-char query matching inside a 30-char filename scores ~0.17×,
+		// while a 5-char query matching a 6-char filename scores ~0.83×.
+		// This prevents long unrelated paths from cheating via a short
+		// incidental substring match.
+		coverageRatio := float64(matchedQueryChars) / float64(baseLen)
+		if coverageRatio > 1.0 {
+			coverageRatio = 1.0
+		}
+
+		scores[path] += fuzzyPathBoost * avgSim * coverageRatio
+	}
+}
+
+// applyNoisePenalties multiplies down scores for files that are unlikely to be
+// useful document search results:
+//   - Known binary/compiled extensions (.class, .exe, .dll, .inf, .sys, etc.)
+//   - System path prefixes (C:\Windows, C:\Program Files, /usr/lib, etc.)
+func applyNoisePenalties(scores map[string]float64) {
+	// Extensions that are never useful document results — heavy penalty
+	binaryExts := map[string]bool{
+		".class": true, ".exe": true, ".dll": true, ".sys": true,
+		".inf": true, ".ini": true, ".dat": true, ".bin": true,
+		".obj": true, ".lib": true, ".pdb": true, ".ilk": true,
+		".so": true, ".dylib": true, ".o": true, ".a": true,
+		".pyc": true, ".pyo": true, ".wasm": true, ".node": true,
+	}
+
+	// Path prefixes that are system/runtime noise
+	systemPrefixes := []string{
+		`c:\windows\`,
+		`c:\program files\`,
+		`c:\program files (x86)\`,
+		`/usr/lib/`, `/usr/share/`, `/System/Library/`,
+	}
+
+	for path, score := range scores {
+		ext := strings.ToLower(filepath.Ext(path))
+		lower := strings.ToLower(filepath.ToSlash(path))
+
+		if binaryExts[ext] {
+			scores[path] = score * 0.1
+			continue
+		}
+
+		for _, pfx := range systemPrefixes {
+			if strings.HasPrefix(lower, pfx) {
+				scores[path] = score * 0.05
+				break
+			}
 		}
 	}
 }

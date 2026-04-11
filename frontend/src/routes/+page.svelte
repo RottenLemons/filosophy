@@ -1,16 +1,59 @@
 <script>
   import { slide, fade } from 'svelte/transition';
+  import { onMount, onDestroy } from 'svelte';
   import SearchIcon from "carbon-icons-svelte/lib/Search.svelte";
   import DocumentIcon from "carbon-icons-svelte/lib/Document.svelte";
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
-  import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity } from 'lucide-svelte';
+  import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity, MessageSquare } from 'lucide-svelte';
   import { Search, OpenFileNative } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import SettingsModal from '$lib/components/SettingsModal.svelte';
+  import Chat from '$lib/components/Chat.svelte';
+  import APIConfirmDialog from '$lib/components/APIConfirmDialog.svelte';
   import { indexingStatus } from '../stores/indexer';
 
   let showSettings = false;
+  let showChat = false;
+
+  // ── API confirm dialog ──────────────────────────────────────────────────────
+  /** @type {{ id: string; query: string } | null} */
+  let apiConfirmRequest = null;
+  // Queue: if multiple requests arrive before user responds, line them up
+  /** @type {{ id: string; query: string }[]} */
+  let apiConfirmQueue = [];
+
+  let apiConfirmUnsubscribe = /** @type {(() => void) | null} */ (null);
+
+  onMount(() => {
+    if (window['runtime']?.EventsOn) {
+      apiConfirmUnsubscribe = window['runtime'].EventsOn('api_confirm_request', (data) => {
+        if (!data?.id || !data?.query) return;
+        if (apiConfirmRequest === null) {
+          apiConfirmRequest = data;
+        } else {
+          apiConfirmQueue = [...apiConfirmQueue, data];
+        }
+      });
+    }
+  });
+
+  onDestroy(() => {
+    apiConfirmUnsubscribe?.();
+  });
+
+  function handleConfirmReply(e) {
+    const { id, allowed } = e.detail;
+    window['runtime']?.EventsEmit('api_confirm_reply', { id, allowed });
+    // Show next queued request if any
+    if (apiConfirmQueue.length > 0) {
+      const [next, ...rest] = apiConfirmQueue;
+      apiConfirmRequest = next;
+      apiConfirmQueue = rest;
+    } else {
+      apiConfirmRequest = null;
+    }
+  }
 
   /** @type {string} */
   let searchQuery = "";
@@ -277,6 +320,14 @@
 <div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
     <button
+      on:click={() => showChat = !showChat}
+      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
+      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+      aria-label="Toggle Chat"
+    >
+      <MessageSquare class="w-5 h-5" />
+    </button>
+    <button
       on:click={() => showSettings = true}
       class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
       style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
@@ -525,9 +576,18 @@
       </div>
     </div>
     
-    <!-- Task 3: Mobile overlay lg:relative vs absolute inset-0 -->
-    {#if selectedFile}
-      <aside 
+    <!-- Chat panel -->
+    {#if showChat}
+      <Chat
+        contextFile={selectedFile}
+        fileContent={textContent}
+        on:close={() => showChat = false}
+      />
+    {/if}
+
+    <!-- File preview — hidden when chat is open -->
+    {#if selectedFile && !showChat}
+      <aside
         transition:slide={{ axis: 'x', duration: 400 }}
         class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
       >
@@ -640,6 +700,8 @@
     </div>
   {/if}
 </div>
+
+<APIConfirmDialog request={apiConfirmRequest} on:reply={handleConfirmReply} />
 
 <style>
   :global(.scrollbar-custom::-webkit-scrollbar) { width: 6px; }

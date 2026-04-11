@@ -2,7 +2,6 @@
 package daemon
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -251,9 +250,7 @@ func (d *Daemon) isDirectChild(path string) bool {
 }
 
 func (d *Daemon) flush() {
-	fmt.Println("[FLUSH] attempting lock...")
 	if !d.flushMu.TryLock() {
-		fmt.Println("[FLUSH] skipped — another flush in progress")
 		return // another flush is already in progress
 	}
 	defer d.flushMu.Unlock()
@@ -262,7 +259,6 @@ func (d *Daemon) flush() {
 	changes := d.t.drain()
 	d.t.mu.Unlock()
 
-	fmt.Printf("[FLUSH] drained %d changed paths\n", len(changes))
 	if len(changes) == 0 {
 		return
 	}
@@ -297,11 +293,8 @@ func (d *Daemon) flush() {
 		}
 	}
 
-	fmt.Printf("[FLUSH] deletes=%d, renames=%d, adds=%d\n", len(deletePaths), len(renamePairs), len(addPaths))
-
 	// 1. Delete all references for removed/modified files
 	if len(deletePaths) > 0 {
-		fmt.Println("[FLUSH] deleting:", deletePaths)
 		if err := d.sc.DeletePaths(deletePaths); err != nil {
 			log.Println("flush delete error:", err)
 		}
@@ -315,7 +308,6 @@ func (d *Daemon) flush() {
 
 	// 2. Rename paths in DB
 	if len(renamePairs) > 0 {
-		fmt.Println("[FLUSH] renaming:", renamePairs)
 		oldPaths := make([]string, len(renamePairs))
 		newPaths := make([]string, len(renamePairs))
 		for i, pair := range renamePairs {
@@ -329,7 +321,6 @@ func (d *Daemon) flush() {
 
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
-		fmt.Println("[FLUSH] indexing:", addPaths)
 		cfg, err := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
 		if err != nil {
 			log.Println("[FLUSH] NewProcessorConfig error:", err)
@@ -378,12 +369,12 @@ func (d *Daemon) run() {
 	// Watch all configured base directories.
 	for _, baseDir := range d.baseDirs {
 		if err := notify.Watch(baseDir, d.structureChan, structureEventMask); err != nil {
-			fmt.Println("Error watching structure for", baseDir, ":", err)
+			log.Println("Error watching structure for", baseDir, ":", err)
 			continue
 		}
 		entries, err := os.ReadDir(baseDir)
 		if err != nil {
-			fmt.Println("Error reading base directory:", baseDir, err)
+			log.Println("Error reading base directory:", baseDir, err)
 			continue
 		}
 		for _, entry := range entries {
