@@ -103,10 +103,25 @@ func (c *Client) IsConnected() bool {
 	return c.wac != nil && c.wac.IsConnected() && c.wac.IsLoggedIn()
 }
 
+// AutoConnect reconnects a previously saved session at startup without showing
+// a QR code. It is a no-op if there is no saved session. Runs asynchronously
+// so it does not block the startup path.
+func (c *Client) AutoConnect(appCtx context.Context) {
+	go func() {
+		if err := c.connect(appCtx, false); err != nil {
+			log.Printf("[WhatsApp] Auto-connect failed: %v", err)
+		}
+	}()
+}
+
 // Connect initialises the whatsmeow client, restores an existing session if one
 // exists, or starts QR pairing for a new session.
 // It is safe to call multiple times — it no-ops if already connected.
 func (c *Client) Connect(appCtx context.Context) error {
+	return c.connect(appCtx, true)
+}
+
+func (c *Client) connect(appCtx context.Context, allowPairing bool) error {
 	c.mu.Lock()
 	if c.wac != nil && c.wac.IsConnected() {
 		c.mu.Unlock()
@@ -170,6 +185,12 @@ func (c *Client) Connect(appCtx context.Context) error {
 	wac.AddEventHandler(c.handleEvent)
 
 	if device.ID == nil {
+		if !allowPairing {
+			// Auto-connect at startup: no saved session, nothing to do.
+			log.Println("[WhatsApp] AutoConnect: no saved session, skipping")
+			c.setStatus(StatusDisconnected)
+			return nil
+		}
 		log.Println("[WhatsApp] Connect: no saved session — starting QR pairing")
 		return c.doPairing(appCtx)
 	}

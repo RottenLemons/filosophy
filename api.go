@@ -57,6 +57,8 @@ func (s *APIServer) start() error {
 	if s.app.config.APIEnabled {
 		mux.HandleFunc("/search", s.apiAuth(s.handleSearch))
 		mux.HandleFunc("/status", s.apiAuth(s.handleStatus))
+		mux.HandleFunc("/feedback", s.apiAuth(s.handleFeedback))
+		mux.HandleFunc("/admin/weights", s.apiAuth(s.handleAdminWeights))
 	}
 	if s.app.config.MCPEnabled {
 		s.mcp.register(mux)
@@ -232,6 +234,102 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"progress":   idxStatus.Progress,
 		"message":    idxStatus.StatusMessage,
 	})
+}
+
+// handleFeedback records a thumbs-up/down event for a search result.
+//
+//	POST /feedback
+//	{"query":"...", "path":"...", "rank":0, "score":0.87, "feedback":1}
+//
+// feedback must be +1 (thumbs up), -1 (thumbs down), or 0 (click-through).
+func (s *APIServer) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Query    string  `json:"query"`
+		Path     string  `json:"path"`
+		Rank     int     `json:"rank"`
+		Score    float64 `json:"score"`
+		Feedback int     `json:"feedback"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Query == "" || req.Path == "" {
+		jsonError(w, "query and path are required", http.StatusBadRequest)
+		return
+	}
+	if req.Feedback != -1 && req.Feedback != 0 && req.Feedback != 1 {
+		jsonError(w, "feedback must be -1, 0, or 1", http.StatusBadRequest)
+		return
+	}
+
+	s.app.mu.Lock()
+	engine := s.app.engine
+	s.app.mu.Unlock()
+	if engine == nil || engine.Feedback == nil {
+		jsonError(w, "engine not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	if err := engine.Feedback.Submit(s.app.sessionID, req.Query, req.Path, req.Rank, req.Score, req.Feedback); err != nil {
+		jsonError(w, "failed to record feedback: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleAdminWeights allows updating ranking weights at runtime without restart.
+//
+//	POST /admin/weights
+//	{"w_recency": 0.5, "w_semantic_text": 1.2}
+//
+// Only keys present in the request body are updated; others are left unchanged.
+func (s *APIServer) handleAdminWeights(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var updates map[string]float64
+	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil || len(updates) == 0 {
+		jsonError(w, "invalid JSON or empty body", http.StatusBadRequest)
+		return
+	}
+
+	s.app.mu.Lock()
+	engine := s.app.engine
+	s.app.mu.Unlock()
+	if engine == nil {
+		jsonError(w, "engine not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Write each key to search_config. Unknown keys are silently stored —
+	// they will be ignored by the weight loader but won't cause harm.
+	for k, v := range updates {
+		if _, err := engine.GetSQLDB().Exec(
+			`INSERT INTO search_config(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			k, v,
+		); err != nil {
+			jsonError(w, "db write failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Trigger an immediate reload so the new weights take effect within this request.
+	if engine.Weights != nil {
+		engine.Weights.ForceReload()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

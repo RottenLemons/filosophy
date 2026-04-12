@@ -1,17 +1,17 @@
 <script>
   import { slide } from 'svelte/transition';
   import { ChevronRight, Folder, FolderOpen } from 'lucide-svelte';
-  import { GetFolderChildren, SetFolderIndexed } from '$lib/wailsjs/go/main/App';
+  import { GetFolderChildren, SetFolderIndexed, SetDirPathOnly } from '$lib/wailsjs/go/main/App';
 
-  /** @typedef {{ Name: string, Path: string, Indexed: boolean, HasChildren: boolean }} FolderState */
+  /** @typedef {{ Name: string, Path: string, Indexed: boolean, PathOnly: boolean, HasChildren: boolean }} FolderState */
 
   /** @type {FolderState} */
   export let folder;
   /** @type {number} */
   export let depth = 0;
   export let searchTerm = "";
-  
-  // Task 3: Cascade prop
+
+  // Cascade prop
   export let parentExcluded = false;
 
   let isExpanded = false;
@@ -19,11 +19,10 @@
   let children = null;
   let loading = false;
 
-  // Task 3: Combined exclusion state
   $: isGloballyExcluded = parentExcluded || !folder.Indexed;
 
-  $: isVisible = !searchTerm || 
-                 folder.Name.toLowerCase().includes(searchTerm.toLowerCase()) || 
+  $: isVisible = !searchTerm ||
+                 folder.Name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                  folder.Path.toLowerCase().includes(searchTerm.toLowerCase());
 
   async function toggleExpand() {
@@ -48,9 +47,19 @@
     try {
       await SetFolderIndexed(folder.Path, checked);
     } catch (err) {
-      // revert on error
       folder = { ...folder, Indexed: !checked };
       console.error('SetFolderIndexed error:', err);
+    }
+  }
+
+  async function togglePathOnly() {
+    const next = !folder.PathOnly;
+    folder = { ...folder, PathOnly: next };
+    try {
+      await SetDirPathOnly(folder.Path, next);
+    } catch (err) {
+      folder = { ...folder, PathOnly: !next };
+      console.error('SetDirPathOnly error:', err);
     }
   }
 </script>
@@ -92,6 +101,17 @@
           {/if}
         </span>
       </label>
+
+      <!-- Path-only toggle (only shown when folder is indexed) -->
+      {#if !isGloballyExcluded}
+        <button
+          class="path-only-btn {folder.PathOnly ? 'active' : ''}"
+          on:click|stopPropagation={togglePathOnly}
+          title={folder.PathOnly ? 'Path only — click to enable full content indexing' : 'Click to make path-only (skip content indexing)'}
+        >
+          {folder.PathOnly ? 'path only' : 'P'}
+        </button>
+      {/if}
     </div>
 
     <!-- Children (lazy loaded) -->
@@ -232,6 +252,49 @@
   }
   :global(.dark) .folder-name {
     color: #cbd5e1;
+  }
+
+  /* Path-only toggle button */
+  .path-only-btn {
+    flex-shrink: 0;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+    background: transparent;
+    color: #94a3b8;
+    border-color: #cbd5e1;
+    text-transform: uppercase;
+  }
+  .row:hover .path-only-btn {
+    opacity: 1;
+  }
+  .path-only-btn:hover {
+    background: #fef3c7;
+    border-color: #f59e0b;
+    color: #92400e;
+  }
+  .path-only-btn.active {
+    opacity: 1;
+    background: #fef3c7;
+    border-color: #f59e0b;
+    color: #92400e;
+  }
+  :global(.dark) .path-only-btn {
+    color: #64748b;
+    border-color: #334155;
+  }
+  :global(.dark) .path-only-btn:hover,
+  :global(.dark) .path-only-btn.active {
+    background: #451a03;
+    border-color: #d97706;
+    color: #fcd34d;
   }
 
   /* Children container */

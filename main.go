@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -51,6 +52,7 @@ type FolderState struct {
 	Name        string `json:"Name"`
 	Path        string `json:"Path"`
 	Indexed     bool   `json:"Indexed"`
+	PathOnly    bool   `json:"PathOnly"`
 	HasChildren bool   `json:"HasChildren"`
 }
 
@@ -149,6 +151,7 @@ func (a *App) makeFolderState(name, path string) FolderState {
 		Name:        name,
 		Path:        path,
 		Indexed:     !a.config.IsExcluded(path),
+		PathOnly:    a.config.IsPathOnly(path),
 		HasChildren: hasSubdirs(path),
 	}
 }
@@ -281,6 +284,7 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 		return
 	}
 	defer cfg.CleanupTempDir()
+	cfg.IsPathOnly = a.config.IsPathOnly
 
 	var processed int32
 
@@ -641,6 +645,10 @@ type App struct {
 	// External API server
 	apiServer *APIServer
 
+	// sessionID is a random UUID generated once per process lifetime.
+	// Used as the session key in search_feedback telemetry rows.
+	sessionID string
+
 	// WhatsApp
 	waClient  *whatsapp.Client
 	waStore   *whatsapp.Store
@@ -650,9 +658,20 @@ type App struct {
 func NewApp() *App {
 	a := &App{
 		trayStatusCh: make(chan string, 4),
+		sessionID:    newSessionID(),
 	}
 	a.apiServer = newAPIServer(a)
 	return a
+}
+
+// newSessionID generates a random 16-byte hex string used to group feedback
+// events within a single run of the application.
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%x", b)
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -872,8 +891,8 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
-	// Initialise WhatsApp store (message DB). The client itself is lazy — it
-	// only connects when the user calls WAConnect() from the frontend.
+	// Initialise WhatsApp store and client. AutoConnect reconnects any saved
+	// session silently; if there is no session it is a no-op (no QR shown).
 	if waStore, err := whatsapp.OpenStore(cwd); err != nil {
 		log.Printf("[WhatsApp] Failed to open store: %v", err)
 	} else {
@@ -888,6 +907,7 @@ func (a *App) startup(ctx context.Context) {
 				wailsruntime.EventsEmit(a.ctx, "wa_status", status)
 			},
 		)
+		a.waClient.AutoConnect(ctx)
 	}
 
 	log.Println("[Boot 13] Startup sequence complete (Main Thread Released)")
@@ -1060,6 +1080,22 @@ func (a *App) Search(query string) ([]shared.SearchResult, error) {
 	return res, err
 }
 
+// SubmitFeedback records a thumbs-up (+1), thumbs-down (-1), or click (0)
+// event for a search result. Called directly from the Svelte frontend via
+// the Wails IPC bridge.
+//
+//   - query:    the raw search string the user typed
+//   - path:     the file path of the result that was interacted with
+//   - rank:     zero-indexed display position (0 = top result)
+//   - score:    the fusion score shown to the user at that moment
+//   - feedback: +1, 0, or -1
+func (a *App) SubmitFeedback(query, path string, rank int, score float64, feedback int) error {
+	if a.engine == nil || a.engine.Feedback == nil {
+		return fmt.Errorf("engine not ready")
+	}
+	return a.engine.Feedback.Submit(a.sessionID, query, path, rank, score, feedback)
+}
+
 func (a *App) OpenFileNative(path string) error {
 	log.Printf("App.OpenFileNative called with path: %s", path)
 	var cmd string
@@ -1182,6 +1218,37 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 		a.daemon.Start()
 	}()
 
+	return nil
+}
+
+// SetDirPathOnly toggles path-only mode for a directory.
+// Path-only directories are indexed for path/filename search but content
+// extraction and semantic embedding are skipped. This reduces index noise
+// from third-party source distributions and build artifacts.
+func (a *App) SetDirPathOnly(dirPath string, pathOnly bool) error {
+	if a.engine == nil {
+		return fmt.Errorf("backend engine not initialized")
+	}
+	a.config.SetPathOnly(dirPath, pathOnly)
+	if err := a.config.Save(); err != nil {
+		return err
+	}
+	go func() {
+		ctx, cancel := context.WithCancel(a.ctx)
+		defer cancel()
+		if !pathOnly {
+			// Removing path-only: reset content_indexed for this dir so files
+			// become eligible for full content indexing on the next pass.
+			if err := a.engine.ResetContentIndexForDir(dirPath); err != nil {
+				log.Printf("SetDirPathOnly: reset error: %v", err)
+			}
+		}
+		// In both cases run pass1+pass2:
+		// - Enabling: unindexed files get fast-marked (IsPathOnly skips content)
+		// - Disabling: reset files get content-indexed normally
+		a.runPass1(ctx, a.engine, a.getContentDirs(), a.config, false)
+		a.runPass2(ctx, a.engine)
+	}()
 	return nil
 }
 
@@ -1403,9 +1470,21 @@ func (a *App) WALogout() error {
 // WASearchMessages performs a full-text search over indexed WhatsApp messages.
 func (a *App) WASearchMessages(query string) ([]whatsapp.Message, error) {
 	if a.waStore == nil {
+		log.Printf("[WASearch] store is nil — not initialised")
 		return nil, fmt.Errorf("whatsapp store not initialised")
 	}
-	return a.waStore.SearchMessages(query, 30)
+	total, err := a.waStore.MessageCount()
+	log.Printf("[WASearch] query=%q  total_messages_in_db=%d", query, total)
+	if err != nil {
+		log.Printf("[WASearch] MessageCount error: %v", err)
+	}
+	results, err := a.waStore.SearchMessages(query, 30)
+	if err != nil {
+		log.Printf("[WASearch] SearchMessages error: %v", err)
+		return nil, err
+	}
+	log.Printf("[WASearch] found %d results", len(results))
+	return results, nil
 }
 
 // WAGetChats returns all known chats, most-recently-active first.
@@ -1421,7 +1500,21 @@ func (a *App) WAGetChatMessages(chatJID string) ([]whatsapp.Message, error) {
 	if a.waStore == nil {
 		return nil, fmt.Errorf("whatsapp store not initialised")
 	}
-	return a.waStore.GetChatMessages(chatJID, 50)
+	return a.waStore.GetChatMessages(chatJID, 100)
+}
+
+// WAOpenChat opens the given chat in the WhatsApp desktop app via its URI scheme.
+// Individual chats: whatsapp://send?phone=<number>
+// Groups: whatsapp:// (just opens the app; no reliable group deep-link exists)
+func (a *App) WAOpenChat(jid string) {
+	var url string
+	if strings.HasSuffix(jid, "@s.whatsapp.net") {
+		phone := strings.TrimSuffix(jid, "@s.whatsapp.net")
+		url = "whatsapp://send?phone=" + phone
+	} else {
+		url = "whatsapp://"
+	}
+	wailsruntime.BrowserOpenURL(a.ctx, url)
 }
 
 func main() {

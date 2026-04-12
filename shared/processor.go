@@ -242,13 +242,14 @@ func DrainRemaining(chunks chan Metadata, mode string, sc *Engine) {
 
 // ProcessorConfig holds configuration for file processing.
 type ProcessorConfig struct {
-	Splitter *textsplitter.RecursiveCharacter
-	Chunks   chan Metadata
-	Images   chan Metadata
-	Engine   *Engine
-	TempDir  string // temp dir for converted images, cleaned up after indexing
-	Mu       *sync.Mutex
-	Batcher  *VipsBatcher
+	Splitter   *textsplitter.RecursiveCharacter
+	Chunks     chan Metadata
+	Images     chan Metadata
+	Engine     *Engine
+	TempDir    string // temp dir for converted images, cleaned up after indexing
+	Mu         *sync.Mutex
+	Batcher    *VipsBatcher
+	IsPathOnly func(string) bool // if non-nil, skip content/embedding for matching paths
 }
 
 // ProcessImage converts an image to JPEG via vips and queues it for indexing.
@@ -321,6 +322,14 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	mtime := info.ModTime().UnixNano()
 	size := info.Size()
 	ctime, atime := FileExtraTimesFromInfo(info) // no extra syscall
+
+	// Path-only directories: the file is already in paths_fts from Pass 1.
+	// Skip content extraction and embedding — just mark as indexed so it
+	// never re-appears in UnindexedFiles() on future startups.
+	if cfg.IsPathOnly != nil && cfg.IsPathOnly(path) {
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
+		return
+	}
 
 	if IsOfflineFile(info) {
 		// Log to know we're skipping offline/cloud-only files without attempting retrieval.

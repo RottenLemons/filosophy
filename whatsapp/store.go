@@ -6,7 +6,9 @@ package whatsapp
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -44,11 +46,32 @@ type Store struct {
 // OpenStore opens (or creates) the whatsapp SQLite DB at dir/whatsapp.db.
 func OpenStore(dir string) (*Store, error) {
 	path := filepath.Join(dir, "whatsapp.db")
-	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_foreign_keys=on")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("whatsapp store: open: %w", err)
 	}
-	db.SetMaxOpenConns(1) // SQLite — single writer
+	// WAL mode: readers don't block writers and vice versa.
+	// Allow multiple concurrent readers; serialise only on writes via the mutex
+	// in callers (or SQLite's own locking for WAL).
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+
+	// Apply pragmas that modernc.org/sqlite ignores in the DSN.
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA synchronous = NORMAL",   // safe with WAL, much faster than FULL
+		"PRAGMA cache_size = -32000",    // 32 MB page cache
+		"PRAGMA temp_store = MEMORY",    // temp tables in RAM
+		"PRAGMA mmap_size = 268435456",  // 256 MB memory-mapped I/O
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("whatsapp store: %s: %w", p, err)
+		}
+	}
+
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -257,6 +280,10 @@ func (s *Store) SearchMessages(query string, limit int) ([]Message, error) {
 	if limit <= 0 {
 		limit = 20
 	}
+	fts := ftsQuery(query)
+	log.Printf("[WASearch] ftsQuery(%q) = %q", query, fts)
+	// No ORDER BY — FTS5 returns rows in BM25 relevance order by default,
+	// which is what we want and avoids a full sort over all matches.
 	rows, err := s.db.Query(`
 		SELECT m.message_id, m.chat_jid, COALESCE(c.name,''), m.sender, m.sender_name,
 		       m.text, m.timestamp, m.is_group, m.media_type, m.media_name
@@ -264,9 +291,8 @@ func (s *Store) SearchMessages(query string, limit int) ([]Message, error) {
 		JOIN messages m ON m.rowid = f.rowid
 		LEFT JOIN chats c ON c.jid = m.chat_jid
 		WHERE messages_fts MATCH ?
-		ORDER BY m.timestamp DESC
 		LIMIT ?
-	`, ftsQuery(query), limit)
+	`, fts, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -373,11 +399,32 @@ func boolInt(b bool) int {
 	return 0
 }
 
-// ftsQuery wraps a raw query string for FTS5 — each word is prefix-matched.
+// ftsQuery converts a user query into an FTS5 MATCH expression.
+// Each whitespace-separated word becomes an independent prefix term (word*),
+// joined with implicit AND. Special FTS5 characters are stripped so that
+// copy-pasted message text (with punctuation, quotes, etc.) never causes a
+// parse error.
 func ftsQuery(q string) string {
-	// FTS5 MATCH syntax: wrap each token with double-quotes for exact phrase,
-	// or append * for prefix. We do simple prefix matching on the whole phrase.
-	return `"` + q + `"*`
+	// Strip characters that have special meaning in FTS5 query syntax.
+	var b strings.Builder
+	for _, r := range q {
+		switch r {
+		case '"', '\'', '(', ')', '-', '+', '^', '*', ':', '.', ',', '!', '?', ';':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.TrimSpace(b.String())
+	if clean == "" {
+		return `""`
+	}
+	// Build "word1* word2* ..." — FTS5 treats space as AND.
+	parts := strings.Fields(clean)
+	for i, p := range parts {
+		parts[i] = p + "*"
+	}
+	return strings.Join(parts, " ")
 }
 
 func scanMessages(rows *sql.Rows) ([]Message, error) {

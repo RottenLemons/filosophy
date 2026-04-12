@@ -11,6 +11,7 @@ import (
 
 type AppConfig struct {
 	ExcludedPaths   []string `json:"ExcludedPaths"`
+	PathOnlyDirs    []string `json:"PathOnlyDirs,omitempty"`
 	ExtraDirs       []string `json:"ExtraDirs,omitempty"`
 	GPUEnabled      bool     `json:"GPUEnabled"`
 	HasGPU          bool     `json:"HasGPU"`
@@ -25,9 +26,10 @@ type AppConfig struct {
 	MCPEnabled bool   `json:"MCPEnabled"`
 	MCPKey     string `json:"MCPKey"`
 
-	path            string
-	mu              sync.RWMutex
-	normalizedPaths []string `json:"-"`
+	path                  string
+	mu                    sync.RWMutex
+	normalizedPaths       []string `json:"-"`
+	normalizedPathOnlyDirs []string `json:"-"`
 }
 
 
@@ -39,6 +41,14 @@ func (c *AppConfig) rebuildCacheLocked() {
 			v += "/"
 		}
 		c.normalizedPaths[i] = v
+	}
+	c.normalizedPathOnlyDirs = make([]string, len(c.PathOnlyDirs))
+	for i, p := range c.PathOnlyDirs {
+		v := strings.ToLower(filepath.ToSlash(p))
+		if !strings.HasSuffix(v, "/") {
+			v += "/"
+		}
+		c.normalizedPathOnlyDirs[i] = v
 	}
 }
 
@@ -102,7 +112,7 @@ func (c *AppConfig) Save() error {
 func (c *AppConfig) IsExcluded(path string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	lower := strings.ToLower(filepath.ToSlash(path))
 	for _, excl := range c.normalizedPaths {
 		if lower == strings.TrimSuffix(excl, "/") || strings.HasPrefix(lower, excl) {
@@ -110,6 +120,48 @@ func (c *AppConfig) IsExcluded(path string) bool {
 		}
 	}
 	return false
+}
+
+// IsPathOnly returns true if path is under a path-only directory.
+// Files in path-only directories are indexed for path/filename search only —
+// content extraction and semantic embedding are skipped.
+func (c *AppConfig) IsPathOnly(path string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	lower := strings.ToLower(filepath.ToSlash(path))
+	for _, po := range c.normalizedPathOnlyDirs {
+		if lower == strings.TrimSuffix(po, "/") || strings.HasPrefix(lower, po) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetPathOnly adds or removes a directory from the path-only list.
+func (c *AppConfig) SetPathOnly(path string, pathOnly bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	lower := strings.ToLower(path)
+	var newDirs []string
+	found := false
+	for _, p := range c.PathOnlyDirs {
+		if strings.ToLower(p) == lower {
+			found = true
+			if pathOnly {
+				newDirs = append(newDirs, p)
+			}
+			// if !pathOnly, omit it (removes from list)
+		} else {
+			newDirs = append(newDirs, p)
+		}
+	}
+	if pathOnly && !found {
+		newDirs = append(newDirs, path)
+	}
+	c.PathOnlyDirs = newDirs
+	c.rebuildCacheLocked()
 }
 
 func (c *AppConfig) SetExcluded(path string, excluded bool) {

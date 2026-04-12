@@ -6,7 +6,7 @@
   import ImageIcon from "carbon-icons-svelte/lib/Image.svelte";
   import PDFIcon from "carbon-icons-svelte/lib/PDF.svelte";
   import { Settings as SettingsIcon, XCircle, AlertCircle, X, Activity, MessageSquare, MessageCircle } from 'lucide-svelte';
-  import { Search, OpenFileNative, WASearchMessages, WAStatus } from "$lib/wailsjs/go/main/App";
+  import { Search, OpenFileNative, WASearchMessages, WAOpenChat, SubmitFeedback } from "$lib/wailsjs/go/main/App";
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import SettingsModal from '$lib/components/SettingsModal.svelte';
   import Chat from '$lib/components/Chat.svelte';
@@ -15,8 +15,7 @@
   import { indexingStatus } from '../stores/indexer';
 
   let showSettings = false;
-  let showChat = false;
-  let showWhatsApp = false;
+  let activeView: 'search' | 'whatsapp' | 'chat' = 'search';
 
   // ── API confirm dialog ──────────────────────────────────────────────────────
   let apiConfirmRequest: { id: string; query: string } | null = null;
@@ -59,11 +58,23 @@
   let selectedFile: any = null;
   let files: any[] = [];
   let waMessages: any[] = [];
-  let searching = false;
+  let searching = false;       // files still loading
+  let waSearching = false;     // wa still loading
   let searchErrorMsg: string | null = null;
 
   let currentSearchTicket = 0;
   let renderLimit = 50;
+
+  // feedback: maps file.Path → +1 | -1 so a result can't be voted twice per session.
+  let feedbackState = new Map<string, number>();
+
+  function submitFeedback(file: any, rank: number, value: 1 | -1) {
+    if (feedbackState.has(file.Path)) return; // already voted
+    feedbackState = new Map(feedbackState).set(file.Path, value);
+    SubmitFeedback(searchQuery, file.Path, rank, file.Score, value).catch(err => {
+      console.warn('[feedback] submit failed:', err);
+    });
+  }
 
   let previewImageError = false;
 
@@ -166,46 +177,52 @@
 
   let searchTimeout: ReturnType<typeof setTimeout> | undefined = undefined;
 
-  // Ticket-based concurrency and Reset renderLimit
+  // Fire file search and WA search independently so files appear immediately.
   async function performingSearch() {
     if (!searchQuery.trim()) {
       files = [];
       waMessages = [];
       selectedFile = null;
       searching = false;
+      waSearching = false;
       searchErrorMsg = null;
       renderLimit = 50;
       return;
     }
 
+    searching = true;
+    waSearching = true;
+    feedbackState = new Map();
     currentSearchTicket++;
     const localTicket = currentSearchTicket;
 
-    try {
-      const [fileResult, waResult] = await Promise.allSettled([
-        Search(searchQuery),
-        WAStatus().then(s => s === 'connected' ? WASearchMessages(searchQuery) : []),
-      ]);
+    // File search — show results as soon as it completes
+    Search(searchQuery).then(result => {
+      if (localTicket !== currentSearchTicket) return;
+      files = result || [];
+      selectedFile = null;
+      searchErrorMsg = null;
+    }).catch(err => {
+      if (localTicket !== currentSearchTicket) return;
+      console.error('[search] file error:', err);
+      searchErrorMsg = String(err);
+      files = [];
+    }).finally(() => {
+      if (localTicket === currentSearchTicket) searching = false;
+    });
 
-      if (localTicket === currentSearchTicket) {
-        files = fileResult.status === 'fulfilled' ? (fileResult.value || []) : [];
-        waMessages = waResult.status === 'fulfilled' ? (waResult.value || []) : [];
-        selectedFile = null;
-        searchErrorMsg = fileResult.status === 'rejected' ? String((fileResult as PromiseRejectedResult).reason) : null;
-      }
-    } catch (error) {
-      if (localTicket === currentSearchTicket) {
-        console.error("Search failed:", error);
-        searchErrorMsg = String(error);
-        files = [];
-        waMessages = [];
-        selectedFile = null;
-      }
-    } finally {
-      if (localTicket === currentSearchTicket) {
-        searching = false;
-      }
-    }
+    // WA search — appends below whenever it lands (usually slower)
+    WASearchMessages(searchQuery).then(result => {
+      if (localTicket !== currentSearchTicket) return;
+      console.log('[search] wa results:', result?.length ?? 0);
+      waMessages = result || [];
+    }).catch(err => {
+      if (localTicket !== currentSearchTicket) return;
+      console.error('[search] wa error:', err);
+      waMessages = [];
+    }).finally(() => {
+      if (localTicket === currentSearchTicket) waSearching = false;
+    });
   }
 
   function debouncedSearch() {
@@ -215,10 +232,13 @@
         waMessages = [];
         selectedFile = null;
         searching = false;
+        waSearching = false;
         searchErrorMsg = null;
         renderLimit = 50;
         return;
     }
+    searching = true;
+    waSearching = true;
     searchTimeout = setTimeout(performingSearch, 300);
   }
 
@@ -240,6 +260,7 @@
     clearTimeout(searchTimeout);
     currentSearchTicket++; // Invalidate pending search
     searching = false;
+    waSearching = false;
     searchErrorMsg = null;
   }
 
@@ -306,44 +327,83 @@
   }
 </script>
 
-<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
-  <div class="absolute top-6 right-8 flex items-center gap-4 z-[9999]">
-    <button
-      on:click={() => { showWhatsApp = !showWhatsApp; if (showWhatsApp) showChat = false; }}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showWhatsApp ? 'opacity-100 text-green-600 dark:text-green-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Toggle WhatsApp"
-    >
-      <MessageCircle class="w-5 h-5" />
-    </button>
-    <button
-      on:click={() => { showChat = !showChat; if (showChat) showWhatsApp = false; }}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Toggle Chat"
-    >
-      <MessageSquare class="w-5 h-5" />
-    </button>
-    <button
-      on:click={() => showSettings = true}
-      class="p-2 rounded-full transition-all duration-300 hover:opacity-100 opacity-60 text-slate-900 dark:text-gray-100 focus:outline-none group cursor-pointer"
-      style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
-      aria-label="Open Settings"
-    >
-      <SettingsIcon class="w-5 h-5 transition-transform group-hover:rotate-45" />
-    </button>
-    <ThemeToggle />
-  </div>
+<div class="h-screen flex flex-row bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans">
 
   <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
-  
-  <header class="w-full px-12 py-6 z-50 shrink-0">
-    <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
-  </header>
 
-  <!-- Task 3: Desktop layout lg:flex-row -->
-  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
+  <!-- Left icon sidebar -->
+  <nav
+    class="w-14 shrink-0 flex flex-col items-center py-5 gap-1 border-r border-gray-100 dark:border-[#2a2a2a] bg-[#FAF9F6] dark:bg-[#111] z-50"
+    style="--wails-draggable:no-drag; -webkit-app-region:no-drag;"
+  >
+    <!-- Logo -->
+    <div class="mb-3 w-8 h-8 flex items-center justify-center">
+      <span class="text-xl font-serif font-bold text-slate-900 dark:text-gray-100 select-none">F</span>
+    </div>
+
+    <!-- Nav buttons -->
+    <button
+      on:click={() => activeView = 'search'}
+      class="p-2.5 rounded-lg transition-all {activeView === 'search' ? 'bg-slate-900 text-white dark:bg-white dark:text-black' : 'text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
+      aria-label="Search"
+      title="Search"
+    >
+      <SearchIcon size={20} />
+    </button>
+
+    <button
+      on:click={() => activeView = activeView === 'whatsapp' ? 'search' : 'whatsapp'}
+      class="p-2.5 rounded-lg transition-all {activeView === 'whatsapp' ? 'bg-green-600 text-white' : 'text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
+      aria-label="WhatsApp"
+      title="WhatsApp"
+    >
+      <MessageCircle class="w-[18px] h-[18px]" />
+    </button>
+
+    <button
+      on:click={() => activeView = activeView === 'chat' ? 'search' : 'chat'}
+      class="p-2.5 rounded-lg transition-all {activeView === 'chat' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
+      aria-label="Chat"
+      title="Chat"
+    >
+      <MessageSquare class="w-[18px] h-[18px]" />
+    </button>
+
+    <!-- Spacer -->
+    <div class="flex-1" />
+
+    <!-- Bottom: settings + theme -->
+    <ThemeToggle />
+    <button
+      on:click={() => showSettings = true}
+      class="p-2.5 rounded-lg transition-all text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-[#1a1a1a] group"
+      aria-label="Settings"
+      title="Settings"
+    >
+      <SettingsIcon class="w-[18px] h-[18px] transition-transform group-hover:rotate-45" />
+    </button>
+  </nav>
+
+  <!-- Main content -->
+  <main class="flex-1 flex overflow-hidden relative">
     
+  {#if activeView === 'whatsapp'}
+    <div class="flex-1 overflow-hidden" transition:fade={{ duration: 150 }}>
+      <WhatsAppTab />
+    </div>
+
+  {:else if activeView === 'chat'}
+    <div class="flex-1 overflow-hidden" transition:fade={{ duration: 150 }}>
+      <Chat
+        contextFile={selectedFile}
+        fileContent={textContent}
+        on:close={() => activeView = 'search'}
+      />
+    </div>
+
+  {:else}
+    <!-- Search view -->
+    <div class="flex-1 flex overflow-hidden">
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
@@ -458,13 +518,13 @@
         </div>
         
         <div class="space-y-4 pt-4">
-          {#if filteredFiles.length > 0}
+          {#if filteredFiles.length > 0 || waMessages.length > 0}
             <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pb-2 border-b border-gray-100 dark:border-[#2a2a2a]">
-              <span>{filteredFiles.length} Records Found</span>
+              <span>{filteredFiles.length + waMessages.length} Results{waSearching ? ' (messages loading…)' : ''}</span>
               <span>Sorted by relevance</span>
             </div>
           {/if}
-          
+
           {#if searchErrorMsg}
             <div class="p-8 border {searchErrorMsg.includes('backend engine not initialized') ? 'border-amber-400 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20' : 'border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10'} rounded-none flex flex-col items-center gap-4 text-center" transition:fade>
               {#if searchErrorMsg.includes('backend engine not initialized')}
@@ -508,9 +568,8 @@
                 Cancel
               </button>
             </div>
-          {:else if filteredFiles.length > 0}
+          {:else if filteredFiles.length > 0 || waMessages.length > 0}
             <div class="flex flex-col gap-6 relative z-20" role="listbox" aria-label="Search results">
-              <!-- Task 2: renderLimit paging -->
               {#each filteredFiles.slice(0, renderLimit) as file, i (file.Path)}
                 <div 
                   class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset
@@ -543,25 +602,88 @@
                       </div>
                     </div>
                   </div>
-                  <div class="flex flex-col items-end pr-4">
+                  <div class="flex flex-col items-end gap-2 pr-4">
                     <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
-                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
+                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Match</div>
+                    <!-- Feedback buttons: visible on hover or after voting -->
+                    <div
+                      class="flex gap-1 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}"
+                      on:click|stopPropagation
+                    >
+                      <button
+                        title="Relevant result"
+                        disabled={feedbackState.has(file.Path)}
+                        on:click={() => submitFeedback(file, i, 1)}
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'} disabled:cursor-default"
+                        aria-label="Thumbs up"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === 1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/>
+                          <path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                        </svg>
+                      </button>
+                      <button
+                        title="Not relevant"
+                        disabled={feedbackState.has(file.Path)}
+                        on:click={() => submitFeedback(file, i, -1)}
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'} disabled:cursor-default"
+                        aria-label="Thumbs down"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === -1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10z"/>
+                          <path d="M17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+                        </svg>
+                      </button>
+                    </div>
                   </div>
                 </div>
               {/each}
 
               {#if filteredFiles.length > renderLimit}
-                <button 
+                <button
                   on:click={loadMore}
                   class="w-full py-6 border-2 border-dashed border-gray-200 dark:border-[#2a2a2a] text-gray-400 dark:text-gray-500 hover:text-blue-500 hover:border-blue-500 dark:hover:text-blue-400 dark:hover:border-blue-400 font-bold uppercase tracking-widest text-[10px] transition-all"
                 >
                   Load More Results ({filteredFiles.length - renderLimit} Remaining)
                 </button>
               {/if}
+
+              <!-- WA results inline -->
+              {#each waMessages as msg (msg.messageId)}
+                <div
+                  class="group relative flex items-start justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 border-green-400 dark:border-green-700 shadow-sm hover:shadow hover:bg-white dark:hover:bg-[#1a1a1a]"
+                  style="animation: slideFadeIn 0.3s ease-out forwards; opacity: 0; transform: translateY(10px);"
+                  on:click={() => WAOpenChat(msg.chatJid)}
+                >
+                  <div class="flex gap-6 items-start">
+                    <div class="w-12 h-12 shrink-0 flex items-center justify-center bg-green-50 dark:bg-green-950/30 text-green-600 dark:text-green-400">
+                      <MessageCircle size={24} />
+                    </div>
+                    <div class="space-y-1.5 mt-0.5">
+                      <h3 class="text-xl font-serif font-bold text-slate-800 dark:text-gray-100 leading-tight">{msg.chatName || msg.chatJid}</h3>
+                      <p class="text-sm font-serif text-slate-600 dark:text-gray-300 leading-relaxed line-clamp-2">{msg.text}</p>
+                      <div class="flex gap-4 pt-1">
+                        <span class="text-[10px] font-bold uppercase tracking-widest text-green-600 dark:text-green-400">WhatsApp</span>
+                        {#if msg.senderName}<span class="text-[10px] text-gray-400 dark:text-gray-500">{msg.senderName}</span>{/if}
+                        {#if msg.isGroup}<span class="text-[10px] text-gray-400 dark:text-gray-500">Group</span>{/if}
+                        <span class="text-[10px] text-gray-400 dark:text-gray-500">{formatDate(msg.timestamp)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+
+              <!-- WA loading indicator -->
+              {#if waSearching}
+                <div class="flex items-center gap-2 p-4 text-[10px] text-gray-400 dark:text-gray-500" transition:fade>
+                  <svg class="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-dasharray="31 11"/></svg>
+                  Searching messages…
+                </div>
+              {/if}
             </div>
-          {:else if searchQuery.trim() !== '' && waMessages.length === 0}
+          {:else if searchQuery.trim() !== '' && !searching && !waSearching}
              <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">
-               No relevant documents found.
+               No results found.
                {#if isFilterActive}
                  <div class="mt-2 text-xs not-italic font-sans font-semibold text-blue-500 dark:text-blue-400 uppercase tracking-widest">
                    Try clearing your active filters.
@@ -571,73 +693,11 @@
           {/if}
         </div>
 
-        <!-- WhatsApp message results -->
-        {#if waMessages.length > 0}
-          <div class="space-y-4 pt-2 border-t border-gray-100 dark:border-[#2a2a2a]" transition:fade>
-            <div class="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 pt-4 pb-2 border-b border-gray-100 dark:border-[#2a2a2a]">
-              <span class="flex items-center gap-2">
-                <MessageCircle size={12} class="text-green-500" />
-                {waMessages.length} WhatsApp Message{waMessages.length !== 1 ? 's' : ''}
-              </span>
-            </div>
-            <div class="flex flex-col gap-4">
-              {#each waMessages as msg (msg.messageId)}
-                <div class="group p-5 bg-white dark:bg-transparent border border-gray-100 dark:border-[#2a2a2a] hover:border-green-200 dark:hover:border-green-900/40 transition-colors">
-                  <div class="flex items-start justify-between gap-4 mb-2">
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-[10px] font-bold uppercase tracking-widest text-green-600 dark:text-green-400">
-                        {msg.chatName || msg.chatJid}
-                      </span>
-                      {#if msg.isGroup}
-                        <span class="px-1.5 py-0.5 bg-gray-100 dark:bg-[#1a1a1a] text-[9px] font-bold uppercase tracking-widest text-gray-500">Group</span>
-                      {/if}
-                    </div>
-                    <span class="text-[10px] text-gray-400 dark:text-gray-500 shrink-0">{formatDate(msg.timestamp)}</span>
-                  </div>
-                  <p class="text-[11px] font-semibold text-gray-500 dark:text-gray-400 mb-1">{msg.senderName || msg.sender}</p>
-                  <p class="text-sm font-serif text-slate-700 dark:text-gray-200 leading-relaxed">{msg.text}</p>
-                  {#if msg.mediaType}
-                    <span class="mt-2 inline-flex items-center gap-1 px-2 py-0.5 bg-gray-100 dark:bg-[#1a1a1a] text-[9px] font-bold uppercase tracking-widest text-gray-500">
-                      {msg.mediaType}{msg.mediaName ? ' · ' + msg.mediaName : ''}
-                    </span>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
       </div>
     </div>
 
-    <!-- Chat panel -->
-    {#if showChat}
-      <Chat
-        contextFile={selectedFile}
-        fileContent={textContent}
-        on:close={() => showChat = false}
-      />
-    {/if}
-
-    <!-- WhatsApp panel -->
-    {#if showWhatsApp && !showChat}
-      <aside
-        transition:slide={{ axis: 'x', duration: 300 }}
-        class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[320px] lg:min-w-[280px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
-      >
-        <button
-          class="absolute top-3 right-3 p-1.5 text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 transition-colors rounded-full z-10"
-          on:click={() => showWhatsApp = false}
-          aria-label="Close WhatsApp"
-        >
-          <X class="w-4 h-4" />
-        </button>
-        <WhatsAppTab />
-      </aside>
-    {/if}
-
-    <!-- File preview — hidden when chat or whatsapp is open -->
-    {#if selectedFile && !showChat && !showWhatsApp}
+    <!-- File preview -->
+    {#if selectedFile}
       <aside
         transition:slide={{ axis: 'x', duration: 400 }}
         class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
@@ -718,7 +778,9 @@
         </div>
       </aside>
     {/if}
-    
+    </div> <!-- end search view inner flex -->
+  {/if}
+
   </main>
   
   <!-- Task 3: The "Engine Ready" Status (Curator Style) -->

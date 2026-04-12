@@ -114,6 +114,10 @@ type Engine struct {
 	initTableOnce     sync.Once                   // ensures InitIndexTables runs at most once per Engine
 	writeChan         chan WriteOperation
 	writerWg          sync.WaitGroup
+
+	// Ranking infrastructure — initialised after InitIndexTables succeeds.
+	Weights  *WeightStore   // hot-reloaded ranking weights from search_config
+	Feedback *FeedbackStore // telemetry write path for thumbs up/down
 }
 
 type WriteOpType int
@@ -565,6 +569,13 @@ func (s *Engine) Flush() error {
 
 
 // Close shuts down the Engine, releasing all resources.
+// GetSQLDB returns the underlying *sql.DB for the main filosophy.db connection.
+// Used by the REST API layer to write directly to search_config without going
+// through the Engine's write-serialisation channel.
+func (s *Engine) GetSQLDB() *sql.DB {
+	return s.sqlDB
+}
+
 func (s *Engine) Close() error {
 	if s.writeChan != nil {
 		close(s.writeChan)
@@ -1157,6 +1168,56 @@ func (s *Engine) InitIndexTables() error {
 	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0")
 	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN atime INTEGER NOT NULL DEFAULT 0")
 
+	// search_config: key/value store for tunable ranking weights.
+	// All weights are loaded at startup and hot-reloaded every 30s.
+	if _, err := s.sqlDB.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS search_config (
+			key   TEXT PRIMARY KEY,
+			value REAL NOT NULL
+		);
+	`); err != nil {
+		return fmt.Errorf("failed to create search_config table: %w", err)
+	}
+
+	// Insert defaults — INSERT OR IGNORE so existing tuned values are never overwritten.
+	defaultConfigs := [][2]any{
+		{"w_path_fts", 3.0},       // RRF weight for path FTS exact/all-word signals
+		{"w_path_prefix", 1.5},    // RRF weight for path FTS prefix signals
+		{"w_semantic_text", 1.0},  // RRF weight for text vector signal
+		{"w_semantic_image", 1.1}, // RRF weight for image vector signal
+		{"w_content_fts", 1.0},    // RRF weight for content FTS signal
+		{"w_filename", 1.0},       // Multiplier applied to filename/fuzzy boosts
+		{"w_recency", 0.3},        // Additive recency score weight
+		{"recency_half_life", 30.0}, // Days for recency score to decay to 37%
+		{"rrf_k", 60.0},           // RRF smoothing constant
+		{"min_score", 0.15},       // Minimum score threshold (used by REST API)
+		{"rerank_top_n", 20.0},    // How many results to pass to cross-encoder reranker
+		{"path_only_cap", 0.12},   // Score cap for path-only results (no content signal)
+		{"use_new_pipeline", 0.0}, // Feature flag: 0=old pipeline, 1=new weighted pipeline
+	}
+	for _, kv := range defaultConfigs {
+		s.sqlDB.ExecContext(ctx, `INSERT OR IGNORE INTO search_config(key, value) VALUES (?, ?)`, kv[0], kv[1])
+	}
+
+	// search_feedback: telemetry for ranking weight adjustment.
+	// feedback: +1 = thumbs up, -1 = thumbs down, 0 = click-through.
+	if _, err := s.sqlDB.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS search_feedback (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id   TEXT    NOT NULL,
+			query        TEXT    NOT NULL,
+			result_path  TEXT    NOT NULL,
+			result_rank  INTEGER NOT NULL,
+			result_score REAL    NOT NULL,
+			feedback     INTEGER NOT NULL,
+			created_at   INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_feedback_query ON search_feedback(query);
+		CREATE INDEX IF NOT EXISTS idx_feedback_path  ON search_feedback(result_path);
+	`); err != nil {
+		return fmt.Errorf("failed to create search_feedback table: %w", err)
+	}
+
 
 	var exists int
 	s.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paths_fts'").Scan(&exists)
@@ -1191,6 +1252,18 @@ func (s *Engine) InitIndexTables() error {
 			return err
 		}
 	}
+
+	// Initialise ranking infrastructure now that tables exist.
+	if s.Weights == nil {
+		s.Weights = NewWeightStore(s.sqlDB)
+	}
+	if s.Feedback == nil {
+		s.Feedback = NewFeedbackStore(s.sqlDB)
+	}
+
+	// Probe atime availability in the background so it doesn't delay startup.
+	go CheckAtimeEnabled(s.sqlDB)
+
 	return nil
 }
 
@@ -1305,6 +1378,25 @@ func (s *Engine) ResetContentIndex() error {
 	return nil
 }
 
+// ResetContentIndexForDir resets the content_indexed flag for all files under
+// a given directory prefix. Used when removing a path-only restriction so that
+// files in that directory become eligible for content indexing on the next pass.
+func (s *Engine) ResetContentIndexForDir(dirPath string) error {
+	// Normalize to forward slashes with trailing separator so the LIKE
+	// pattern matches only files actually inside this directory.
+	normalized := filepath.ToSlash(dirPath)
+	if !strings.HasSuffix(normalized, "/") {
+		normalized += "/"
+	}
+	prefix := normalized + "%"
+	_, err := s.sqlDB.Exec(
+		`UPDATE files SET content_indexed=0, hash=0 WHERE path LIKE ? OR path LIKE ?`,
+		filepath.FromSlash(prefix),
+		prefix,
+	)
+	return err
+}
+
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
@@ -1364,21 +1456,40 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		log.Printf("image search error: %v", err)
 	}
 
+	// Load ranking weights. Falls back to hardcoded defaults if WeightStore is nil
+	// (e.g., during unit tests before InitIndexTables has run).
+	var w SearchWeights
+	if s.Weights != nil {
+		w = s.Weights.Get()
+	} else {
+		w = defaultWeights
+	}
+
 	// Phase 1: run independent scoring signals in parallel, each writing to its own map.
 	// Path FTS, content FTS, and vector results have no inter-dependencies.
 	const numSigGroups = 3
 	sigCh := make(chan map[string]float64, numSigGroups)
 	var sigWg sync.WaitGroup
 
-	// Group A: path FTS signals (4 queries on paths_fts)
+	// Group A: path FTS signals (4 queries on paths_fts).
+	// When the new pipeline is active, path weights come from search_config.
+	// The old pipeline uses the original hardcoded literals so behaviour is
+	// 100% identical when the flag is off.
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
-		s.addPathFTSScores(ctx, query, m, 3.0)
-		s.addPathFTSAllWords(ctx, query, m, 4.0)
-		s.addPathFTSPrefixScores(ctx, query, m, 1.5)
-		s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
+		if w.UseNewPipeline {
+			s.addPathFTSScores(ctx, query, m, w.WPathFTS)
+			s.addPathFTSAllWords(ctx, query, m, w.WPathFTS*4.0/3.0) // all-word gets 33% more than exact
+			s.addPathFTSPrefixScores(ctx, query, m, w.WPathPrefix)
+			s.addPathFTSShortPrefixScores(ctx, query, m, w.WPathPrefix*2.0/3.0)
+		} else {
+			s.addPathFTSScores(ctx, query, m, 3.0)
+			s.addPathFTSAllWords(ctx, query, m, 4.0)
+			s.addPathFTSPrefixScores(ctx, query, m, 1.5)
+			s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
+		}
 		sigCh <- m
 	}()
 
@@ -1394,6 +1505,12 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		if len(m) < 5 {
 			s.addContentFTSFuzzyRRF(ctx, query, m)
 		}
+		// Scale content FTS signal by w_content_fts when new pipeline is active.
+		if w.UseNewPipeline && w.WContentFTS != 1.0 {
+			for p, v := range m {
+				m[p] = v * w.WContentFTS
+			}
+		}
 		contentMu.Lock()
 		for p, v := range m {
 			contentScores[p] += v
@@ -1402,16 +1519,26 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		sigCh <- m
 	}()
 
-	// Group C: vector result iteration (in-memory, no I/O)
+	// Group C: vector result iteration (in-memory, no I/O).
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
+		k := rrfK
+		if w.UseNewPipeline {
+			k = w.RRFK
+		}
+		wText := 1.0
+		wImg := 1.0
+		if w.UseNewPipeline {
+			wText = w.WSemanticText
+			wImg = w.WSemanticImg
+		}
 		for i, res := range textResults {
-			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+			m[res.Metadata["path"]] += wText / (k + float64(i+1))
 		}
 		for i, res := range imageResults {
-			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+			m[res.Metadata["path"]] += wImg / (k + float64(i+1))
 		}
 		contentMu.Lock()
 		for p, v := range m {
@@ -1431,26 +1558,58 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 
 	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
-	addFilenameBoosts(query, scores)
-	addFuzzyPathBoosts(query, scores)
+	// In the new pipeline the filename multiplier comes from search_config.
+	if w.UseNewPipeline && w.WFilename != 1.0 {
+		// Capture pre-boost scores to compute the delta, then scale the delta.
+		pre := make(map[string]float64, len(scores))
+		for p, v := range scores {
+			pre[p] = v
+		}
+		addFilenameBoosts(query, scores)
+		addFuzzyPathBoosts(query, scores)
+		for p, post := range scores {
+			delta := post - pre[p]
+			scores[p] = pre[p] + delta*w.WFilename
+		}
+	} else {
+		addFilenameBoosts(query, scores)
+		addFuzzyPathBoosts(query, scores)
+	}
 
-	// Idea 2: cap path-only results. Any path with zero content signal (no vector
-	// hit, no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
-	// Cap these at pathOnlyScoreCap so they can never beat a real content match.
-	const pathOnlyScoreCap = 0.12
+	// Cap path-only results. Any path with zero content signal (no vector hit,
+	// no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
+	// Cap these so they can never beat a real content match.
+	pathOnlyScoreCap := 0.12
+	if w.UseNewPipeline {
+		pathOnlyScoreCap = w.PathOnlyCap
+	}
 	for path, score := range scores {
 		if _, hasContent := contentScores[path]; !hasContent && score > pathOnlyScoreCap {
 			scores[path] = pathOnlyScoreCap
 		}
 	}
 
-	// Idea 3: penalize binary/system files that have no business appearing in
+	// Penalize binary/system files that have no business appearing in
 	// document searches. Apply a multiplier based on extension and path prefix.
 	applyNoisePenalties(scores)
 
 	// Batch-fetch size/mtime from the files table — replaces per-result os.Stat.
 	results := s.buildResultsFromScores(ctx, scores)
 	sortResults(results)
+
+	// New pipeline: apply recency boost after sort so the score change doesn't
+	// affect sort order — recency adjusts absolute scores for the telemetry log
+	// but we re-sort once afterwards.
+	if w.UseNewPipeline && w.WRecency > 0 {
+		ApplyRecencyBoost(results, w.WRecency, w.RecencyHalf)
+		sortResults(results)
+	}
+
+	rerankN := rerankerTopN
+	if w.UseNewPipeline && w.RerankTopN > 0 {
+		rerankN = w.RerankTopN
+	}
+	_ = rerankN // rerank() uses its own internal top-N; expose via weights in a future pass
 	results = s.rerank(query, results)
 	results = s.applyFilters(results, pq)
 	return results, nil
