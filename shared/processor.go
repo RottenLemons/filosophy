@@ -249,6 +249,7 @@ type ProcessorConfig struct {
 	TempDir  string // temp dir for converted images, cleaned up after indexing
 	Mu       *sync.Mutex
 	Batcher  *VipsBatcher
+	Hardware HardwareConfig
 }
 
 // ProcessImage converts an image to JPEG via vips and queues it for indexing.
@@ -356,7 +357,7 @@ func ProcessDirectory(path string, cfg *ProcessorConfig) {
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
 // InitIndexTables is called at most once per Engine instance via sync.Once (IX-4 fix).
-func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*ProcessorConfig, error) {
+func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine, hw HardwareConfig) (*ProcessorConfig, error) {
 	if sc == nil {
 		return nil, fmt.Errorf("cannot create processor config: engine is nil")
 	}
@@ -380,6 +381,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*Process
 		Engine:   sc,
 		TempDir:  tmpDir,
 		Mu:       &sync.Mutex{},
+		Hardware: hw,
 	}
 	cfg.Batcher = NewVipsBatcher(cfg, imageCap)
 	return cfg, nil

@@ -42,8 +42,6 @@ cd filosophy
 pip install -r requirements.txt
 ```
 
-> **Note**: If you need GPU acceleration for PyTorch, visit [pytorch.org](https://pytorch.org/get-started/locally/) to install a CUDA‑enabled version.
-
 ### 3. Install Node dependencies
 
 ```bash

@@ -114,6 +114,8 @@ type Engine struct {
 	initTableOnce     sync.Once                   // ensures InitIndexTables runs at most once per Engine
 	writeChan         chan WriteOperation
 	writerWg          sync.WaitGroup
+	gpuMutex          sync.Mutex // surgically wraps session.Run for DirectML stability
+	Hardware          HardwareConfig
 }
 
 type WriteOpType int
@@ -148,7 +150,7 @@ type WriteOperation struct {
 
 // New initializes the Engine with the given database path and ONNX model paths.
 // textModelPath and imageModelPath should point to directories containing the ONNX model files.
-func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
+func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engine, error) {
 	dir := filepath.Dir(dbPath)
 	base := filepath.Base(dbPath)
 	vectorsBase := "vectors.db"
@@ -231,9 +233,9 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	// Initialize ONNX Runtime
 	ortPath := findOnnxRuntime()
 	ort.SetSharedLibraryPath(ortPath)
-	useGPU := hasCUDAProvider() && cudaRuntimeReady()
+	useGPU := hasDirectMLProvider()
 	if useGPU {
-		log.Printf("CUDA runtime verified — GPU acceleration enabled")
+		log.Printf("DirectML runtime verified — GPU acceleration enabled")
 	}
 	log.Println("[Engine 4] Initializing ONNX Runtime environment...")
 	if err := ort.InitializeEnvironment(); err != nil {
@@ -276,10 +278,15 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 	defer opts.Destroy()
 
+	if hw.DirectMLKneecap {
+		opts.SetMemPattern(false)
+		opts.SetCpuMemArena(false)
+	}
+
 	// We are synchronizing inference with Engine.mu.Lock() inside IndexText/IndexImage,
 	// so it's safe to let ONNX use its default multi-threading across all cores.
-	if useGPU && tryAppendCUDA(opts) {
-		log.Printf("CLIP text session: CUDA GPU enabled")
+	if useGPU && tryAppendDirectML(opts) {
+		log.Printf("CLIP text session: DirectML GPU enabled")
 	}
 
 	// Create ONNX sessions for CLIP only (text uses the static embedder).
@@ -309,10 +316,15 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 	defer visionOpts.Destroy()
 
+	if hw.DirectMLKneecap {
+		visionOpts.SetMemPattern(false)
+		visionOpts.SetCpuMemArena(false)
+	}
+
 	// Vision models are large, allow ONNX to use its default multi-threading
 	// because Go is NOT actually processing them concurrently (IndexBatch is guarded by a Mutex).
-	if useGPU && tryAppendCUDA(visionOpts) {
-		log.Printf("CLIP vision session: CUDA GPU enabled")
+	if useGPU && tryAppendDirectML(visionOpts) {
+		log.Printf("CLIP vision session: DirectML GPU enabled")
 	}
 
 	log.Println("[Engine 8] Initializing CLIP vision session...")
@@ -374,8 +386,12 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 				log.Printf("reranker session opts warning (reranking disabled): %v", err)
 			} else {
 				defer ropts.Destroy()
-				if useGPU && tryAppendCUDA(ropts) {
-					log.Printf("reranker session: CUDA GPU enabled")
+				if hw.DirectMLKneecap {
+					ropts.SetMemPattern(false)
+					ropts.SetCpuMemArena(false)
+				}
+				if useGPU && tryAppendDirectML(ropts) {
+					log.Printf("reranker session: DirectML GPU enabled")
 				}
 				rsess, err := ort.NewDynamicAdvancedSession(
 					rerankerOnnx,
@@ -409,6 +425,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		textCollectionID:  textCol.ID,
 		imageCollectionID: imageCol.ID,
 		writeChan:         make(chan WriteOperation, 10000),
+		Hardware:          hw,
 	}
 	go engine.runWriter()
 	return engine, nil
@@ -776,13 +793,17 @@ func (s *Engine) embedClipText(texts []string) ([][]float32, error) {
 			return nil, fmt.Errorf("clip text batch output tensor: %w", err)
 		}
 
-		if err := s.clipTextSession.Run(
+		s.gpuMutex.Lock()
+		runErr := s.clipTextSession.Run(
 			[]ort.Value{inputIDs},
 			[]ort.Value{outTensor},
-		); err != nil {
+		)
+		s.gpuMutex.Unlock()
+
+		if runErr != nil {
 			outTensor.Destroy()
 			inputIDs.Destroy()
-			return nil, fmt.Errorf("clip text batch inference failed: %w", err)
+			return nil, fmt.Errorf("clip text batch inference failed: %w", runErr)
 		}
 
 		data := outTensor.GetData()
@@ -855,13 +876,17 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 			return nil, fmt.Errorf("vision batch output tensor error: %w", err)
 		}
 
-		if err := s.clipVisionSession.Run(
+		s.gpuMutex.Lock()
+		runErr := s.clipVisionSession.Run(
 			[]ort.Value{inputTensor},
 			[]ort.Value{outTensor},
-		); err != nil {
+		)
+		s.gpuMutex.Unlock()
+
+		if runErr != nil {
 			outTensor.Destroy()
 			inputTensor.Destroy()
-			return nil, fmt.Errorf("vision batch inference failed: %w", err)
+			return nil, fmt.Errorf("vision batch inference failed: %w", runErr)
 		}
 
 		data := outTensor.GetData()
@@ -2500,10 +2525,12 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 				rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
 			}
 		} else {
+			s.gpuMutex.Lock()
 			runErr := s.rerankerSession.Run(
 				[]ort.Value{tIDs, tMask},
 				[]ort.Value{tOut},
 			)
+			s.gpuMutex.Unlock()
 			logits := tOut.GetData() // []float32 of length nPairs
 			tIDs.Destroy()
 			tMask.Destroy()
@@ -2656,10 +2683,10 @@ func findOnnxRuntime() string {
 	return dllName
 }
 
-// hasCUDAProvider returns true if onnxruntime_providers_cuda.dll is present
-// alongside the main ONNX Runtime DLL, indicating GPU inference may be available.
-func hasCUDAProvider() bool {
-	const dllName = "onnxruntime_providers_cuda.dll"
+// hasDirectMLProvider returns true if DirectML.dll is present, indicating 
+// that GPU acceleration is likely available on this Windows machine.
+func hasDirectMLProvider() bool {
+	const dllName = "DirectML.dll"
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), dllName)
 		if _, err := os.Stat(p); err == nil {
@@ -2675,32 +2702,12 @@ func hasCUDAProvider() bool {
 	return false
 }
 
-// cudaRuntimeReady probes whether the CUDA 13 runtime DLLs are actually
-// loadable. ORT's CUDA EP requires cublasLt64_13.dll; if it is absent the
-// provider DLL fails to load and ORT prints an internal error for every
-// session. We check once here so we can skip the EP entirely when CUDA is
-// installed but the runtime is not.
-func cudaRuntimeReady() bool {
-	dll, err := syscall.LoadDLL("cublasLt64_13.dll")
-	if err != nil {
-		log.Printf("CUDA runtime not available (cublasLt64_13.dll missing) — using CPU. Install CUDA 13 to enable GPU.")
-		return false
-	}
-	dll.Release()
-	return true
-}
-
-// tryAppendCUDA attempts to register the CUDA execution provider on opts.
+// tryAppendDirectML attempts to register the DirectML execution provider on opts.
 // Returns true on success; on any error it logs and leaves opts unchanged (CPU fallback).
-func tryAppendCUDA(opts *ort.SessionOptions) bool {
-	cudaOpts, err := ort.NewCUDAProviderOptions()
-	if err != nil {
-		log.Printf("CUDA provider options unavailable: %v", err)
-		return false
-	}
-	defer cudaOpts.Destroy()
-	if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
-		log.Printf("CUDA EP append failed (falling back to CPU): %v", err)
+func tryAppendDirectML(opts *ort.SessionOptions) bool {
+	// Use Device 0 (primary GPU)
+	if err := opts.AppendExecutionProviderDirectML(0); err != nil {
+		log.Printf("DirectML EP append failed (falling back to CPU): %v", err)
 		return false
 	}
 	return true
