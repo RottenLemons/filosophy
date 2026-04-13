@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -321,7 +323,7 @@ func (d *Daemon) flush() {
 
 	// 3. Index new/modified files via shared processor
 	if len(addPaths) > 0 {
-		cfg, err := shared.NewProcessorConfig(8096, 1000, 200, d.sc)
+		cfg, err := shared.NewProcessorConfig(8096, 1000, 200, d.sc, d.sc.Hardware)
 		if err != nil {
 			log.Println("[FLUSH] NewProcessorConfig error:", err)
 			return
@@ -344,6 +346,13 @@ func (d *Daemon) flush() {
 		shared.DrainRemaining(cfg.Chunks, "text", d.sc)
 		shared.DrainRemaining(cfg.Images, "image", d.sc)
 		cfg.CleanupTempDir()
+
+		// Release memory back to Windows only if the batch was significant.
+		// Uses the hardware-adaptive GCInterval.
+		if len(addPaths) >= d.sc.Hardware.GCInterval/5 || len(addPaths) > 10 {
+			runtime.GC()
+			debug.FreeOSMemory()
+		}
 	}
 }
 

@@ -11,6 +11,20 @@ import (
 	"time"
 )
 
+// vipsSemaphore restricts total concurrent vipsthumbnail.exe processes.
+var vipsSemaphore chan struct{}
+var vipsOnce sync.Once
+
+// InitVipsSemaphore initializes the global VIPS concurrency limit.
+func InitVipsSemaphore(cap int) {
+	vipsOnce.Do(func() {
+		if cap < 1 {
+			cap = 1
+		}
+		vipsSemaphore = make(chan struct{}, cap)
+	})
+}
+
 // ImageJob holds all metadata required for a single image thumbnail job.
 type ImageJob struct {
 	Path  string
@@ -117,7 +131,13 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 		return
 	}
 
-	args := make([]string, 0, len(jobs)+4)
+	args := make([]string, 0, len(jobs)+10)
+	
+	// Inject dynamic resource flags based on hardware profile.
+	args = append(args, fmt.Sprintf("--vips-concurrency=%d", v.cfg.Hardware.VIPSThreads))
+	args = append(args, fmt.Sprintf("--vips-cache-max=%d", v.cfg.Hardware.VIPSCache))
+	args = append(args, fmt.Sprintf("--vips-cache-max-memory=%d", v.cfg.Hardware.VIPSCache))
+
 	for _, j := range jobs {
 		args = append(args, j.Path)
 	}
@@ -129,6 +149,10 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 	args = append(args, "-o", outFmt+"[Q=80,strip]")
 
 	cmd := exec.Command(vipsThumbnailPath(), args...)
+	
+	// Use semaphore to restrict concurrency of external VIPS calls.
+	vipsSemaphore <- struct{}{}
+	defer func() { <-vipsSemaphore }()
 	
 	// We don't necessarily care about individual errors stopping the whole batch
 	if output, err := cmd.CombinedOutput(); err != nil {

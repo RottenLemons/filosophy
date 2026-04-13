@@ -35,7 +35,6 @@ import (
 
 	"github.com/daulet/tokenizers"
 	"github.com/liliang-cn/sqvect/v2/pkg/core"
-	"github.com/liliang-cn/sqvect/v2/pkg/sqvect"
 	ort "github.com/yalue/onnxruntime_go"
 	_ "golang.org/x/image/webp"
 	_ "modernc.org/sqlite"
@@ -100,7 +99,7 @@ var (
 
 // Engine holds the models and database connection for embedding operations.
 type Engine struct {
-	db                *sqvect.DB
+	db                *core.SQLiteStore
 	sqlDB             *sql.DB // separate connection for the files table
 	staticEmb         *StaticEmbedder
 	clipTok           *tokenizers.Tokenizer
@@ -118,6 +117,9 @@ type Engine struct {
 	// Ranking infrastructure — initialised after InitIndexTables succeeds.
 	Weights  *WeightStore   // hot-reloaded ranking weights from search_config
 	Feedback *FeedbackStore // telemetry write path for thumbs up/down
+
+	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
+	Hardware HardwareConfig
 }
 
 type WriteOpType int
@@ -152,7 +154,7 @@ type WriteOperation struct {
 
 // New initializes the Engine with the given database path and ONNX model paths.
 // textModelPath and imageModelPath should point to directories containing the ONNX model files.
-func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
+func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engine, error) {
 	dir := filepath.Dir(dbPath)
 	base := filepath.Base(dbPath)
 	vectorsBase := "vectors.db"
@@ -208,36 +210,49 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 
 	log.Println("[Engine 2] Opening sqvect database at", vectorsDBPath)
-	cfg := sqvect.Config{
+	hnswCfg := core.DefaultHNSWConfig()
+	hnswCfg.Enabled = true
+	cfg := core.Config{
 		Path:         vectorsDBPath,
-		Dimensions:   0, // auto-detect
+		VectorDim:    textEmbedDim,
 		SimilarityFn: core.CosineSimilarity,
+		AutoDimAdapt: core.SmartAdapt,
 		IndexType:    core.IndexTypeHNSW,
+		HNSW:         hnswCfg,
+		Quantization: core.QuantizationConfig{
+			Enabled: true,
+			Type:    "scalar", // SQ8: uint8 min-max scalar quantization
+			NBits:   8,
+		},
 	}
-	db, err := sqvect.Open(cfg)
+	db, err := core.NewWithConfig(cfg)
 	if err != nil {
 		sqlDB.Close()
 		vDB.Close()
-		return nil, fmt.Errorf("failed to open sqvect database: %w", err)
+		return nil, fmt.Errorf("failed to create vector store: %w", err)
 	}
-
 	ctx := context.Background()
+	if err := db.Init(ctx); err != nil {
+		sqlDB.Close()
+		vDB.Close()
+		return nil, fmt.Errorf("failed to initialize vector store: %w", err)
+	}
 
 	// Create collections for text and image embeddings
 	log.Println("[Engine 3] Ensuring vector collections exist...")
-	if _, err := db.Vector().CreateCollection(ctx, textCollection, textEmbedDim); err != nil {
+	if _, err := db.CreateCollection(ctx, textCollection, textEmbedDim); err != nil {
 		log.Printf("text collection: %v", err)
 	}
-	if _, err := db.Vector().CreateCollection(ctx, imageCollection, imageEmbedDim); err != nil {
+	if _, err := db.CreateCollection(ctx, imageCollection, imageEmbedDim); err != nil {
 		log.Printf("image collection: %v", err)
 	}
 
 	// Initialize ONNX Runtime
 	ortPath := findOnnxRuntime()
 	ort.SetSharedLibraryPath(ortPath)
-	useGPU := hasCUDAProvider() && cudaRuntimeReady()
+	useGPU := hasDirectMLProvider()
 	if useGPU {
-		log.Printf("CUDA runtime verified — GPU acceleration enabled")
+		log.Printf("DirectML runtime verified — GPU acceleration enabled")
 	}
 	log.Println("[Engine 4] Initializing ONNX Runtime environment...")
 	if err := ort.InitializeEnvironment(); err != nil {
@@ -280,10 +295,15 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 	defer opts.Destroy()
 
+	if hw.DirectMLKneecap {
+		opts.SetMemPattern(false)
+		opts.SetCpuMemArena(false)
+	}
+
 	// We are synchronizing inference with Engine.mu.Lock() inside IndexText/IndexImage,
 	// so it's safe to let ONNX use its default multi-threading across all cores.
-	if useGPU && tryAppendCUDA(opts) {
-		log.Printf("CLIP text session: CUDA GPU enabled")
+	if useGPU && tryAppendDirectML(opts) {
+		log.Printf("CLIP text session: DirectML GPU enabled")
 	}
 
 	// Create ONNX sessions for CLIP only (text uses the static embedder).
@@ -313,10 +333,15 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 	}
 	defer visionOpts.Destroy()
 
+	if hw.DirectMLKneecap {
+		visionOpts.SetMemPattern(false)
+		visionOpts.SetCpuMemArena(false)
+	}
+
 	// Vision models are large, allow ONNX to use its default multi-threading
 	// because Go is NOT actually processing them concurrently (IndexBatch is guarded by a Mutex).
-	if useGPU && tryAppendCUDA(visionOpts) {
-		log.Printf("CLIP vision session: CUDA GPU enabled")
+	if useGPU && tryAppendDirectML(visionOpts) {
+		log.Printf("CLIP vision session: DirectML GPU enabled")
 	}
 
 	log.Println("[Engine 8] Initializing CLIP vision session...")
@@ -337,7 +362,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 
 	// Cache collection IDs to avoid per-row SQL lookups in UpsertBatch
 	ctx2 := context.Background()
-	textCol, err := db.Vector().GetCollection(ctx2, textCollection)
+	textCol, err := db.GetCollection(ctx2, textCollection)
 	if err != nil {
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
@@ -349,7 +374,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to get text collection: %w", err)
 	}
-	imageCol, err := db.Vector().GetCollection(ctx2, imageCollection)
+	imageCol, err := db.GetCollection(ctx2, imageCollection)
 	if err != nil {
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
@@ -378,8 +403,12 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 				log.Printf("reranker session opts warning (reranking disabled): %v", err)
 			} else {
 				defer ropts.Destroy()
-				if useGPU && tryAppendCUDA(ropts) {
-					log.Printf("reranker session: CUDA GPU enabled")
+				if hw.DirectMLKneecap {
+					ropts.SetMemPattern(false)
+					ropts.SetCpuMemArena(false)
+				}
+				if useGPU && tryAppendDirectML(ropts) {
+					log.Printf("reranker session: DirectML GPU enabled")
 				}
 				rsess, err := ort.NewDynamicAdvancedSession(
 					rerankerOnnx,
@@ -413,6 +442,7 @@ func New(dbPath, textModelPath, imageModelPath string) (*Engine, error) {
 		textCollectionID:  textCol.ID,
 		imageCollectionID: imageCol.ID,
 		writeChan:         make(chan WriteOperation, 10000),
+		Hardware:          hw,
 	}
 	go engine.runWriter()
 	return engine, nil
@@ -517,13 +547,13 @@ func (s *Engine) runWriter() {
 		}
 
 		if len(sqEmbsBatch) > 0 {
-			if err := s.db.Vector().UpsertBatch(ctx, sqEmbsBatch); err != nil {
+			if err := s.db.UpsertBatch(ctx, sqEmbsBatch); err != nil {
 				log.Printf("writer sqvect upsert error: %v", err)
 			}
 		}
 
 		if len(deletePathIDs) > 0 {
-			if err := s.db.Vector().DeleteBatch(ctx, deletePathIDs); err != nil {
+			if err := s.db.DeleteBatch(ctx, deletePathIDs); err != nil {
 				log.Printf("writer sqvect delete error: %v", err)
 			}
 		}
@@ -693,7 +723,8 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	result := make([][]float32, len(texts))
 
 	// Worker pool: each goroutine calls StaticEmbedder.EmbedString (pure Go, no CGO lock).
-	numWorkers := runtime.NumCPU()
+	// Use half CPU to keep overall indexing load modest (~20% CPU).
+	numWorkers := runtime.NumCPU() / 2
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
@@ -787,13 +818,17 @@ func (s *Engine) embedClipText(texts []string) ([][]float32, error) {
 			return nil, fmt.Errorf("clip text batch output tensor: %w", err)
 		}
 
-		if err := s.clipTextSession.Run(
+		s.gpuMutex.Lock()
+		runErr := s.clipTextSession.Run(
 			[]ort.Value{inputIDs},
 			[]ort.Value{outTensor},
-		); err != nil {
+		)
+		s.gpuMutex.Unlock()
+
+		if runErr != nil {
 			outTensor.Destroy()
 			inputIDs.Destroy()
-			return nil, fmt.Errorf("clip text batch inference failed: %w", err)
+			return nil, fmt.Errorf("clip text batch inference failed: %w", runErr)
 		}
 
 		data := outTensor.GetData()
@@ -866,13 +901,17 @@ func (s *Engine) embedImage(imagePaths []string) ([][]float32, error) {
 			return nil, fmt.Errorf("vision batch output tensor error: %w", err)
 		}
 
-		if err := s.clipVisionSession.Run(
+		s.gpuMutex.Lock()
+		runErr := s.clipVisionSession.Run(
 			[]ort.Value{inputTensor},
 			[]ort.Value{outTensor},
-		); err != nil {
+		)
+		s.gpuMutex.Unlock()
+
+		if runErr != nil {
 			outTensor.Destroy()
 			inputTensor.Destroy()
-			return nil, fmt.Errorf("vision batch inference failed: %w", err)
+			return nil, fmt.Errorf("vision batch inference failed: %w", runErr)
 		}
 
 		data := outTensor.GetData()
@@ -1440,7 +1479,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	// Vector search both collections. Images are capped lower than text: they add
 	// semantic coverage but shouldn't flood rankings for text-heavy queries.
-	textResults, err := s.db.Vector().Search(ctx, textQueryVec, core.SearchOptions{
+	textResults, err := s.db.Search(ctx, textQueryVec, core.SearchOptions{
 		Collection: textCollection,
 		TopK:       200,
 	})
@@ -1448,7 +1487,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		log.Printf("text search error: %v", err)
 	}
 
-	imageResults, err := s.db.Vector().Search(ctx, imageQueryVec, core.SearchOptions{
+	imageResults, err := s.db.Search(ctx, imageQueryVec, core.SearchOptions{
 		Collection: imageCollection,
 		TopK:       50,
 	})
@@ -1677,7 +1716,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	}
 	queryVec := embs[0]
 
-	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
+	results, err := s.db.Search(ctx, queryVec, core.SearchOptions{
 		Collection: textCollection,
 		TopK:       200,
 	})
@@ -1753,7 +1792,7 @@ func (s *Engine) ImageSearch(query string) ([]SearchResult, error) {
 	}
 	queryVec := embs[0]
 
-	results, err := s.db.Vector().Search(ctx, queryVec, core.SearchOptions{
+	results, err := s.db.Search(ctx, queryVec, core.SearchOptions{
 		Collection: imageCollection,
 		TopK:       50,
 	})
@@ -2659,10 +2698,12 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 				rerankedText = append(rerankedText, scored{item.result, float32(item.result.Score)})
 			}
 		} else {
+			s.gpuMutex.Lock()
 			runErr := s.rerankerSession.Run(
 				[]ort.Value{tIDs, tMask},
 				[]ort.Value{tOut},
 			)
+			s.gpuMutex.Unlock()
 			logits := tOut.GetData() // []float32 of length nPairs
 			tIDs.Destroy()
 			tMask.Destroy()
@@ -2815,10 +2856,10 @@ func findOnnxRuntime() string {
 	return dllName
 }
 
-// hasCUDAProvider returns true if onnxruntime_providers_cuda.dll is present
-// alongside the main ONNX Runtime DLL, indicating GPU inference may be available.
-func hasCUDAProvider() bool {
-	const dllName = "onnxruntime_providers_cuda.dll"
+// hasDirectMLProvider returns true if DirectML.dll is present, indicating 
+// that GPU acceleration is likely available on this Windows machine.
+func hasDirectMLProvider() bool {
+	const dllName = "DirectML.dll"
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), dllName)
 		if _, err := os.Stat(p); err == nil {
@@ -2834,32 +2875,12 @@ func hasCUDAProvider() bool {
 	return false
 }
 
-// cudaRuntimeReady probes whether the CUDA 13 runtime DLLs are actually
-// loadable. ORT's CUDA EP requires cublasLt64_13.dll; if it is absent the
-// provider DLL fails to load and ORT prints an internal error for every
-// session. We check once here so we can skip the EP entirely when CUDA is
-// installed but the runtime is not.
-func cudaRuntimeReady() bool {
-	dll, err := syscall.LoadDLL("cublasLt64_13.dll")
-	if err != nil {
-		log.Printf("CUDA runtime not available (cublasLt64_13.dll missing) — using CPU. Install CUDA 13 to enable GPU.")
-		return false
-	}
-	dll.Release()
-	return true
-}
-
-// tryAppendCUDA attempts to register the CUDA execution provider on opts.
+// tryAppendDirectML attempts to register the DirectML execution provider on opts.
 // Returns true on success; on any error it logs and leaves opts unchanged (CPU fallback).
-func tryAppendCUDA(opts *ort.SessionOptions) bool {
-	cudaOpts, err := ort.NewCUDAProviderOptions()
-	if err != nil {
-		log.Printf("CUDA provider options unavailable: %v", err)
-		return false
-	}
-	defer cudaOpts.Destroy()
-	if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
-		log.Printf("CUDA EP append failed (falling back to CPU): %v", err)
+func tryAppendDirectML(opts *ort.SessionOptions) bool {
+	// Use Device 0 (primary GPU)
+	if err := opts.AppendExecutionProviderDirectML(0); err != nil {
+		log.Printf("DirectML EP append failed (falling back to CPU): %v", err)
 		return false
 	}
 	return true

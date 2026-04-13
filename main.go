@@ -40,9 +40,8 @@ var assets embed.FS
 //go:embed cmd/daemon/icon.ico
 var trayIcon []byte
 
-// Pass-2 file extraction (kreuzberg) is I/O-bound: 2×CPU keeps the pipeline
-// saturated while half the goroutines wait on disk reads.
-var maxConcurrency = runtime.NumCPU() * 2
+// Pass-2 file extraction (kreuzberg) is I/O-bound but capped to limit CPU usage.
+var maxConcurrency = runtime.NumCPU()
 var imageBatchSize = 100 // Defaults, adapted at startup
 
 const appPidFile = "filosophy-app.pid"
@@ -161,7 +160,7 @@ func (a *App) makeFolderState(name, path string) FolderState {
 func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
 
-	cfg, err := shared.NewProcessorConfig(8096, 4000, imageBatchSize, sc)
+	cfg, err := shared.NewProcessorConfig(512, 4000, imageBatchSize, sc, a.Hardware)
 	if err != nil {
 		log.Printf("runPass1 error: %v", err)
 		return
@@ -278,7 +277,7 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	}
 
 	start := time.Now()
-	cfg, err := shared.NewProcessorConfig(8096, 4000, imageBatchSize, sc)
+	cfg, err := shared.NewProcessorConfig(512, 4000, imageBatchSize, sc, a.Hardware)
 	if err != nil {
 		log.Printf("runPass2 error: %v", err)
 		return
@@ -346,7 +345,15 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	}
 
 	sem := make(chan struct{}, maxConcurrency)
+	var processedCount int
 	for _, path := range paths {
+		processedCount++
+		if processedCount%a.Hardware.GCInterval == 0 {
+			// Resource-adaptive GC based on hardware profile.
+			runtime.GC()
+			debug.FreeOSMemory()
+		}
+
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
@@ -653,6 +660,8 @@ type App struct {
 	waClient  *whatsapp.Client
 	waStore   *whatsapp.Store
 	waIndexer *whatsapp.Indexer
+
+	Hardware shared.HardwareConfig
 }
 
 func NewApp() *App {
@@ -685,31 +694,10 @@ func (a *App) startup(ctx context.Context) {
 	a.cwd = cwd
 	a.config = shared.LoadConfig(cwd)
 
-	// --- Memory Adaptive Engine ---
-	_, availBytes := shared.GetMemoryInfo()
-	if availBytes > 0 {
-		availGB := availBytes / (1024 * 1024 * 1024)
-		debug.SetMemoryLimit(int64(float64(availBytes) * 0.75))
+	a.Hardware = shared.DetermineHardwareProfile()
+	shared.InitVipsSemaphore(a.Hardware.VIPSCap)
 
-		concurrency := int(availGB / 2)
-		cpuCap := int(float64(runtime.NumCPU()) * 1.5)
-		if concurrency > cpuCap {
-			concurrency = cpuCap
-		}
-		if concurrency < 1 {
-			concurrency = 1
-		}
-		maxConcurrency = concurrency
-
-		batch := int(availGB * 5)
-		if batch < 20 {
-			batch = 20
-		} else if batch > 100 {
-			batch = 100
-		}
-		imageBatchSize = batch
-		log.Printf("[Indexer] Adaptive RAM %dGB available -> concurrency=%d, batchSize=%d", availGB, maxConcurrency, imageBatchSize)
-	}
+	// Memory watchdog
 
 	// Stale temp file cleanup
 	tempMatches, _ := filepath.Glob(filepath.Join(os.TempDir(), "filosophy-img-*"))
@@ -720,7 +708,9 @@ func (a *App) startup(ctx context.Context) {
 	// Memory watchdog
 	go func() {
 		var m runtime.MemStats
-		limit := int64(float64(availBytes) * 0.75)
+		// Set memory limit to 75% of total RAM
+		totalRAM, _ := shared.GetMemoryInfo()
+		limit := int64(float64(totalRAM) * 0.75)
 		if limit <= 0 {
 			return
 		}
@@ -810,7 +800,7 @@ func (a *App) startup(ctx context.Context) {
 	log.Println("[Boot 5] Spawning Engine initialization (async)...")
 	a.engineInitializing.Store(true)
 	go func() {
-		engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+		engine, err := shared.New(dbPath, textModelPath, imageModelPath, a.Hardware)
 		a.engineInitializing.Store(false)
 		if err != nil {
 			log.Printf("[Boot Error] CRITICAL initialization failed: %v", err)
@@ -933,7 +923,7 @@ func (a *App) RetryEngineInit() error {
 
 	go func() {
 		log.Println("[Retry] Attempting manual Engine re-initialization...")
-		engine, err := shared.New(dbPath, textModelPath, imageModelPath)
+		engine, err := shared.New(dbPath, textModelPath, imageModelPath, a.Hardware)
 		a.engineInitializing.Store(false)
 		if err != nil {
 			log.Printf("[Retry Error] Re-initialization failed: %v", err)

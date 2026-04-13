@@ -67,35 +67,17 @@ var imageSkipExtensions = map[string]struct{}{
 	".avif": {},
 }
 
-// textAllowExtensions is the set of extensions kreuzberg can meaningfully extract.
-// Any file NOT in this set is immediately marked content_indexed=1 without calling
-// kreuzberg — this prevents re-processing thousands of binaries on every startup.
+// textAllowExtensions controls which file types get text extraction via kreuzberg.
+// Files NOT in this set are immediately marked content_indexed=1 without calling
+// kreuzberg — they are still findable by filename/path via paths_fts.
 var textAllowExtensions = map[string]bool{
 	// Documents
 	".pdf": true, ".docx": true, ".doc": true,
 	".xlsx": true, ".xls": true,
 	".pptx": true, ".ppt": true,
-	".odt": true, ".ods": true, ".odp": true,
-	".rtf": true, ".epub": true,
 	// Plain text / markup
-	".txt": true, ".md": true, ".rst": true, ".org": true,
-	".csv": true, ".tsv": true,
-	".html": true, ".htm": true, ".xhtml": true,
-	".xml": true, ".json": true,
-	".yaml": true, ".yml": true, ".toml": true,
-	".ini": true, ".cfg": true, ".conf": true, ".env": true,
-	// Source code
-	".go": true, ".py": true, ".js": true, ".ts": true,
-	".jsx": true, ".tsx": true, ".vue": true, ".svelte": true,
-	".java": true, ".c": true, ".cpp": true, ".cc": true,
-	".h": true, ".hpp": true, ".cs": true, ".rb": true,
-	".php": true, ".swift": true, ".kt": true, ".kts": true,
-	".rs": true, ".scala": true, ".hs": true, ".lua": true,
-	".r": true, ".sh": true, ".bash": true, ".zsh": true,
-	".fish": true, ".ps1": true, ".bat": true, ".cmd": true,
-	".sql": true, ".graphql": true, ".proto": true,
-	".css": true, ".scss": true, ".sass": true, ".less": true,
-	".tex": true, ".bib": true,
+	".txt": true, ".md": true,
+	".html": true, ".htm": true,
 }
 
 var empty int64 = int64(xxhash.Sum64String(""))
@@ -250,6 +232,7 @@ type ProcessorConfig struct {
 	Mu         *sync.Mutex
 	Batcher    *VipsBatcher
 	IsPathOnly func(string) bool // if non-nil, skip content/embedding for matching paths
+	Hardware   HardwareConfig
 }
 
 // ProcessImage converts an image to JPEG via vips and queues it for indexing.
@@ -365,7 +348,7 @@ func ProcessDirectory(path string, cfg *ProcessorConfig) {
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
 // InitIndexTables is called at most once per Engine instance via sync.Once (IX-4 fix).
-func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*ProcessorConfig, error) {
+func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine, hw HardwareConfig) (*ProcessorConfig, error) {
 	if sc == nil {
 		return nil, fmt.Errorf("cannot create processor config: engine is nil")
 	}
@@ -377,6 +360,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*Process
 
 	splitter := textsplitter.NewRecursiveCharacter(func(o *textsplitter.Options) {
 		o.ChunkSize = chunkSize
+		o.ChunkOverlap = chunkSize / 5 // 20% overlap
 	})
 	tmpDir, err := os.MkdirTemp("", "filosophy-img-*")
 	if err != nil {
@@ -389,6 +373,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine) (*Process
 		Engine:   sc,
 		TempDir:  tmpDir,
 		Mu:       &sync.Mutex{},
+		Hardware: hw,
 	}
 	cfg.Batcher = NewVipsBatcher(cfg, imageCap)
 	return cfg, nil

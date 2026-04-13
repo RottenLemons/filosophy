@@ -106,6 +106,7 @@ func main() {
 		filepath.Join(cwd, "filosophy.db"),
 		filepath.Join(cwd, "text"),
 		filepath.Join(cwd, "image"),
+		shared.HardwareConfig{},
 	)
 	if err != nil {
 		log.Fatal("daemon: failed to initialize engine:", err)
