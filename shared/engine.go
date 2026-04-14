@@ -45,7 +45,9 @@ const (
 	textCollection  = "text"
 	imageCollection = "image"
 
-	textEmbedDim  = 256 // truncated from model's native 1024
+	textEmbedDim  = 256 // truncated from model's native dim
+	textNativeDim = 384 // BERT model hidden size
+	textMaxSeqLen = 512 // max_position_embeddings
 	imageEmbedDim = 256 // truncated from CLIP's 512
 	clipEmbedDim  = 512 // CLIP native output dimension
 	clipCtxLen    = 77  // CLIP text context_length
@@ -103,6 +105,8 @@ type Engine struct {
 	db                *core.SQLiteStore
 	sqlDB             *sql.DB // separate connection for the files table
 	staticEmb         *StaticEmbedder
+	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx)
+	textTok           *tokenizers.Tokenizer       // tokenizer for the BERT text encoder
 	clipTok           *tokenizers.Tokenizer
 	clipTextSession   *ort.DynamicAdvancedSession
 	clipVisionSession *ort.DynamicAdvancedSession
@@ -262,12 +266,13 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		return nil, fmt.Errorf("failed to initialize onnxruntime (dll=%s): %w", ortPath, err)
 	}
 
-	// Load the static text embedder (reads model.safetensors + tokenizer.json directly,
-	// no ONNX inference needed for text).
+	// Load the static text embedder from the dd/ subfolder (reads model.safetensors
+	// + tokenizer.json directly, no ONNX inference needed — used as fallback).
 	log.Println("[Engine 5] Loading static text embedder from", textModelPath)
+	ddPath := filepath.Join(textModelPath, "dd")
 	staticEmb, err := LoadStaticEmbedder(
-		filepath.Join(textModelPath, "model.safetensors"),
-		filepath.Join(textModelPath, "tokenizer.json"),
+		filepath.Join(ddPath, "model.safetensors"),
+		filepath.Join(ddPath, "tokenizer.json"),
 	)
 	if err != nil {
 		ort.DestroyEnvironment()
@@ -276,9 +281,21 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		return nil, fmt.Errorf("failed to load static embedder: %w", err)
 	}
 
+	// Load the BERT text encoder tokenizer (text/tokenizer.json).
+	log.Println("[Engine 5b] Loading text encoder tokenizer from", textModelPath)
+	textTok, err := tokenizers.FromFile(filepath.Join(textModelPath, "tokenizer.json"))
+	if err != nil {
+		staticEmb.Close()
+		ort.DestroyEnvironment()
+		sqlDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("failed to load text tokenizer: %w", err)
+	}
+
 	log.Println("[Engine 6] Loading CLIP tokenizer from", imageModelPath)
 	clipTok, err := tokenizers.FromFile(filepath.Join(imageModelPath, "tokenizer.json"))
 	if err != nil {
+		textTok.Close()
 		staticEmb.Close()
 		ort.DestroyEnvironment()
 		sqlDB.Close()
@@ -286,7 +303,43 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		return nil, fmt.Errorf("failed to load CLIP tokenizer: %w", err)
 	}
 
-	// Limit ORT thread spawning to prevent contention with Go's concurrent processing
+	// Create session options for the BERT text encoder.
+	textOpts, err := ort.NewSessionOptions()
+	if err != nil {
+		ort.DestroyEnvironment()
+		sqlDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("failed to create text session options: %w", err)
+	}
+	defer textOpts.Destroy()
+
+	if hw.DirectMLKneecap {
+		textOpts.SetMemPattern(false)
+		textOpts.SetCpuMemArena(false)
+	}
+
+	if useGPU && tryAppendDirectML(textOpts) {
+		log.Printf("BERT text session: DirectML GPU enabled")
+	}
+
+	log.Println("[Engine 5c] Initializing BERT text session...")
+	textSession, err := ort.NewDynamicAdvancedSession(
+		filepath.Join(textModelPath, "model.onnx"),
+		[]string{"input_ids", "attention_mask", "token_type_ids"},
+		[]string{"last_hidden_state"},
+		textOpts,
+	)
+	if err != nil {
+		textTok.Close()
+		staticEmb.Close()
+		clipTok.Close()
+		ort.DestroyEnvironment()
+		sqlDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("failed to create BERT text session: %w", err)
+	}
+
+	// Create session options for CLIP text encoder.
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		ort.DestroyEnvironment()
@@ -301,13 +354,10 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		opts.SetCpuMemArena(false)
 	}
 
-	// We are synchronizing inference with Engine.mu.Lock() inside IndexText/IndexImage,
-	// so it's safe to let ONNX use its default multi-threading across all cores.
 	if useGPU && tryAppendDirectML(opts) {
 		log.Printf("CLIP text session: DirectML GPU enabled")
 	}
 
-	// Create ONNX sessions for CLIP only (text uses the static embedder).
 	log.Println("[Engine 7] Initializing CLIP text session...")
 	clipTextSession, err := ort.NewDynamicAdvancedSession(
 		filepath.Join(imageModelPath, "text_model.onnx"),
@@ -435,6 +485,8 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		sqlDB:             sqlDB,
 		vDB:               vDB,
 		staticEmb:         staticEmb,
+		textSession:       textSession,
+		textTok:           textTok,
 		clipTok:           clipTok,
 		clipTextSession:   clipTextSession,
 		clipVisionSession: clipVisionSession,
@@ -632,10 +684,18 @@ func (s *Engine) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if s.textSession != nil {
+		if err := s.textSession.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.staticEmb != nil {
 		if err := s.staticEmb.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if s.textTok != nil {
+		s.textTok.Close()
 	}
 	if s.clipTok != nil {
 		s.clipTok.Close()
@@ -721,57 +781,135 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 		return nil, nil
 	}
 
+	const batchSize = 16
 	result := make([][]float32, len(texts))
 
-	// Worker pool: each goroutine calls StaticEmbedder.EmbedString (pure Go, no CGO lock).
-	// Use half CPU to keep overall indexing load modest (~20% CPU).
-	numWorkers := runtime.NumCPU() / 2
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-	jobs := make(chan int, len(texts))
-	for i := range texts {
-		jobs <- i
-	}
-	close(jobs)
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		batch := texts[i:end]
+		n := len(batch)
 
-	type outcome struct {
-		idx int
-		emb []float32
-		err error
-	}
-	results := make(chan outcome, len(texts))
+		// Tokenize all texts and find the max sequence length in this batch.
+		type tokenized struct {
+			ids  []uint32
+			mask []int64
+		}
+		toks := make([]tokenized, n)
+		maxLen := 0
+		for j, text := range batch {
+			ids, _ := s.textTok.Encode(text, true)
+			if len(ids) > textMaxSeqLen {
+				ids = ids[:textMaxSeqLen]
+			}
+			seqLen := len(ids)
+			if seqLen > maxLen {
+				maxLen = seqLen
+			}
+			mask := make([]int64, seqLen)
+			for k := range mask {
+				mask[k] = 1
+			}
+			toks[j] = tokenized{ids: ids, mask: mask}
+		}
+		if maxLen == 0 {
+			maxLen = 1
+		}
 
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				emb, err := s.staticEmb.EmbedString(texts[idx])
-				if err != nil {
-					// Shouldn't happen — EmbedString returns zero vec on empty input.
-					results <- outcome{idx: idx, err: err}
+		// Build padded flat tensors [n, maxLen].
+		inputIDs := make([]int64, n*maxLen)
+		attentionMask := make([]int64, n*maxLen)
+		tokenTypeIDs := make([]int64, n*maxLen) // all zeros for single-segment
+
+		for j, t := range toks {
+			off := j * maxLen
+			for k, id := range t.ids {
+				inputIDs[off+k] = int64(id)
+			}
+			copy(attentionMask[off:], t.mask)
+			// tokenTypeIDs stays zero-filled (single sentence)
+			// padding positions stay zero for input_ids, attention_mask, token_type_ids
+		}
+
+		shape := ort.NewShape(int64(n), int64(maxLen))
+
+		idsTensor, err := ort.NewTensor(shape, inputIDs)
+		if err != nil {
+			return nil, fmt.Errorf("text input_ids tensor: %w", err)
+		}
+		maskTensor, err := ort.NewTensor(shape, attentionMask)
+		if err != nil {
+			idsTensor.Destroy()
+			return nil, fmt.Errorf("text attention_mask tensor: %w", err)
+		}
+		typeTensor, err := ort.NewTensor(shape, tokenTypeIDs)
+		if err != nil {
+			idsTensor.Destroy()
+			maskTensor.Destroy()
+			return nil, fmt.Errorf("text token_type_ids tensor: %w", err)
+		}
+
+		outShape := ort.NewShape(int64(n), int64(maxLen), textNativeDim)
+		outTensor, err := ort.NewEmptyTensor[float32](outShape)
+		if err != nil {
+			idsTensor.Destroy()
+			maskTensor.Destroy()
+			typeTensor.Destroy()
+			return nil, fmt.Errorf("text output tensor: %w", err)
+		}
+
+		s.gpuMutex.Lock()
+		runErr := s.textSession.Run(
+			[]ort.Value{idsTensor, maskTensor, typeTensor},
+			[]ort.Value{outTensor},
+		)
+		s.gpuMutex.Unlock()
+
+		if runErr != nil {
+			outTensor.Destroy()
+			idsTensor.Destroy()
+			maskTensor.Destroy()
+			typeTensor.Destroy()
+			return nil, fmt.Errorf("text inference failed: %w", runErr)
+		}
+
+		// Mean pooling over the sequence dimension, masked by attention_mask.
+		data := outTensor.GetData()
+		for j := 0; j < n; j++ {
+			seqOff := j * maxLen * textNativeDim
+			maskOff := j * maxLen
+			emb := make([]float32, textNativeDim)
+			var count float32
+			for k := 0; k < maxLen; k++ {
+				if attentionMask[maskOff+k] == 0 {
 					continue
 				}
-				// MRL model: truncate to textEmbedDim, then re-normalise.
-				if len(emb) > textEmbedDim {
-					emb = emb[:textEmbedDim]
-					normalize(emb)
+				tokOff := seqOff + k*textNativeDim
+				for d := 0; d < textNativeDim; d++ {
+					emb[d] += data[tokOff+d]
 				}
-				results <- outcome{idx: idx, emb: emb}
+				count++
 			}
-		}()
-	}
-	wg.Wait()
-	close(results)
-
-	for o := range results {
-		if o.err != nil {
-			log.Printf("embedText[%d]: %v", o.idx, o.err)
-			continue
+			if count > 0 {
+				inv := 1.0 / count
+				for d := range emb {
+					emb[d] *= inv
+				}
+			}
+			// Truncate to textEmbedDim, then normalise.
+			if len(emb) > textEmbedDim {
+				emb = emb[:textEmbedDim]
+			}
+			normalize(emb)
+			result[i+j] = emb
 		}
-		result[o.idx] = o.emb
+
+		outTensor.Destroy()
+		idsTensor.Destroy()
+		maskTensor.Destroy()
+		typeTensor.Destroy()
 	}
 
 	return result, nil
