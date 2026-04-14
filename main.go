@@ -159,6 +159,9 @@ func (a *App) makeFolderState(name, path string) FolderState {
 
 func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
+	if ctx != nil {
+		a.setStatus(true, "Phase 1/2: Scanning metadata...", 0)
+	}
 
 	cfg, err := shared.NewProcessorConfig(512, 4000, imageBatchSize, sc, a.Hardware)
 	if err != nil {
@@ -245,6 +248,9 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 		return
 	}
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	if ctx != nil {
+		a.setStatus(true, "Phase 1/2: Metadata scan complete.", 100)
+	}
 	log.Println("[Indexer] Phase 1/2: Metadata scan complete.")
 }
 
@@ -571,9 +577,12 @@ func availableDrives() []string {
 	return drives
 }
 
-func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
+func (a *App) runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 	if sc == nil {
 		return
+	}
+	if ctx != nil {
+		a.setStatus(true, "System-wide path indexing...", 0)
 	}
 	drives := availableDrives()
 	log.Printf("[sysindex] Starting system-wide path index across %d drive(s)...", len(drives))
@@ -621,6 +630,9 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 		}(root)
 	}
 	wg.Wait()
+	if ctx != nil {
+		a.setStatus(false, "System-wide path index complete.", 100)
+	}
 	log.Println("[sysindex] System-wide path index complete.")
 }
 
@@ -799,6 +811,7 @@ func (a *App) startup(ctx context.Context) {
 	// an "engine_status" event when it is ready (or failed).
 	log.Println("[Boot 5] Spawning Engine initialization (async)...")
 	a.engineInitializing.Store(true)
+	a.setStatus(true, "Initializing Search Engine...", 0)
 	go func() {
 		engine, err := shared.New(dbPath, textModelPath, imageModelPath, a.Hardware)
 		a.engineInitializing.Store(false)
@@ -845,9 +858,19 @@ func (a *App) startup(ctx context.Context) {
 			// runPass2 processes any unindexed content (Semantic)
 			a.runPass2(idxCtx, a.engine)
 
+			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon...")
+			a.daemon = daemon.NewDaemon(dirs, a.engine)
+			a.daemon.Start()
+
+			// Block until system path indexing is also done so 'Ready' is true
+			a.runSystemPathIndex(idxCtx, a.engine)
+
+			// Finally done with everything
+			a.setStatus(false, "System Ready", 100)
+
 			// Indexing complete — update the tray to reflect idle state.
 			select {
-			case a.trayStatusCh <- "Filosophy — Indexing complete":
+			case a.trayStatusCh <- "Filosophy — Ready":
 			default:
 			}
 			// Revert to idle label after a few seconds so it doesn't stay "complete" forever.
@@ -858,11 +881,6 @@ func (a *App) startup(ctx context.Context) {
 				default:
 				}
 			}()
-
-			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon...")
-			a.daemon = daemon.NewDaemon(dirs, a.engine)
-			a.daemon.Start()
-			go runSystemPathIndex(idxCtx, a.engine)
 		}()
 	}()
 
@@ -1424,6 +1442,7 @@ func (a *App) WAConnect() error {
 	// Start indexer if not already running.
 	if a.waIndexer == nil && a.engine != nil {
 		a.waIndexer = whatsapp.NewIndexer(a.waStore, a.engine)
+		a.waIndexer.StatusCallback = a.setStatus
 		a.waIndexer.Start()
 	}
 

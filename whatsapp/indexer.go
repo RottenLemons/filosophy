@@ -38,6 +38,10 @@ type Indexer struct {
 	pending map[string]time.Time // chatJID → time of last queue
 	quit    chan struct{}
 	wakeup  chan struct{}
+
+	// StatusCallback is called only during IndexAll to report global status.
+	// Routine background syncs are silent.
+	StatusCallback func(isIndexing bool, message string, progress int)
 }
 
 // NewIndexer creates an Indexer but does not start it.
@@ -83,9 +87,17 @@ func (idx *Indexer) IndexAll() {
 		log.Printf("[WA Indexer] GetChats error: %v", err)
 		return
 	}
-	log.Printf("[WA Indexer] Full re-index: %d chat(s)", len(chats))
-	for _, c := range chats {
+	total := len(chats)
+	log.Printf("[WA Indexer] Full re-index: %d chat(s)", total)
+	for i, c := range chats {
+		if idx.StatusCallback != nil {
+			progress := int((float64(i) / float64(total)) * 100)
+			idx.StatusCallback(true, fmt.Sprintf("Indexing WhatsApp: %d/%d", i+1, total), progress)
+		}
 		idx.indexChat(c.JID)
+	}
+	if idx.StatusCallback != nil {
+		idx.StatusCallback(false, "WhatsApp indexing complete", 100)
 	}
 }
 

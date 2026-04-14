@@ -5,7 +5,7 @@ import { GetIndexingStatus } from '../lib/wailsjs/go/main/App';
 export const indexingStatus = writable({
     isIndexing: false,
     progress: 0,
-    statusMessage: 'System Ready'
+    statusMessage: 'Initializing...'
 });
 
 // Setup event listeners for Wails
