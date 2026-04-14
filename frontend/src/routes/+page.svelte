@@ -595,6 +595,36 @@
                   <div class="flex flex-col items-end pr-4">
                     <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
                     <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
+                    <!-- Feedback buttons: visible on hover or after voting -->
+                    <div
+                      class="flex gap-1 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}"
+                      on:click|stopPropagation
+                    >
+                      <button
+                        title="Relevant result"
+                        disabled={feedbackState.has(file.Path)}
+                        on:click={() => submitFeedback(file, i, 1)}
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'} disabled:cursor-default"
+                        aria-label="Thumbs up"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === 1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/>
+                          <path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                        </svg>
+                      </button>
+                      <button
+                        title="Not relevant"
+                        disabled={feedbackState.has(file.Path)}
+                        on:click={() => submitFeedback(file, i, -1)}
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'} disabled:cursor-default"
+                        aria-label="Thumbs down"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === -1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10z"/>
+                          <path d="M17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+                        </svg>
+                      </button>
+                    </div>
                   </div>
                 </div>
               {/each}
