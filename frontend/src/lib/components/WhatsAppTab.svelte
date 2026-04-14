@@ -261,7 +261,7 @@
     <!-- Header -->
     <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-[#2a2a2a] shrink-0">
       <div class="flex items-center gap-2">
-        <MessageCircle class="w-4 h-4 text-green-600 dark:text-green-400" />
+        <MessageCircle class="w-4 h-4 text-slate-900 dark:text-gray-100" />
         <span class="text-sm font-bold text-slate-900 dark:text-gray-100">WhatsApp</span>
       </div>
       <div class="flex items-center gap-1">
@@ -279,7 +279,7 @@
     <!-- Status bar -->
     <div class="px-5 py-2 shrink-0 border-b border-gray-100 dark:border-[#2a2a2a]">
       {#if isConnected}
-        <span class="flex items-center gap-1.5 text-[10px] font-semibold text-green-600 dark:text-green-400">
+        <span class="flex items-center gap-1.5 text-[10px] font-semibold text-slate-900 dark:text-gray-100">
           <Wifi class="w-3 h-3" /> Connected
           {#if totalMsgs > 0}
             <span class="text-gray-400 dark:text-gray-500 font-normal">· {totalMsgs.toLocaleString()} messages</span>
@@ -298,7 +298,7 @@
 
     <!-- Error -->
     {#if error}
-      <div class="mx-4 mt-2 px-3 py-2 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/30 rounded-lg text-[11px] text-red-600 dark:text-red-400" transition:fade>
+      <div class="mx-4 mt-2 px-3 py-2 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/30 rounded-none text-[11px] text-red-600 dark:text-red-400" transition:fade>
         {error}
       </div>
     {/if}
@@ -310,7 +310,7 @@
         <!-- Connect prompt -->
         <div class="flex flex-col items-center justify-center gap-5 py-12 px-6">
           {#if qrImage}
-            <div class="p-3 bg-white rounded-xl shadow border border-gray-100" transition:fade>
+            <div class="p-3 bg-white rounded-none shadow border border-gray-100" transition:fade>
               <img src={qrImage} alt="WhatsApp QR Code" class="w-48 h-48" />
             </div>
             <div class="text-center space-y-1">
@@ -318,8 +318,8 @@
               <p class="text-[10px] text-gray-400 dark:text-gray-500 leading-relaxed">Settings → Linked Devices → Link a Device</p>
             </div>
           {:else}
-            <div class="w-14 h-14 rounded-2xl bg-green-100 dark:bg-green-950/30 flex items-center justify-center">
-              <MessageCircle class="w-7 h-7 text-green-600 dark:text-green-400" />
+            <div class="w-14 h-14 rounded-none bg-gray-100 dark:bg-[#1a1a1a] flex items-center justify-center">
+              <MessageCircle class="w-7 h-7 text-slate-900 dark:text-gray-100" />
             </div>
             <div class="text-center space-y-1 max-w-[200px]">
               <p class="text-xs font-semibold text-gray-800 dark:text-gray-200">Connect WhatsApp</p>
@@ -328,7 +328,7 @@
             <button
               on:click={connect}
               disabled={connecting}
-              class="flex items-center gap-2 px-5 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-bold rounded-full transition-all shadow-md shadow-green-900/20 disabled:opacity-50"
+              class="flex items-center gap-2 px-5 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-none transition-all shadow-md  disabled:opacity-50"
             >
               {#if connecting}
                 <RefreshCw class="w-3 h-3 animate-spin" /> Connecting…
@@ -353,14 +353,14 @@
             on:click={() => selectChat(chat)}
             class="w-full flex items-center gap-3 px-4 py-3 text-left transition-colors
                    {selectedChat?.jid === chat.jid
-                     ? 'bg-green-50 dark:bg-green-950/20 border-l-2 border-green-500'
+                     ? 'bg-gray-100 dark:bg-[#1a1a1a] border-l-2 border-slate-900 dark:border-gray-100'
                      : 'hover:bg-gray-50 dark:hover:bg-[#1a1a1a] border-l-2 border-transparent'}"
           >
             <!-- Avatar -->
-            <div class="w-10 h-10 rounded-full shrink-0 flex items-center justify-center font-bold text-sm
+            <div class="w-10 h-10 rounded-none shrink-0 flex items-center justify-center font-bold text-sm
                         {chat.isGroup
-                          ? 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400'
-                          : 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400'}">
+                          ? 'bg-gray-100 dark:bg-[#1a1a1a] text-slate-900 dark:text-gray-100'
+                          : 'bg-gray-100 dark:bg-[#1a1a1a] text-slate-900 dark:text-gray-100'}">
               {#if chat.isGroup}
                 <Users class="w-4 h-4" />
               {:else}
@@ -376,7 +376,7 @@
               <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate mt-0.5">{chat.lastMessage || ''}</p>
             </div>
             <!-- Count -->
-            <span class="shrink-0 min-w-[20px] text-center px-1.5 py-0.5 rounded-full bg-gray-100 dark:bg-[#222] text-[9px] font-bold text-gray-500 dark:text-gray-400">
+            <span class="shrink-0 min-w-[20px] text-center px-1.5 py-0.5 rounded-none bg-gray-100 dark:bg-[#222] text-[9px] font-bold text-gray-500 dark:text-gray-400">
               {chat.msgCount}
             </span>
           </button>
@@ -405,10 +405,10 @@
         </button>
 
         <!-- Avatar -->
-        <div class="w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm shrink-0
+        <div class="w-9 h-9 rounded-none flex items-center justify-center font-bold text-sm shrink-0
                     {selectedChat.isGroup
-                      ? 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400'
-                      : 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400'}">
+                      ? 'bg-gray-100 dark:bg-[#1a1a1a] text-slate-900 dark:text-gray-100'
+                      : 'bg-gray-100 dark:bg-[#1a1a1a] text-slate-900 dark:text-gray-100'}">
           {#if selectedChat.isGroup}
             <Users class="w-4 h-4" />
           {:else}
@@ -426,7 +426,7 @@
         <!-- Open in WhatsApp -->
         <button
           on:click={() => openInWhatsApp(selectedChat!.jid)}
-          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-600 hover:bg-green-700 text-white text-[10px] font-bold transition-colors shadow-sm shrink-0"
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-none bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-bold transition-colors shadow-sm shrink-0"
           title="Open chat in WhatsApp. Hover a message and click the copy icon to copy its timestamp, then use WhatsApp's jump-to-date to find it."
         >
           <ExternalLink class="w-3 h-3" />
@@ -461,13 +461,13 @@
             <div class="group flex flex-col gap-0.5 py-0.5" transition:fade={{ duration: 80 }}>
               <!-- Sender name (groups or when sender changes) -->
               {#if selectedChat.isGroup && msg.senderName && (i === 0 || messages[i-1].sender !== msg.sender || showDateSep(messages, i))}
-                <span class="text-[10px] font-semibold text-green-600 dark:text-green-400 px-1 mt-1">
+                <span class="text-[10px] font-semibold text-slate-900 dark:text-gray-100 px-1 mt-1">
                   {msg.senderName || msg.sender}
                 </span>
               {/if}
 
               <div class="flex items-end gap-2 max-w-[80%]">
-                <div class="flex-1 px-3 py-2 rounded-2xl rounded-tl-sm bg-white dark:bg-[#1a1a1a] border border-gray-100 dark:border-[#2a2a2a] shadow-sm">
+                <div class="flex-1 px-3 py-2 rounded-none rounded-none bg-white dark:bg-[#1a1a1a] border border-gray-100 dark:border-[#2a2a2a] shadow-sm">
                   {#if msg.text}
                     <p class="text-[13px] text-slate-800 dark:text-gray-200 leading-relaxed whitespace-pre-wrap break-words">{msg.text}</p>
                   {/if}
@@ -486,7 +486,7 @@
                   class="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-gray-300 hover:text-gray-500 dark:text-gray-600 dark:hover:text-gray-400 shrink-0"
                 >
                   {#if copiedMsgId === msg.messageId}
-                    <Check class="w-3 h-3 text-green-500" />
+                    <Check class="w-3 h-3 text-slate-900 dark:text-gray-100" />
                   {:else}
                     <Copy class="w-3 h-3" />
                   {/if}

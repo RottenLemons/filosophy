@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2501,6 +2502,49 @@ func extractSnippets(content, query string, maxWindows int) []string {
 	return out
 }
 
+// serializeMetadataPayload constructs a token-efficient header for the cross-encoder payload.
+// It pre-allocates strings to prevent memory fragmentation and strips heavy absolute root paths.
+func serializeMetadataPayload(path string, size int64, modified string, snippet string) string {
+	ext := filepath.Ext(path)
+	szStr := strconv.FormatInt(size, 10)
+
+	mod := modified
+	if len(mod) >= 10 {
+		mod = mod[:10] // Extrude YYYY-MM-DD from RFC3339
+	}
+
+	pSlash := filepath.ToSlash(path)
+	parts := strings.Split(pSlash, "/")
+	var cleanParts []string
+	for _, p := range parts {
+		if p != "" && !strings.Contains(p, ":") { // Drop Windows Drive letters
+			cleanParts = append(cleanParts, p)
+		}
+	}
+	relPath := strings.Join(cleanParts, "/")
+	// Keep up to 4 terminal segments for a dense hierarchy
+	if len(cleanParts) > 4 {
+		relPath = strings.Join(cleanParts[len(cleanParts)-4:], "/")
+	}
+
+	var sb strings.Builder
+	// Capacity heuristic: [Path: ] [Ext: ] [Size: ] [Modified: ] | Content:  (approx 55 bytes)
+	sb.Grow(55 + len(relPath) + len(ext) + len(szStr) + len(mod) + len(snippet))
+	
+	sb.WriteString("[Path: ")
+	sb.WriteString(relPath)
+	sb.WriteString("] [Ext: ")
+	sb.WriteString(ext)
+	sb.WriteString("] [Size: ")
+	sb.WriteString(szStr)
+	sb.WriteString("] [Modified: ")
+	sb.WriteString(mod)
+	sb.WriteString("] | Content: ")
+	sb.WriteString(snippet)
+
+	return sb.String()
+}
+
 // rerank re-scores the top rerankerTopN text results using the cross-encoder.
 // Images are partitioned out before reranking (cross-encoder needs text) and
 // re-inserted after by their original RRF rank, so they compete fairly with
@@ -2657,7 +2701,8 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 			if debug {
 				log.Printf("  snippet[%d]: %s", si, snip)
 			}
-			pairs = append(pairs, encodePair("Filename: "+basenames[item.result.Path]+"\n"+snip))
+			payload := serializeMetadataPayload(item.result.Path, item.result.Size, item.result.Modified, snip)
+			pairs = append(pairs, encodePair(payload))
 			pairDoc = append(pairDoc, i)
 		}
 	}

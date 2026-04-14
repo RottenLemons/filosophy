@@ -328,11 +328,12 @@
   }
 </script>
 
-<div class="h-screen flex flex-row bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
+
+<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-6 z-[9999]">
     <!-- Engine Status (Integrated) -->
     {#if searchErrorMsg !== 'backend engine not initialized'}
-      <div
+      <div 
         class="flex items-center gap-3 px-3 py-1.5 bg-gray-100/50 dark:bg-[#252626]/50 backdrop-blur-md rounded-sm border border-gray-200 dark:border-[#474848]/20 transition-all"
         transition:fade={{ duration: 400 }}
       >
@@ -342,10 +343,10 @@
         <span class="font-sans text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-[#acabab]">
           {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Indexing') : 'Ready'}
         </span>
-
+        
         {#if $indexingStatus.isIndexing}
           <div class="w-12 h-0.5 bg-gray-200 dark:bg-[#131313] rounded-full overflow-hidden">
-            <div
+            <div 
               class="h-full bg-[#bfc8ca] transition-all duration-300"
               style="width: {$indexingStatus.progress}%"
             ></div>
@@ -356,8 +357,16 @@
 
     <div class="flex items-center gap-3">
       <button
-        on:click={() => showChat = !showChat}
-        class="p-2 rounded-full transition-all duration-300 hover:opacity-100 {showChat ? 'opacity-100 text-blue-600 dark:text-blue-400' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
+        on:click={() => activeView = activeView === 'whatsapp' ? 'search' : 'whatsapp'}
+        class="p-2 rounded-none transition-all duration-300 hover:opacity-100 {activeView === 'whatsapp' ? 'opacity-100 text-slate-900 dark:text-gray-100' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
+        style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
+        aria-label="Toggle WhatsApp"
+      >
+        <MessageCircle class="w-5 h-5" />
+      </button>      
+      <button
+        on:click={() => activeView = activeView === 'chat' ? 'search' : 'chat'}
+        class="p-2 rounded-none transition-all duration-300 hover:opacity-100 {activeView === 'chat' ? 'opacity-100 text-slate-900 dark:text-gray-100' : 'opacity-60 text-slate-900 dark:text-gray-100'} focus:outline-none cursor-pointer"
         style="--wails-draggable:no-drag; -webkit-app-region:no-drag; pointer-events:auto;"
         aria-label="Toggle Chat"
       >
@@ -376,80 +385,14 @@
   </div>
 
   <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
+  
+  <header class="w-full px-12 py-6 z-50 shrink-0">
+    <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
+  </header>
 
-  <!-- Left icon sidebar -->
-  <nav
-    class="w-14 shrink-0 flex flex-col items-center py-5 gap-1 border-r border-gray-100 dark:border-[#2a2a2a] bg-[#FAF9F6] dark:bg-[#111] z-50"
-    style="--wails-draggable:no-drag; -webkit-app-region:no-drag;"
-  >
-    <!-- Logo -->
-    <div class="mb-3 w-8 h-8 flex items-center justify-center">
-      <span class="text-xl font-serif font-bold text-slate-900 dark:text-gray-100 select-none">F</span>
-    </div>
-
-    <!-- Nav buttons -->
-    <button
-      on:click={() => activeView = 'search'}
-      class="p-2.5 rounded-lg transition-all {activeView === 'search' ? 'bg-slate-900 text-white dark:bg-white dark:text-black' : 'text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
-      aria-label="Search"
-      title="Search"
-    >
-      <SearchIcon size={20} />
-    </button>
-
-    <button
-      on:click={() => activeView = activeView === 'whatsapp' ? 'search' : 'whatsapp'}
-      class="p-2.5 rounded-lg transition-all {activeView === 'whatsapp' ? 'bg-green-600 text-white' : 'text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
-      aria-label="WhatsApp"
-      title="WhatsApp"
-    >
-      <MessageCircle class="w-[18px] h-[18px]" />
-    </button>
-
-    <button
-      on:click={() => activeView = activeView === 'chat' ? 'search' : 'chat'}
-      class="p-2.5 rounded-lg transition-all {activeView === 'chat' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-[#1a1a1a]'}"
-      aria-label="Chat"
-      title="Chat"
-    >
-      <MessageSquare class="w-[18px] h-[18px]" />
-    </button>
-
-    <!-- Spacer -->
-    <div class="flex-1" />
-
-    <!-- Bottom: settings + theme -->
-    <ThemeToggle />
-    <button
-      on:click={() => showSettings = true}
-      class="p-2.5 rounded-lg transition-all text-gray-400 hover:text-slate-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-[#1a1a1a] group"
-      aria-label="Settings"
-      title="Settings"
-    >
-      <SettingsIcon class="w-[18px] h-[18px] transition-transform group-hover:rotate-45" />
-    </button>
-  </nav>
-
-  <!-- Main content -->
-  <main class="flex-1 flex overflow-hidden relative">
+  <!-- Task 3: Desktop layout lg:flex-row -->
+  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
     
-  {#if activeView === 'whatsapp'}
-    <div class="flex-1 overflow-hidden" transition:fade={{ duration: 150 }}>
-      <WhatsAppTab />
-    </div>
-
-  {:else if activeView === 'chat'}
-    <div class="flex-1 overflow-hidden" transition:fade={{ duration: 150 }}>
-      <Chat
-        contextFile={selectedFile}
-        fileContent={textContent}
-        on:close={() => activeView = 'search'}
-      />
-    </div>
-
-  {:else}
-    <!-- Search view -->
-    <div class="flex-1 flex overflow-hidden">
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
         
@@ -570,7 +513,7 @@
               <span>Sorted by relevance</span>
             </div>
           {/if}
-
+          
           {#if searchErrorMsg}
             <div class="p-8 border {searchErrorMsg.includes('backend engine not initialized') ? 'border-amber-400 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20' : 'border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10'} rounded-none flex flex-col items-center gap-4 text-center" transition:fade>
               {#if searchErrorMsg.includes('backend engine not initialized')}
@@ -614,8 +557,9 @@
                 Cancel
               </button>
             </div>
-          {:else if filteredFiles.length > 0 || waMessages.length > 0}
+          {:else if filteredFiles.length > 0}
             <div class="flex flex-col gap-6 relative z-20" role="listbox" aria-label="Search results">
+              <!-- Task 2: renderLimit paging -->
               {#each filteredFiles.slice(0, renderLimit) as file, i (file.Path)}
                 <div 
                   class="group relative flex items-center justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 shadow-sm outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset
@@ -648,68 +592,30 @@
                       </div>
                     </div>
                   </div>
-                  <div class="flex flex-col items-end gap-2 pr-4">
+                  <div class="flex flex-col items-end pr-4">
                     <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
-                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Match</div>
-                    <!-- Feedback buttons: visible on hover or after voting -->
-                    <div
-                      class="flex gap-1 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}"
-                      on:click|stopPropagation
-                    >
-                      <button
-                        title="Relevant result"
-                        disabled={feedbackState.has(file.Path)}
-                        on:click={() => submitFeedback(file, i, 1)}
-                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'} disabled:cursor-default"
-                        aria-label="Thumbs up"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === 1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/>
-                          <path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
-                        </svg>
-                      </button>
-                      <button
-                        title="Not relevant"
-                        disabled={feedbackState.has(file.Path)}
-                        on:click={() => submitFeedback(file, i, -1)}
-                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'} disabled:cursor-default"
-                        aria-label="Thumbs down"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === -1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10z"/>
-                          <path d="M17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
-                        </svg>
-                      </button>
-                    </div>
+                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
                   </div>
                 </div>
               {/each}
 
-              {#if filteredFiles.length > renderLimit}
-                <button
-                  on:click={loadMore}
-                  class="w-full py-6 border-2 border-dashed border-gray-200 dark:border-[#2a2a2a] text-gray-400 dark:text-gray-500 hover:text-blue-500 hover:border-blue-500 dark:hover:text-blue-400 dark:hover:border-blue-400 font-bold uppercase tracking-widest text-[10px] transition-all"
-                >
-                  Load More Results ({filteredFiles.length - renderLimit} Remaining)
-                </button>
-              {/if}
-
+              
               <!-- WA results inline -->
               {#each waMessages as msg (msg.messageId)}
                 <div
-                  class="group relative flex items-start justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 border-green-400 dark:border-green-700 shadow-sm hover:shadow hover:bg-white dark:hover:bg-[#1a1a1a]"
+                  class="group relative flex items-start justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 border-transparent hover:border-gray-200 dark:hover:border-[#2a2a2a] shadow-sm hover:shadow hover:bg-white dark:hover:bg-[#1a1a1a]"
                   style="animation: slideFadeIn 0.3s ease-out forwards; opacity: 0; transform: translateY(10px);"
-                  on:click={() => WAOpenChat(msg.chatJid)}
+                  on:click={() => { activeView = 'whatsapp'; setTimeout(() => WAOpenChat(msg.chatJid), 100); }}
                 >
                   <div class="flex gap-6 items-start">
-                    <div class="w-12 h-12 shrink-0 flex items-center justify-center bg-green-50 dark:bg-green-950/30 text-green-600 dark:text-green-400">
+                    <div class="w-12 h-12 shrink-0 flex items-center justify-center bg-gray-100 dark:bg-[#1a1a1a] text-gray-400 dark:text-gray-500">
                       <MessageCircle size={24} />
                     </div>
                     <div class="space-y-1.5 mt-0.5">
                       <h3 class="text-xl font-serif font-bold text-slate-800 dark:text-gray-100 leading-tight">{msg.chatName || msg.chatJid}</h3>
                       <p class="text-sm font-serif text-slate-600 dark:text-gray-300 leading-relaxed line-clamp-2">{msg.text}</p>
                       <div class="flex gap-4 pt-1">
-                        <span class="text-[10px] font-bold uppercase tracking-widest text-green-600 dark:text-green-400">WhatsApp</span>
+                        <span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">WhatsApp</span>
                         {#if msg.senderName}<span class="text-[10px] text-gray-400 dark:text-gray-500">{msg.senderName}</span>{/if}
                         {#if msg.isGroup}<span class="text-[10px] text-gray-400 dark:text-gray-500">Group</span>{/if}
                         <span class="text-[10px] text-gray-400 dark:text-gray-500">{formatDate(msg.timestamp)}</span>
@@ -726,10 +632,19 @@
                   Searching messages…
                 </div>
               {/if}
+
+              {#if filteredFiles.length > renderLimit}
+                <button 
+                  on:click={loadMore}
+                  class="w-full py-6 border-2 border-dashed border-gray-200 dark:border-[#2a2a2a] text-gray-400 dark:text-gray-500 hover:text-blue-500 hover:border-blue-500 dark:hover:text-blue-400 dark:hover:border-blue-400 font-bold uppercase tracking-widest text-[10px] transition-all"
+                >
+                  Load More Results ({filteredFiles.length - renderLimit} Remaining)
+                </button>
+              {/if}
             </div>
           {:else if searchQuery.trim() !== '' && !searching && !waSearching}
              <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">
-               No results found.
+               No relevant documents found.
                {#if isFilterActive}
                  <div class="mt-2 text-xs not-italic font-sans font-semibold text-blue-500 dark:text-blue-400 uppercase tracking-widest">
                    Try clearing your active filters.
@@ -738,12 +653,26 @@
              </div>
           {/if}
         </div>
-
       </div>
     </div>
+    
+    <!-- Chat panel -->
+    {#if activeView === 'chat'}
+      <Chat
+        contextFile={selectedFile}
+        fileContent={textContent}
+        on:close={() => activeView = 'search'}
+      />
+    {/if}
 
-    <!-- File preview -->
-    {#if selectedFile}
+    {#if activeView === 'whatsapp'}
+      <div class="flex-1 overflow-hidden" transition:fade={{ duration: 150 }}>
+        <WhatsAppTab />
+      </div>
+    {/if}
+
+    <!-- File preview ΓÇö hidden when chat is open -->
+    {#if selectedFile && activeView !== 'chat'}
       <aside
         transition:slide={{ axis: 'x', duration: 400 }}
         class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#FAF9F6] dark:bg-[#111] border-l border-gray-200 dark:border-l-[#2a2a2a] flex flex-col shadow-2xl overflow-hidden"
@@ -824,9 +753,7 @@
         </div>
       </aside>
     {/if}
-    </div> <!-- end search view inner flex -->
-  {/if}
-
+    
   </main>
   
   <!-- Task 3: The "Engine Ready" Status (Obsolete Fixed Position) -->

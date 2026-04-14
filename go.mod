@@ -11,7 +11,7 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/syncthing/notify v0.0.0-20250528144937-c7027d4f7465
 	github.com/tmc/langchaingo v0.1.14
-	github.com/wailsapp/wails/v2 v2.12.0
+	github.com/wailsapp/wails/v2 v2.11.0
 	github.com/yalue/onnxruntime_go v1.26.0
 	go.mau.fi/whatsmeow v0.0.0-20260410162419-b95d92207080
 	golang.org/x/image v0.36.0
@@ -21,7 +21,6 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
-	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
