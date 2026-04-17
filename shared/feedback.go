@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -31,6 +32,7 @@ func (f *FeedbackStore) Submit(sessionID, query, path string, rank int, score fl
 	if f.db == nil {
 		return fmt.Errorf("feedback store: db not initialised")
 	}
+	log.Printf("[Feedback] Submitting vote %d for '%s' (query: %q, rank: %d, score: %.3f)", feedback, path, query, rank, score)
 	_, err := f.db.ExecContext(
 		context.Background(),
 		`INSERT INTO search_feedback
@@ -39,8 +41,11 @@ func (f *FeedbackStore) Submit(sessionID, query, path string, rank int, score fl
 		sessionID, query, path, rank, score, feedback, time.Now().Unix(),
 	)
 	if err != nil {
+		log.Printf("[Feedback] INSERT failed for vote %d on '%s': %v", feedback, path, err)
 		return fmt.Errorf("feedback store: insert: %w", err)
 	}
+
+	log.Printf("[Feedback] Received vote %d for '%s' (query: %q, rank: %d, score: %.3f)", feedback, path, query, rank, score)
 	return nil
 }
 

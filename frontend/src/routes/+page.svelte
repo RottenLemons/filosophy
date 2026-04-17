@@ -69,10 +69,17 @@
   // feedback: maps file.Path → +1 | -1 so a result can't be voted twice per session.
   let feedbackState = new Map<string, number>();
 
-  function submitFeedback(file: any, rank: number, value: 1 | -1) {
-    if (feedbackState.has(file.Path)) return; // already voted
-    feedbackState = new Map(feedbackState).set(file.Path, value);
-    SubmitFeedback(searchQuery, file.Path, rank, file.Score, value).catch(err => {
+  function submitFeedback(file: any, rank: number, value: number) {
+    let finalValue = value;
+    if (feedbackState.get(file.Path) === value) {
+      finalValue = 0;
+      const newMap = new Map(feedbackState);
+      newMap.delete(file.Path);
+      feedbackState = newMap;
+    } else {
+      feedbackState = new Map(feedbackState).set(file.Path, value);
+    }
+    SubmitFeedback(searchQuery, file.Path, rank, file.Score, finalValue).catch(err => {
       console.warn('[feedback] submit failed:', err);
     });
   }
@@ -597,14 +604,13 @@
                     <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
                     <!-- Feedback buttons: visible on hover or after voting -->
                     <div
-                      class="flex gap-1 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}"
+                      class="flex gap-1 mt-2 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-50 group-hover:opacity-100'}"
                       on:click|stopPropagation
                     >
                       <button
                         title="Relevant result"
-                        disabled={feedbackState.has(file.Path)}
                         on:click={() => submitFeedback(file, i, 1)}
-                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'} disabled:cursor-default"
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'}"
                         aria-label="Thumbs up"
                       >
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === 1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -614,9 +620,8 @@
                       </button>
                       <button
                         title="Not relevant"
-                        disabled={feedbackState.has(file.Path)}
                         on:click={() => submitFeedback(file, i, -1)}
-                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'} disabled:cursor-default"
+                        class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'}"
                         aria-label="Thumbs down"
                       >
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill={feedbackState.get(file.Path) === -1 ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

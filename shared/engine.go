@@ -1566,6 +1566,100 @@ type SearchResult struct {
 //  5. Image vector RRF (1.1x weighted)
 //  6. Exact/prefix/substring filename match boost
 //  7. Trigram fuzzy path similarity — typo tolerance
+
+// GetRawSignals performs vector and FTS search but returns the raw, unweighted
+// signal maps for each query. This is used strictly by the telemetry optimizer
+// to run in-memory parameter grid sweeps without repeating ONNX inference.
+func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vectorSignals map[string]float64) {
+	ctx := context.Background()
+	pq := ParseQuery(query)
+	qText := pq.Text
+
+	pathSignals = make(map[string]float64)
+	contentSignals = make(map[string]float64)
+	vectorSignals = make(map[string]float64)
+
+	textEmbs, err := s.embedText([]string{qText})
+	if err != nil {
+		return
+	}
+	textQueryVec := textEmbs[0]
+
+	var imageQueryVec []float32
+	clipEmbs, err := s.embedClipText([]string{qText})
+	if err == nil {
+		imageQueryVec = clipEmbs[0]
+	}
+
+	textResults, _ := s.db.Search(ctx, textQueryVec, core.SearchOptions{
+		Collection: textCollection,
+		TopK:       200,
+	})
+
+	var imageResults []core.ScoredEmbedding
+	if imageQueryVec != nil {
+		imageResults, _ = s.db.Search(ctx, imageQueryVec, core.SearchOptions{
+			Collection: imageCollection,
+			TopK:       50,
+		})
+	}
+
+	var sigWg sync.WaitGroup
+	var mu sync.Mutex
+
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		s.addPathFTSScores(ctx, qText, m, 1.0)
+		s.addPathFTSAllWords(ctx, qText, m, 4.0/3.0)
+		s.addPathFTSPrefixScores(ctx, qText, m, 1.0)
+		s.addPathFTSShortPrefixScores(ctx, qText, m, 2.0/3.0)
+		mu.Lock()
+		for p, v := range m {
+			pathSignals[p] = v
+		}
+		mu.Unlock()
+	}()
+
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		s.addContentFTSPhraseRRF(ctx, qText, m)
+		s.addContentFTSRRF(ctx, qText, m)
+		if len(m) < 5 {
+			s.addContentFTSFuzzyRRF(ctx, qText, m)
+		}
+		mu.Lock()
+		for p, v := range m {
+			contentSignals[p] = v
+		}
+		mu.Unlock()
+	}()
+
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		k := rrfK
+		for i, res := range textResults {
+			m[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
+		}
+		for i, res := range imageResults {
+			m[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
+		}
+		mu.Lock()
+		for p, v := range m {
+			vectorSignals[p] = v
+		}
+		mu.Unlock()
+	}()
+
+	sigWg.Wait()
+	return
+}
+
 func (s *Engine) Search(query string) ([]SearchResult, error) {
 	ctx := context.Background()
 

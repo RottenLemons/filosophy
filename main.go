@@ -859,7 +859,8 @@ func (a *App) startup(ctx context.Context) {
 				}
 			}()
 
-			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon...")
+			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon and optimizer...")
+			shared.NewTelemetryOptimizer(idxCtx, a.engine).Start()
 			a.daemon = daemon.NewDaemon(dirs, a.engine)
 			a.daemon.Start()
 			go runSystemPathIndex(idxCtx, a.engine)
