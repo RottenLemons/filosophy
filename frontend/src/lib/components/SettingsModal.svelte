@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { fade, slide, fly } from 'svelte/transition';
-  import { X, Folder, Cpu, Settings, Activity, AlertCircle, Network, Plus, Trash2, CheckCircle, Circle, RefreshCw, Clock, Key, Copy, Globe, Lock } from 'lucide-svelte';
+  import { X, Folder, Cpu, Settings, Activity, AlertCircle, Network, Plus, Trash2, CheckCircle, Circle, RefreshCw, Clock, Key, Copy, Globe, Lock, BarChart3 } from 'lucide-svelte';
   import { themeStore } from '../../stores/theme';
   import { indexingStatus, initIndexerStore } from '../../stores/indexer';
-  import { GetHomeFolders, GetEngineStatus, RetryEngineInit, CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration, TestLLMEndpoint, GetAPIConfig, SetAPIEnabled, SetAPIPort, RegenerateAPIKey, SetMCPEnabled, SetMCPKey } from '$lib/wailsjs/go/main/App';
+  import { GetHomeFolders, GetEngineStatus, RetryEngineInit, CheckSystemGPU, GetGPUAcceleration, SetGPUAcceleration, TestLLMEndpoint, GetAPIConfig, SetAPIEnabled, SetAPIPort, RegenerateAPIKey, SetMCPEnabled, SetMCPKey, GetOptimizerStatus } from '$lib/wailsjs/go/main/App';
   import Indexer from './Indexer.svelte';
 
   const dispatch = createEventDispatcher();
@@ -217,6 +217,30 @@
     setTimeout(() => snippetCopied = false, 2000);
   }
 
+  // ── Ranking / Optimizer state ──────────────────────────────────────────────
+
+  let optimizerStatus: any = null;
+  let optimizerLoading = true;
+  let optimizerPollId: ReturnType<typeof setInterval> | null = null;
+
+  async function loadOptimizer() {
+    try {
+      optimizerStatus = await GetOptimizerStatus();
+    } catch {}
+    optimizerLoading = false;
+  }
+
+  // Poll every 15s while the ranking tab is visible.
+  $: if (activeTab === 'ranking') {
+    loadOptimizer();
+    if (!optimizerPollId) {
+      optimizerPollId = setInterval(loadOptimizer, 15000);
+    }
+  } else if (optimizerPollId) {
+    clearInterval(optimizerPollId);
+    optimizerPollId = null;
+  }
+
   let engineStatusUnsubscribe: (() => void) | null = null;
 
   onMount(async () => {
@@ -255,6 +279,7 @@
 
   onDestroy(() => {
     engineStatusUnsubscribe?.();
+    if (optimizerPollId) clearInterval(optimizerPollId);
   });
 
   async function retryEngine() {
@@ -374,10 +399,21 @@
           </button>
 
           <button
+            on:click={() => activeTab = 'ranking'}
+            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
+                   {activeTab === 'ranking'
+                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
+                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+          >
+            <BarChart3 class="w-4 h-4" />
+            <span class="uppercase tracking-widest text-[10px]">Ranking</span>
+          </button>
+
+          <button
             on:click={() => activeTab = 'connections'}
             class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'connections' 
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner' 
+                   {activeTab === 'connections'
+                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
                      : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
           >
             <Network class="w-4 h-4" />
@@ -455,7 +491,7 @@
         <!-- Header -->
         <header class="h-20 flex items-center justify-between px-10 shrink-0">
           <h3 class="text-[#acabab] text-xs uppercase tracking-widest font-sans font-bold">
-            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : activeTab === 'connections' ? 'LLM & MCP Connections' : 'API & MCP Access'}
+            {activeTab === 'folders' ? 'Indexing Preferences' : activeTab === 'hardware' ? 'System & Performance' : activeTab === 'ranking' ? 'Ranking Intelligence' : activeTab === 'connections' ? 'LLM & MCP Connections' : 'API & MCP Access'}
           </h3>
           <button 
             on:click={close}
@@ -830,6 +866,108 @@
                  <p class="text-[11px] font-sans text-[#acabab] leading-relaxed opacity-80">
                    Enabling GPU acceleration can reduce search latency by up to 80% on large collections. This is highly recommended for users with dedicated NVIDIA or AMD hardware.
                  </p>
+              </section>
+            </div>
+
+          {:else if activeTab === 'ranking'}
+            <div in:fade={{ duration: 200 }} class="space-y-10">
+              <section>
+                <div class="mb-8">
+                  <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3">Telemetry Optimizer</h4>
+                  <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
+                    The optimizer learns from your thumbs-up/down feedback and adjusts ranking weights to surface better results over time.
+                  </p>
+                </div>
+
+                {#if optimizerLoading}
+                  <div class="flex items-center gap-3 p-8 bg-[#131313] rounded-sm border border-[#474848]/10">
+                    <RefreshCw class="w-4 h-4 animate-spin text-[#bfc8ca]" />
+                    <span class="text-xs text-[#acabab]">Loading optimizer status...</span>
+                  </div>
+                {:else if !optimizerStatus}
+                  <div class="flex flex-col items-center justify-center p-12 bg-[#131313] rounded-sm text-center border border-[#474848]/10 shadow-inner">
+                    <BarChart3 class="w-8 h-8 mb-4 text-[#acabab] opacity-40" />
+                    <p class="text-sm font-sans font-medium text-[#e7e5e5]">Optimizer not yet started</p>
+                    <p class="text-[10px] font-sans text-[#acabab] mt-1 opacity-60">It begins after the initial indexing completes</p>
+                  </div>
+                {:else}
+                  <!-- Last Action -->
+                  <div class="bg-[#131313] rounded-sm p-8 border border-[#474848]/10 shadow-inner space-y-5">
+                    <div class="flex items-center justify-between">
+                      <span class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-60">Last Action</span>
+                      {#if optimizerStatus.lastRunAt}
+                        <span class="text-[10px] font-mono text-[#acabab] opacity-40">
+                          {new Date(optimizerStatus.lastRunAt).toLocaleTimeString()}
+                        </span>
+                      {/if}
+                    </div>
+                    <p class="text-xs font-sans text-[#e7e5e5] leading-relaxed">
+                      {optimizerStatus.lastAction || 'Waiting for first run...'}
+                    </p>
+                    <div class="flex items-center gap-6 pt-3 border-t border-[#474848]/10">
+                      <div class="flex items-center gap-2">
+                        <span class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-60">Feedback votes</span>
+                        <span class="text-sm font-mono text-[#bfc8ca] font-bold">{optimizerStatus.feedbackCount}</span>
+                      </div>
+                    </div>
+                  </div>
+                {/if}
+              </section>
+
+              <!-- Weights Table -->
+              {#if optimizerStatus?.currentWeights}
+                <section>
+                  <div class="mb-6">
+                    <h4 class="text-xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-2">Active Weights</h4>
+                    <p class="text-[10px] text-[#acabab] font-sans tracking-tight leading-relaxed opacity-60">
+                      Current values vs. defaults. Highlighted rows have been tuned by the optimizer.
+                    </p>
+                  </div>
+
+                  <div class="bg-[#131313] rounded-sm border border-[#474848]/10 shadow-inner overflow-hidden">
+                    <table class="w-full text-xs font-sans">
+                      <thead>
+                        <tr class="border-b border-[#474848]/10">
+                          <th class="text-left px-6 py-3 text-[10px] font-bold uppercase tracking-widest text-[#acabab] opacity-60">Signal</th>
+                          <th class="text-right px-6 py-3 text-[10px] font-bold uppercase tracking-widest text-[#acabab] opacity-60">Current</th>
+                          <th class="text-right px-6 py-3 text-[10px] font-bold uppercase tracking-widest text-[#acabab] opacity-60">Default</th>
+                          <th class="text-right px-6 py-3 text-[10px] font-bold uppercase tracking-widest text-[#acabab] opacity-60">Delta</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each [
+                          { label: 'Path FTS', key: 'WPathFTS' },
+                          { label: 'Path Prefix', key: 'WPathPrefix' },
+                          { label: 'Content FTS', key: 'WContentFTS' },
+                          { label: 'Semantic Text', key: 'WSemanticText' },
+                          { label: 'Semantic Image', key: 'WSemanticImg' },
+                          { label: 'Filename', key: 'WFilename' },
+                          { label: 'Recency', key: 'WRecency' },
+                        ] as row}
+                          {@const current = optimizerStatus.currentWeights[row.key] ?? 0}
+                          {@const def = optimizerStatus.defaultWeights[row.key] ?? 0}
+                          {@const delta = current - def}
+                          {@const changed = Math.abs(delta) > 0.001}
+                          <tr class="border-b border-[#474848]/5 {changed ? 'bg-[#bfc8ca]/5' : ''}">
+                            <td class="px-6 py-3 text-[#e7e5e5] {changed ? 'font-medium' : ''}">{row.label}</td>
+                            <td class="px-6 py-3 text-right font-mono text-[#bfc8ca]">{current.toFixed(1)}</td>
+                            <td class="px-6 py-3 text-right font-mono text-[#acabab] opacity-50">{def.toFixed(1)}</td>
+                            <td class="px-6 py-3 text-right font-mono {delta > 0 ? 'text-green-400' : delta < 0 ? 'text-red-400' : 'text-[#acabab] opacity-30'}">
+                              {changed ? (delta > 0 ? '+' : '') + delta.toFixed(1) : '--'}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              {/if}
+
+              <section class="p-6 bg-[#131313] border-l-2 border-[#bfc8ca] rounded-sm shadow-sm">
+                <h5 class="text-[#bfc8ca] text-[10px] font-bold uppercase tracking-widest mb-3">How It Works</h5>
+                <p class="text-[11px] font-sans text-[#acabab] leading-relaxed opacity-80">
+                  Every 15 seconds the optimizer runs a grid search over your recent feedback, simulating different weight combinations to find which one best predicts your preferences. When it finds a better set of weights, it applies them automatically. The more feedback you give, the more accurate your rankings become.
+                </p>
               </section>
             </div>
 

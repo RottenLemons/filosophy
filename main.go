@@ -1081,10 +1081,18 @@ func (a *App) Search(query string) ([]shared.SearchResult, error) {
 //   - score:    the fusion score shown to the user at that moment
 //   - feedback: +1, 0, or -1
 func (a *App) SubmitFeedback(query, path string, rank int, score float64, feedback int) error {
-	if a.engine == nil || a.engine.Feedback == nil {
+	if a.engine == nil {
 		return fmt.Errorf("engine not ready")
 	}
-	return a.engine.Feedback.Submit(a.sessionID, query, path, rank, score, feedback)
+	a.engine.SubmitFeedback(a.sessionID, query, path, rank, score, feedback)
+	return nil
+}
+
+func (a *App) GetOptimizerStatus() *shared.OptimizerStatus {
+	if a.engine == nil {
+		return nil
+	}
+	return a.engine.GetOptimizerStatus()
 }
 
 func (a *App) OpenFileNative(path string) error {

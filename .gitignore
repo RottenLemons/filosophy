@@ -81,3 +81,4 @@ tokenizer.json
 filosophy.log
 filosophy-app.pid
 filosophy-daemon.pid
+filosophy-config.json

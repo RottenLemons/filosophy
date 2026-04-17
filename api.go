@@ -271,15 +271,12 @@ func (s *APIServer) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	s.app.mu.Lock()
 	engine := s.app.engine
 	s.app.mu.Unlock()
-	if engine == nil || engine.Feedback == nil {
+	if engine == nil {
 		jsonError(w, "engine not ready", http.StatusServiceUnavailable)
 		return
 	}
 
-	if err := engine.Feedback.Submit(s.app.sessionID, req.Query, req.Path, req.Rank, req.Score, req.Feedback); err != nil {
-		jsonError(w, "failed to record feedback: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
+	engine.SubmitFeedback(s.app.sessionID, req.Query, req.Path, req.Rank, req.Score, req.Feedback)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

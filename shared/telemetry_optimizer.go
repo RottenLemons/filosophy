@@ -2,16 +2,34 @@ package shared
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"sort"
+	"sync"
 	"time"
 )
+
+// OptimizerStatus is the snapshot returned to the frontend so users can see
+// what the background optimizer is doing.
+type OptimizerStatus struct {
+	FeedbackCount  int            `json:"feedbackCount"`
+	LastRunAt      string         `json:"lastRunAt"`      // ISO-8601 or "" if never ran
+	LastAction     string         `json:"lastAction"`     // human-readable summary
+	CurrentWeights SearchWeights  `json:"currentWeights"`
+	DefaultWeights SearchWeights  `json:"defaultWeights"`
+	WeightDeltas   map[string]float64 `json:"weightDeltas"` // non-zero deltas from default
+}
 
 // TelemetryOptimizer periodically re-evaluates ranking parameters based on feedback.
 type TelemetryOptimizer struct {
 	engine *Engine
 	ctx    context.Context
+
+	mu             sync.RWMutex
+	lastRunAt      time.Time
+	lastAction     string
+	lastFeedbackN  int
 }
 
 // NewTelemetryOptimizer creates a background optimizer instance.
@@ -24,7 +42,40 @@ func NewTelemetryOptimizer(ctx context.Context, engine *Engine) *TelemetryOptimi
 
 // Start launches the optimizer's run loop in a background goroutine.
 func (o *TelemetryOptimizer) Start() {
+	o.engine.SetOptimizer(o)
 	go o.runLoop()
+}
+
+// Status returns a snapshot of the optimizer's last run for the UI.
+func (o *TelemetryOptimizer) Status() OptimizerStatus {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	current := o.engine.Weights.Get()
+	defaults := defaultWeights
+
+	deltas := make(map[string]float64)
+	if d := current.WPathFTS - defaults.WPathFTS; d != 0 { deltas["Path FTS"] = d }
+	if d := current.WContentFTS - defaults.WContentFTS; d != 0 { deltas["Content FTS"] = d }
+	if d := current.WSemanticText - defaults.WSemanticText; d != 0 { deltas["Semantic Text"] = d }
+	if d := current.WSemanticImg - defaults.WSemanticImg; d != 0 { deltas["Semantic Image"] = d }
+	if d := current.WPathPrefix - defaults.WPathPrefix; d != 0 { deltas["Path Prefix"] = d }
+	if d := current.WFilename - defaults.WFilename; d != 0 { deltas["Filename"] = d }
+	if d := current.WRecency - defaults.WRecency; d != 0 { deltas["Recency"] = d }
+
+	lastRun := ""
+	if !o.lastRunAt.IsZero() {
+		lastRun = o.lastRunAt.Format(time.RFC3339)
+	}
+
+	return OptimizerStatus{
+		FeedbackCount:  o.lastFeedbackN,
+		LastRunAt:      lastRun,
+		LastAction:     o.lastAction,
+		CurrentWeights: current,
+		DefaultWeights: defaults,
+		WeightDeltas:   deltas,
+	}
 }
 
 func (o *TelemetryOptimizer) runLoop() {
@@ -101,6 +152,11 @@ func (o *TelemetryOptimizer) optimize() {
 	}
 	if len(feedbacks) < 2 {
 		// Not enough telemetry data to perform a statistically meaningful optimization pass.
+		o.mu.Lock()
+		o.lastRunAt = time.Now()
+		o.lastFeedbackN = len(feedbacks)
+		o.lastAction = "Not enough feedback yet (need at least 2 votes)"
+		o.mu.Unlock()
 		return
 	}
 
@@ -245,10 +301,24 @@ func (o *TelemetryOptimizer) optimize() {
 		if err := tx.Commit(); err == nil {
 			log.Println("[Optimizer] Committing new weights to global WeightStore.")
 			o.engine.Weights.ForceReload()
+			o.mu.Lock()
+			o.lastRunAt = time.Now()
+			o.lastFeedbackN = len(feedbacks)
+			o.lastAction = fmt.Sprintf("Updated weights — Path: %.1f→%.1f, Content: %.1f→%.1f, Vector: %.1f→%.1f (score %.0f→%.0f)",
+				currentWeights.WPathFTS, bestWPath,
+				currentWeights.WContentFTS, bestWContent,
+				currentWeights.WSemanticText, bestWVec,
+				baselineScore, bestScore)
+			o.mu.Unlock()
 		} else {
 			log.Printf("[Optimizer] Failed to commit transactions: %v", err)
 		}
 	} else {
 		log.Println("[Optimizer] Grid search complete. Current weights are already optimal.")
+		o.mu.Lock()
+		o.lastRunAt = time.Now()
+		o.lastFeedbackN = len(feedbacks)
+		o.lastAction = fmt.Sprintf("No change needed — current weights are optimal (score %.0f, %d votes)", bestScore, len(feedbacks))
+		o.mu.Unlock()
 	}
 }

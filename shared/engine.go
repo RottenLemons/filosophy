@@ -119,8 +119,9 @@ type Engine struct {
 	writerWg          sync.WaitGroup
 
 	// Ranking infrastructure — initialised after InitIndexTables succeeds.
-	Weights  *WeightStore   // hot-reloaded ranking weights from search_config
-	Feedback *FeedbackStore // telemetry write path for thumbs up/down
+	Weights   *WeightStore          // hot-reloaded ranking weights from search_config
+	Feedback  *FeedbackStore        // telemetry write path for thumbs up/down
+	optimizer *TelemetryOptimizer   // set by optimizer.Start(); nil until then
 
 	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
 	Hardware HardwareConfig
@@ -137,6 +138,7 @@ const (
 	OpDeletePaths
 	OpRenamePaths
 	OpResetContentIndex
+	OpSubmitFeedback
 	OpFlush
 )
 
@@ -154,6 +156,14 @@ type WriteOperation struct {
 	OldPaths   []string
 	NewPaths   []string
 	Done       chan struct{}
+
+	// Feedback fields (OpSubmitFeedback)
+	FeedbackSessionID string
+	FeedbackQuery     string
+	FeedbackPath      string
+	FeedbackRank      int
+	FeedbackScore     float64
+	FeedbackValue     int
 }
 
 // New initializes the Engine with the given database path and ONNX model paths.
@@ -574,6 +584,13 @@ func (s *Engine) runWriter() {
 			case OpResetContentIndex:
 				tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`)
 				tx.ExecContext(ctx, `DELETE FROM paths_fts`)
+
+			case OpSubmitFeedback:
+				tx.ExecContext(ctx, `INSERT INTO search_feedback
+					(session_id, query, result_path, result_rank, result_score, feedback, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					op.FeedbackSessionID, op.FeedbackQuery, op.FeedbackPath,
+					op.FeedbackRank, op.FeedbackScore, op.FeedbackValue, time.Now().Unix())
 			}
 		}
 
@@ -617,6 +634,35 @@ func (s *Engine) runWriter() {
 		case <-ticker.C:
 			flush()
 		}
+	}
+}
+
+// SetOptimizer stores a reference to the running TelemetryOptimizer so the
+// app layer can query its status.
+func (s *Engine) SetOptimizer(o *TelemetryOptimizer) { s.optimizer = o }
+
+// GetOptimizerStatus returns the optimizer's last-run snapshot, or nil if
+// the optimizer hasn't been started yet.
+func (s *Engine) GetOptimizerStatus() *OptimizerStatus {
+	if s.optimizer == nil {
+		return nil
+	}
+	st := s.optimizer.Status()
+	return &st
+}
+
+// SubmitFeedback routes a feedback write through the serialized write channel
+// so it never contends with indexing transactions for the SQLite write lock.
+func (s *Engine) SubmitFeedback(sessionID, query, path string, rank int, score float64, feedback int) {
+	log.Printf("[Feedback] Submitting vote %d for '%s' (query: %q, rank: %d, score: %.3f)", feedback, path, query, rank, score)
+	s.writeChan <- WriteOperation{
+		Op:                OpSubmitFeedback,
+		FeedbackSessionID: sessionID,
+		FeedbackQuery:     query,
+		FeedbackPath:      path,
+		FeedbackRank:      rank,
+		FeedbackScore:     score,
+		FeedbackValue:     feedback,
 	}
 }
 
