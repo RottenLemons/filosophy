@@ -1772,11 +1772,13 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 			s.addPathFTSAllWords(ctx, query, m, w.WPathFTS*4.0/3.0) // all-word gets 33% more than exact
 			s.addPathFTSPrefixScores(ctx, query, m, w.WPathPrefix)
 			s.addPathFTSShortPrefixScores(ctx, query, m, w.WPathPrefix*2.0/3.0)
+			s.addPathSubstringScores(ctx, query, m, w.WPathPrefix*0.5)
 		} else {
 			s.addPathFTSScores(ctx, query, m, 3.0)
 			s.addPathFTSAllWords(ctx, query, m, 4.0)
 			s.addPathFTSPrefixScores(ctx, query, m, 1.5)
 			s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
+			s.addPathSubstringScores(ctx, query, m, 0.75)
 		}
 		sigCh <- m
 	}()
@@ -1846,7 +1848,9 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 
 	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
-	// In the new pipeline the filename multiplier comes from search_config.
+	// Track the filename-boost delta per path so the path-only cap can exempt
+	// files that genuinely matched the query by name (images, WhatsApp chats, etc).
+	filenameDeltas := make(map[string]float64, len(scores))
 	if w.UseNewPipeline && w.WFilename != 1.0 {
 		// Capture pre-boost scores to compute the delta, then scale the delta.
 		pre := make(map[string]float64, len(scores))
@@ -1857,22 +1861,37 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		addFuzzyPathBoosts(query, scores)
 		for p, post := range scores {
 			delta := post - pre[p]
+			filenameDeltas[p] = delta * w.WFilename
 			scores[p] = pre[p] + delta*w.WFilename
 		}
 	} else {
+		pre := make(map[string]float64, len(scores))
+		for p, v := range scores {
+			pre[p] = v
+		}
 		addFilenameBoosts(query, scores)
 		addFuzzyPathBoosts(query, scores)
+		for p, post := range scores {
+			filenameDeltas[p] = post - pre[p]
+		}
 	}
 
 	// Cap path-only results. Any path with zero content signal (no vector hit,
 	// no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
-	// Cap these so they can never beat a real content match.
+	// Cap these so they can never beat a real content match — BUT exempt paths
+	// that got a strong filename match (e.g. images, WhatsApp chats). These files
+	// have no text content to generate a content signal, yet the user clearly
+	// searched for them by name.
 	pathOnlyScoreCap := 0.12
 	if w.UseNewPipeline {
 		pathOnlyScoreCap = w.PathOnlyCap
 	}
 	for path, score := range scores {
 		if _, hasContent := contentScores[path]; !hasContent && score > pathOnlyScoreCap {
+			// If filename matching contributed significantly, don't suppress.
+			if filenameDeltas[path] >= filenamePrefixBoost {
+				continue
+			}
 			scores[path] = pathOnlyScoreCap
 		}
 	}
@@ -2234,6 +2253,51 @@ func (s *Engine) addPathFTSShortPrefixScores(ctx context.Context, query string, 
 		"SELECT path FROM paths_fts WHERE paths_fts MATCH ? ORDER BY rank LIMIT 20", ftsQuery)
 	if err != nil {
 		log.Printf("paths_fts short-prefix search warning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	rankPos := 1
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		scores[path] += boost / (rrfK + float64(rankPos))
+		rankPos++
+	}
+}
+
+// addPathSubstringScores uses a plain SQL LIKE query on the files table to find
+// paths that contain query words as substrings anywhere in the filename. This
+// catches cases FTS5 misses: searching "cv" matches "mahircv.pdf" because FTS5
+// only tokenizes on word boundaries and cannot find infix matches.
+func (s *Engine) addPathSubstringScores(ctx context.Context, query string, scores map[string]float64, boost float64) {
+	words := strings.Fields(strings.ToLower(query))
+	if len(words) == 0 {
+		return
+	}
+	// Build: WHERE (LOWER(path) LIKE '%word1%' OR LOWER(path) LIKE '%word2%')
+	var clauses []string
+	var args []any
+	for _, w := range words {
+		if len(w) < 2 {
+			continue
+		}
+		// Escape LIKE wildcards in the search term itself
+		escaped := strings.ReplaceAll(w, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `%`, `\%`)
+		escaped = strings.ReplaceAll(escaped, `_`, `\_`)
+		clauses = append(clauses, "LOWER(path) LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escaped+"%")
+	}
+	if len(clauses) == 0 {
+		return
+	}
+	sql := "SELECT path FROM files WHERE (" + strings.Join(clauses, " OR ") + ") LIMIT 30"
+	rows, err := s.sqlDB.QueryContext(ctx, sql, args...)
+	if err != nil {
+		log.Printf("path substring search warning: %v", err)
 		return
 	}
 	defer rows.Close()

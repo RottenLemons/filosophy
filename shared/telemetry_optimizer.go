@@ -105,8 +105,13 @@ func (o *TelemetryOptimizer) runLoop() {
 type feedbackRow struct {
 	Query      string
 	ResultPath string
-	Feedback   int // +1 or -1
+	Feedback   int     // +1 or -1
+	Weight     float64 // time-decay weight (1.0 = most recent, decays toward 0)
 }
+
+// feedbackDecayHalfLife controls how quickly old feedback loses influence.
+// A vote 7 days old has ~50% the weight of a brand new vote.
+const feedbackDecayHalfLifeDays = 7.0
 
 func (o *TelemetryOptimizer) optimize() {
 	db := o.engine.GetSQLDB()
@@ -114,13 +119,14 @@ func (o *TelemetryOptimizer) optimize() {
 		return
 	}
 
-	// 1. Fetch the last 2000 feedback rows to ensure we get a sufficient slice of the rolling window.
-	// We read ALL votes (including 0 "resets") so we can accurately deduplicate them chronologically.
+	now := time.Now().Unix()
+
+	// 1. Fetch ALL feedback rows with timestamps. We apply exponential decay
+	// so old lessons fade gradually instead of falling off a hard window.
 	rows, err := db.QueryContext(o.ctx, `
-		SELECT query, result_path, feedback 
-		FROM search_feedback 
-		ORDER BY created_at DESC 
-		LIMIT 2000
+		SELECT query, result_path, feedback, created_at
+		FROM search_feedback
+		ORDER BY created_at DESC
 	`)
 	if err != nil {
 		log.Printf("[Optimizer] Failed to read feedback telemetry: %v", err)
@@ -130,25 +136,42 @@ func (o *TelemetryOptimizer) optimize() {
 
 	var feedbacks []feedbackRow
 	seen := make(map[string]bool)
+	decayLambda := math.Ln2 / (feedbackDecayHalfLifeDays * 86400) // per-second decay rate
 
 	for rows.Next() {
-		var f feedbackRow
-		if err := rows.Scan(&f.Query, &f.ResultPath, &f.Feedback); err == nil {
-			// Deduplicate: the SQL query orders by created_at DESC, so the first time 
-			// we see a query+path combo, it is guaranteed to be the most recent action.
-			key := f.Query + "|" + f.ResultPath
-			if !seen[key] {
-				seen[key] = true
-				if f.Feedback != 0 {
-					feedbacks = append(feedbacks, f)
-				}
-			}
-
-			// Bound the grid search computationally to the exact 500 most recent valid events
-			if len(feedbacks) >= 500 {
-				break
-			}
+		var query, path string
+		var feedback int
+		var createdAt int64
+		if err := rows.Scan(&query, &path, &feedback, &createdAt); err != nil {
+			continue
 		}
+		// Deduplicate: ORDER BY created_at DESC means first occurrence is most recent.
+		key := query + "|" + path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if feedback == 0 {
+			continue
+		}
+
+		ageSec := float64(now - createdAt)
+		if ageSec < 0 {
+			ageSec = 0
+		}
+		w := math.Exp(-decayLambda * ageSec)
+
+		// Skip votes that have decayed below 1% — they contribute noise, not signal.
+		if w < 0.01 {
+			continue
+		}
+
+		feedbacks = append(feedbacks, feedbackRow{
+			Query:      query,
+			ResultPath: path,
+			Feedback:   feedback,
+			Weight:     w,
+		})
 	}
 	if len(feedbacks) < 2 {
 		// Not enough telemetry data to perform a statistically meaningful optimization pass.
@@ -232,15 +255,15 @@ func (o *TelemetryOptimizer) optimize() {
 
 					if rank > 0 {
 						if f.Feedback == 1 {
-							score += 100.0 / float64(rank)
+							score += f.Weight * 100.0 / float64(rank)
 						} else if f.Feedback == -1 {
-							score -= 100.0 / float64(rank)
+							score -= f.Weight * 100.0 / float64(rank)
 						}
 					} else {
 						if f.Feedback == 1 {
-							score -= 10.0 // penalty for losing a liked document
+							score -= f.Weight * 10.0 // penalty for losing a liked document
 						} else {
-							score += 10.0 // reward for burying a disliked document
+							score += f.Weight * 10.0 // reward for burying a disliked document
 						}
 					}
 				}
