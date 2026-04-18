@@ -88,8 +88,8 @@ func (o *TelemetryOptimizer) runLoop() {
 
 	o.optimize()
 
-	// Trigger periodically. For active testing, we will run it every 15 seconds.
-	ticker := time.NewTicker(15 * time.Second)
+	// Trigger periodically. For calibration, we run it every 10 minutes.
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -119,8 +119,6 @@ func (o *TelemetryOptimizer) optimize() {
 		return
 	}
 
-	now := time.Now().Unix()
-
 	// 1. Fetch ALL feedback rows with timestamps. We apply exponential decay
 	// so old lessons fade gradually instead of falling off a hard window.
 	rows, err := db.QueryContext(o.ctx, `
@@ -136,8 +134,6 @@ func (o *TelemetryOptimizer) optimize() {
 
 	var feedbacks []feedbackRow
 	seen := make(map[string]bool)
-	decayLambda := math.Ln2 / (feedbackDecayHalfLifeDays * 86400) // per-second decay rate
-
 	for rows.Next() {
 		var query, path string
 		var feedback int
@@ -155,16 +151,8 @@ func (o *TelemetryOptimizer) optimize() {
 			continue
 		}
 
-		ageSec := float64(now - createdAt)
-		if ageSec < 0 {
-			ageSec = 0
-		}
-		w := math.Exp(-decayLambda * ageSec)
-
-		// Skip votes that have decayed below 1% — they contribute noise, not signal.
-		if w < 0.01 {
-			continue
-		}
+		// Calibration: treat all votes as ground truth with equal weight (no time decay).
+		w := 1.0
 
 		feedbacks = append(feedbacks, feedbackRow{
 			Query:      query,
@@ -173,12 +161,12 @@ func (o *TelemetryOptimizer) optimize() {
 			Weight:     w,
 		})
 	}
-	if len(feedbacks) < 2 {
+	if len(feedbacks) < 10 {
 		// Not enough telemetry data to perform a statistically meaningful optimization pass.
 		o.mu.Lock()
 		o.lastRunAt = time.Now()
 		o.lastFeedbackN = len(feedbacks)
-		o.lastAction = "Not enough feedback yet (need at least 2 votes)"
+		o.lastAction = "Not enough feedback yet (need at least 10 votes)"
 		o.mu.Unlock()
 		return
 	}
@@ -202,8 +190,9 @@ func (o *TelemetryOptimizer) optimize() {
 		}
 	}
 
-	// 3. The Objective Function (Bounded Grid Search)
-	factors := []float64{0.5, 1.0, 1.5, 2.0, 3.0}
+	// 3. The Objective Function (Bounded Relative Grid Search)
+	// Factors are relative multipliers centered on the current weights.
+	factors := []float64{0.7, 0.9, 1.0, 1.1, 1.3}
 
 	bestScore := math.Inf(-1)
 	baselineScore := math.Inf(-1)
@@ -211,9 +200,13 @@ func (o *TelemetryOptimizer) optimize() {
 	currentWeights := o.engine.Weights.Get()
 
 	// 5x5x5 grid = 125 total iterations over purely in-memory maps.
-	for _, wPath := range factors {
-		for _, wContent := range factors {
-			for _, wVec := range factors {
+	for _, fPath := range factors {
+		for _, fContent := range factors {
+			for _, fVec := range factors {
+
+				wPath := currentWeights.WPathFTS * fPath
+				wContent := currentWeights.WContentFTS * fContent
+				wVec := currentWeights.WSemanticText * fVec
 
 				score := 0.0
 
@@ -268,8 +261,8 @@ func (o *TelemetryOptimizer) optimize() {
 					}
 				}
 
-				// Capture the baseline score for logging comparisons
-				if wPath == currentWeights.WPathFTS && wContent == currentWeights.WContentFTS && wVec == currentWeights.WSemanticText {
+				// Capture the baseline score for logging comparisons (multiplier 1.0)
+				if fPath == 1.0 && fContent == 1.0 && fVec == 1.0 {
 					baselineScore = score
 				}
 

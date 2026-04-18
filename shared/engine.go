@@ -120,7 +120,6 @@ type Engine struct {
 
 	// Ranking infrastructure — initialised after InitIndexTables succeeds.
 	Weights   *WeightStore          // hot-reloaded ranking weights from search_config
-	Feedback  *FeedbackStore        // telemetry write path for thumbs up/down
 	optimizer *TelemetryOptimizer   // set by optimizer.Start(); nil until then
 
 	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
@@ -1451,9 +1450,6 @@ func (s *Engine) InitIndexTables() error {
 	if s.Weights == nil {
 		s.Weights = NewWeightStore(s.sqlDB)
 	}
-	if s.Feedback == nil {
-		s.Feedback = NewFeedbackStore(s.sqlDB)
-	}
 
 	// Probe atime availability in the background so it doesn't delay startup.
 	go CheckAtimeEnabled(s.sqlDB)
@@ -1625,30 +1621,16 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 	contentSignals = make(map[string]float64)
 	vectorSignals = make(map[string]float64)
 
+	var textQueryVec []float32
 	textEmbs, err := s.embedText([]string{qText})
-	if err != nil {
-		return
-	}
-	textQueryVec := textEmbs[0]
-
-	var imageQueryVec []float32
-	clipEmbs, err := s.embedClipText([]string{qText})
 	if err == nil {
-		imageQueryVec = clipEmbs[0]
+		textQueryVec = textEmbs[0]
 	}
 
 	textResults, _ := s.db.Search(ctx, textQueryVec, core.SearchOptions{
 		Collection: textCollection,
 		TopK:       200,
 	})
-
-	var imageResults []core.ScoredEmbedding
-	if imageQueryVec != nil {
-		imageResults, _ = s.db.Search(ctx, imageQueryVec, core.SearchOptions{
-			Collection: imageCollection,
-			TopK:       50,
-		})
-	}
 
 	var sigWg sync.WaitGroup
 	var mu sync.Mutex
@@ -1658,9 +1640,9 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 		defer sigWg.Done()
 		m := make(map[string]float64)
 		s.addPathFTSScores(ctx, qText, m, 1.0)
-		s.addPathFTSAllWords(ctx, qText, m, 4.0/3.0)
+		s.addPathFTSAllWords(ctx, qText, m, 1.0)
 		s.addPathFTSPrefixScores(ctx, qText, m, 1.0)
-		s.addPathFTSShortPrefixScores(ctx, qText, m, 2.0/3.0)
+		s.addPathFTSShortPrefixScores(ctx, qText, m, 1.0)
 		mu.Lock()
 		for p, v := range m {
 			pathSignals[p] = v
@@ -1690,9 +1672,6 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 		m := make(map[string]float64)
 		k := rrfK
 		for i, res := range textResults {
-			m[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
-		}
-		for i, res := range imageResults {
 			m[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
 		}
 		mu.Lock()
