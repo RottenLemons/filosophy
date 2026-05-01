@@ -13,12 +13,18 @@ import (
 // OptimizerStatus is the snapshot returned to the frontend so users can see
 // what the background optimizer is doing.
 type OptimizerStatus struct {
-	FeedbackCount  int            `json:"feedbackCount"`
-	LastRunAt      string         `json:"lastRunAt"`      // ISO-8601 or "" if never ran
-	LastAction     string         `json:"lastAction"`     // human-readable summary
-	CurrentWeights SearchWeights  `json:"currentWeights"`
-	DefaultWeights SearchWeights  `json:"defaultWeights"`
-	WeightDeltas   map[string]float64 `json:"weightDeltas"` // non-zero deltas from default
+	FeedbackCount   int                `json:"feedbackCount"`
+	LastRunAt       string             `json:"lastRunAt"`  // ISO-8601 or "" if never ran
+	LastAction      string             `json:"lastAction"` // human-readable summary
+	PreferenceScore float64            `json:"preferenceScore"`
+	BaselineScore   float64            `json:"baselineScore"`
+	NDCG10          float64            `json:"ndcg10"`
+	MRR10           float64            `json:"mrr10"`
+	RecallAtRerank  float64            `json:"recallAtRerank"`
+	DownvotePenalty float64            `json:"downvotePenalty"`
+	CurrentWeights  SearchWeights      `json:"currentWeights"`
+	DefaultWeights  SearchWeights      `json:"defaultWeights"`
+	WeightDeltas    map[string]float64 `json:"weightDeltas"` // non-zero deltas from default
 }
 
 // TelemetryOptimizer periodically re-evaluates ranking parameters based on feedback.
@@ -26,10 +32,11 @@ type TelemetryOptimizer struct {
 	engine *Engine
 	ctx    context.Context
 
-	mu             sync.RWMutex
-	lastRunAt      time.Time
-	lastAction     string
-	lastFeedbackN  int
+	mu            sync.RWMutex
+	lastRunAt     time.Time
+	lastAction    string
+	lastFeedbackN int
+	lastMetrics   optimizerMetrics
 }
 
 // NewTelemetryOptimizer creates a background optimizer instance.
@@ -55,13 +62,30 @@ func (o *TelemetryOptimizer) Status() OptimizerStatus {
 	defaults := defaultWeights
 
 	deltas := make(map[string]float64)
-	if d := current.WPathFTS - defaults.WPathFTS; d != 0 { deltas["Path FTS"] = d }
-	if d := current.WContentFTS - defaults.WContentFTS; d != 0 { deltas["Content FTS"] = d }
-	if d := current.WSemanticText - defaults.WSemanticText; d != 0 { deltas["Semantic Text"] = d }
-	if d := current.WSemanticImg - defaults.WSemanticImg; d != 0 { deltas["Semantic Image"] = d }
-	if d := current.WPathPrefix - defaults.WPathPrefix; d != 0 { deltas["Path Prefix"] = d }
-	if d := current.WFilename - defaults.WFilename; d != 0 { deltas["Filename"] = d }
-	if d := current.WRecency - defaults.WRecency; d != 0 { deltas["Recency"] = d }
+	if d := current.WPathFTS - defaults.WPathFTS; d != 0 {
+		deltas["Path FTS"] = d
+	}
+	if d := current.WContentFTS - defaults.WContentFTS; d != 0 {
+		deltas["Content FTS"] = d
+	}
+	if d := current.WSemanticText - defaults.WSemanticText; d != 0 {
+		deltas["Semantic Text"] = d
+	}
+	if d := current.WSemanticImg - defaults.WSemanticImg; d != 0 {
+		deltas["Semantic Image"] = d
+	}
+	if d := current.WPathPrefix - defaults.WPathPrefix; d != 0 {
+		deltas["Path Prefix"] = d
+	}
+	if d := current.WFilename - defaults.WFilename; d != 0 {
+		deltas["Filename"] = d
+	}
+	if d := current.WRecency - defaults.WRecency; d != 0 {
+		deltas["Recency"] = d
+	}
+	if d := current.WRerankerBlend - defaults.WRerankerBlend; d != 0 {
+		deltas["Reranker Blend"] = d
+	}
 
 	lastRun := ""
 	if !o.lastRunAt.IsZero() {
@@ -69,12 +93,18 @@ func (o *TelemetryOptimizer) Status() OptimizerStatus {
 	}
 
 	return OptimizerStatus{
-		FeedbackCount:  o.lastFeedbackN,
-		LastRunAt:      lastRun,
-		LastAction:     o.lastAction,
-		CurrentWeights: current,
-		DefaultWeights: defaults,
-		WeightDeltas:   deltas,
+		FeedbackCount:   o.lastFeedbackN,
+		LastRunAt:       lastRun,
+		LastAction:      o.lastAction,
+		PreferenceScore: o.lastMetrics.Score * 100,
+		BaselineScore:   o.lastMetrics.BaselineScore * 100,
+		NDCG10:          o.lastMetrics.NDCG10,
+		MRR10:           o.lastMetrics.MRR10,
+		RecallAtRerank:  o.lastMetrics.RecallAtRerank,
+		DownvotePenalty: o.lastMetrics.DownvotePenalty,
+		CurrentWeights:  current,
+		DefaultWeights:  defaults,
+		WeightDeltas:    deltas,
 	}
 }
 
@@ -109,9 +139,194 @@ type feedbackRow struct {
 	Weight     float64 // time-decay weight (1.0 = most recent, decays toward 0)
 }
 
+type docScore struct {
+	Path  string
+	Score float64
+}
+
+type optimizerMetrics struct {
+	Score           float64
+	BaselineScore   float64
+	NDCG10          float64
+	MRR10           float64
+	RecallAtRerank  float64
+	DownvotePenalty float64
+}
+
 // feedbackDecayHalfLife controls how quickly old feedback loses influence.
 // A vote 7 days old has ~50% the weight of a brand new vote.
 const feedbackDecayHalfLifeDays = 7.0
+
+const (
+	preferenceEvalK       = 10
+	relevantGain          = 3.0
+	ndcgObjectiveWeight   = 0.45
+	mrrObjectiveWeight    = 0.30
+	recallObjectiveWeight = 0.20
+	downvotePenaltyWeight = 1.25
+)
+
+func groupFeedbackByQuery(feedbacks []feedbackRow) map[string][]feedbackRow {
+	grouped := make(map[string][]feedbackRow)
+	for _, f := range feedbacks {
+		grouped[f.Query] = append(grouped[f.Query], f)
+	}
+	return grouped
+}
+
+func rankWeightedSignals(sigs RawSearchSignals, w SearchWeights) []docScore {
+	combined := make(map[string]float64)
+	for p, v := range sigs.PathFTS {
+		combined[p] += v * w.WPathFTS
+	}
+	for p, v := range sigs.PathPrefix {
+		combined[p] += v * w.WPathPrefix
+	}
+	for p, v := range sigs.ContentFTS {
+		combined[p] += v * w.WContentFTS
+	}
+	for p, v := range sigs.SemanticText {
+		combined[p] += v * w.WSemanticText
+	}
+	for p, v := range sigs.SemanticImage {
+		combined[p] += v * w.WSemanticImg
+	}
+
+	maxCombined := 1e-9
+	for _, score := range combined {
+		if score > maxCombined {
+			maxCombined = score
+		}
+	}
+	blend := w.WRerankerBlend
+	if blend < 0 {
+		blend = 0
+	}
+	if blend > 1 {
+		blend = 1
+	}
+	if blend > 0 && len(sigs.Reranker) > 0 {
+		for p, score := range combined {
+			rrfNorm := score / maxCombined
+			if rerankerScore, ok := sigs.Reranker[p]; ok {
+				combined[p] = blend*rerankerScore + (1-blend)*rrfNorm
+			} else {
+				combined[p] = (1 - blend) * rrfNorm
+			}
+		}
+	}
+
+	docs := make([]docScore, 0, len(combined))
+	for p, s := range combined {
+		docs = append(docs, docScore{Path: p, Score: s})
+	}
+	sort.Slice(docs, func(i, j int) bool {
+		return docs[i].Score > docs[j].Score
+	})
+	return docs
+}
+
+func evaluatePreferenceMetrics(grouped map[string][]feedbackRow, queryCache map[string]RawSearchSignals, w SearchWeights) optimizerMetrics {
+	rerankTopN := w.RerankTopN
+	if rerankTopN <= 0 {
+		rerankTopN = rerankerTopN
+	}
+
+	totalWeight := 0.0
+	out := optimizerMetrics{}
+
+	for query, judgments := range grouped {
+		docs := rankWeightedSignals(queryCache[query], w)
+		rankByPath := make(map[string]int, len(docs))
+		for i, d := range docs {
+			rankByPath[d.Path] = i + 1
+		}
+
+		queryWeight := 0.0
+		var positives []feedbackRow
+		var negatives []feedbackRow
+		for _, j := range judgments {
+			queryWeight += j.Weight
+			if j.Feedback > 0 {
+				positives = append(positives, j)
+			} else if j.Feedback < 0 {
+				negatives = append(negatives, j)
+			}
+		}
+		if queryWeight <= 0 {
+			queryWeight = 1
+		}
+
+		ndcg10 := 0.0
+		mrr10 := 0.0
+		recallAtRerank := 0.0
+		if len(positives) > 0 {
+			dcg := 0.0
+			firstPositiveRank := 0
+			recalled := 0
+			for _, p := range positives {
+				rank := rankByPath[p.ResultPath]
+				if rank == 0 {
+					continue
+				}
+				if rank <= preferenceEvalK {
+					dcg += (math.Pow(2, relevantGain) - 1) / math.Log2(float64(rank+1))
+					if firstPositiveRank == 0 || rank < firstPositiveRank {
+						firstPositiveRank = rank
+					}
+				}
+				if rank <= rerankTopN {
+					recalled++
+				}
+			}
+
+			idcg := 0.0
+			idealN := len(positives)
+			if idealN > preferenceEvalK {
+				idealN = preferenceEvalK
+			}
+			for i := 1; i <= idealN; i++ {
+				idcg += (math.Pow(2, relevantGain) - 1) / math.Log2(float64(i+1))
+			}
+			if idcg > 0 {
+				ndcg10 = dcg / idcg
+			}
+			if firstPositiveRank > 0 {
+				mrr10 = 1.0 / float64(firstPositiveRank)
+			}
+			recallAtRerank = float64(recalled) / float64(len(positives))
+		}
+
+		downvotePenalty := 0.0
+		for _, n := range negatives {
+			rank := rankByPath[n.ResultPath]
+			if rank > 0 && rank <= preferenceEvalK {
+				downvotePenalty += 1.0 / math.Log2(float64(rank+1))
+			}
+		}
+
+		score := ndcgObjectiveWeight*ndcg10 +
+			mrrObjectiveWeight*mrr10 +
+			recallObjectiveWeight*recallAtRerank -
+			downvotePenaltyWeight*downvotePenalty
+
+		out.Score += score * queryWeight
+		out.NDCG10 += ndcg10 * queryWeight
+		out.MRR10 += mrr10 * queryWeight
+		out.RecallAtRerank += recallAtRerank * queryWeight
+		out.DownvotePenalty += downvotePenalty * queryWeight
+		totalWeight += queryWeight
+	}
+
+	if totalWeight > 0 {
+		out.Score /= totalWeight
+		out.NDCG10 /= totalWeight
+		out.MRR10 /= totalWeight
+		out.RecallAtRerank /= totalWeight
+		out.DownvotePenalty /= totalWeight
+	}
+	return out
+}
 
 func (o *TelemetryOptimizer) optimize() {
 	db := o.engine.GetSQLDB()
@@ -166,6 +381,7 @@ func (o *TelemetryOptimizer) optimize() {
 		o.mu.Lock()
 		o.lastRunAt = time.Now()
 		o.lastFeedbackN = len(feedbacks)
+		o.lastMetrics = optimizerMetrics{}
 		o.lastAction = "Not enough feedback yet (need at least 10 votes)"
 		o.mu.Unlock()
 		return
@@ -174,118 +390,99 @@ func (o *TelemetryOptimizer) optimize() {
 	log.Printf("[Optimizer] Starting bounded grid search on last %d feedback events...", len(feedbacks))
 
 	// 2. Extract Raw Signals into Memory.
-	// We only run GetRawSignals ONCE per unique query to avoid hitting ONNX 
-	// multiple times during the grid search loop. 
-	type signalsCache struct {
-		Path    map[string]float64
-		Content map[string]float64
-		Vector  map[string]float64
-	}
-	queryCache := make(map[string]signalsCache)
+	// We only run GetRawSignals ONCE per unique query to avoid hitting ONNX
+	// multiple times during the grid search loop.
+	queryCache := make(map[string]RawSearchSignals)
 
 	for _, f := range feedbacks {
 		if _, exists := queryCache[f.Query]; !exists {
-			p, c, v := o.engine.GetRawSignals(f.Query)
-			queryCache[f.Query] = signalsCache{Path: p, Content: c, Vector: v}
+			queryCache[f.Query] = o.engine.GetRawSignals(f.Query)
 		}
 	}
+	groupedFeedback := groupFeedbackByQuery(feedbacks)
 
 	// 3. The Objective Function (Bounded Relative Grid Search)
 	// Factors are relative multipliers centered on the current weights.
 	factors := []float64{0.7, 0.9, 1.0, 1.1, 1.3}
+	blendFactors := []float64{-0.15, 0.0, 0.15}
 
 	bestScore := math.Inf(-1)
 	baselineScore := math.Inf(-1)
-	var bestWPath, bestWContent, bestWVec float64
+	var bestMetrics optimizerMetrics
+	var baselineMetrics optimizerMetrics
+	var bestWeights SearchWeights
 	currentWeights := o.engine.Weights.Get()
+	bestWeights = currentWeights
 
-	// 5x5x5 grid = 125 total iterations over purely in-memory maps.
+	// 5^5 * 3 grid = 9375 total iterations over purely in-memory maps.
 	for _, fPath := range factors {
-		for _, fContent := range factors {
-			for _, fVec := range factors {
+		for _, fPrefix := range factors {
+			for _, fContent := range factors {
+				for _, fText := range factors {
+					for _, fImage := range factors {
+						for _, blendDelta := range blendFactors {
+							candidate := currentWeights
+							candidate.WPathFTS *= fPath
+							candidate.WPathPrefix *= fPrefix
+							candidate.WContentFTS *= fContent
+							candidate.WSemanticText *= fText
+							candidate.WSemanticImg *= fImage
+							candidate.WRerankerBlend += blendDelta
+							if candidate.WRerankerBlend < 0 {
+								candidate.WRerankerBlend = 0
+							}
+							if candidate.WRerankerBlend > 1 {
+								candidate.WRerankerBlend = 1
+							}
 
-				wPath := currentWeights.WPathFTS * fPath
-				wContent := currentWeights.WContentFTS * fContent
-				wVec := currentWeights.WSemanticText * fVec
+							metrics := evaluatePreferenceMetrics(groupedFeedback, queryCache, candidate)
+							score := metrics.Score
 
-				score := 0.0
+							// Capture the baseline score for logging comparisons.
+							if fPath == 1.0 && fPrefix == 1.0 && fContent == 1.0 && fText == 1.0 && fImage == 1.0 && blendDelta == 0.0 {
+								baselineScore = score
+								baselineMetrics = metrics
+							}
 
-				for _, f := range feedbacks {
-					sigs := queryCache[f.Query]
-
-					// Simulate RRF math using current weights
-					combined := make(map[string]float64)
-					for p, v := range sigs.Path {
-						combined[p] += v * wPath
-					}
-					for p, v := range sigs.Content {
-						combined[p] += v * wContent
-					}
-					for p, v := range sigs.Vector {
-						combined[p] += v * wVec
-					}
-
-					// Convert to slice and sort to find simulated rank position
-					type docScore struct {
-						Path  string
-						Score float64
-					}
-					docs := make([]docScore, 0, len(combined))
-					for p, s := range combined {
-						docs = append(docs, docScore{Path: p, Score: s})
-					}
-					sort.Slice(docs, func(i, j int) bool {
-						return docs[i].Score > docs[j].Score
-					})
-
-					rank := -1
-					for i, d := range docs {
-						if d.Path == f.ResultPath {
-							rank = i + 1
-							break
+							if score > bestScore {
+								bestScore = score
+								bestMetrics = metrics
+								bestWeights = candidate
+							}
 						}
 					}
-
-					if rank > 0 {
-						if f.Feedback == 1 {
-							score += f.Weight * 100.0 / float64(rank)
-						} else if f.Feedback == -1 {
-							score -= f.Weight * 100.0 / float64(rank)
-						}
-					} else {
-						if f.Feedback == 1 {
-							score -= f.Weight * 10.0 // penalty for losing a liked document
-						} else {
-							score += f.Weight * 10.0 // reward for burying a disliked document
-						}
-					}
-				}
-
-				// Capture the baseline score for logging comparisons (multiplier 1.0)
-				if fPath == 1.0 && fContent == 1.0 && fVec == 1.0 {
-					baselineScore = score
-				}
-
-				if score > bestScore {
-					bestScore = score
-					bestWPath = wPath
-					bestWContent = wContent
-					bestWVec = wVec
 				}
 			}
 		}
 	}
+	bestMetrics.BaselineScore = baselineMetrics.Score
 
-	log.Printf("[Optimizer] Grid search evaluated. Baseline Score: %.2f (Path: %.1f, Content: %.1f, Vector: %.1f)", baselineScore, currentWeights.WPathFTS, currentWeights.WContentFTS, currentWeights.WSemanticText)
+	log.Printf("[Optimizer] Grid search evaluated. Baseline Preference Score: %.1f (Path: %.1f, Prefix: %.1f, Content: %.1f, Text: %.1f, Image: %.1f, Blend: %.2f)",
+		baselineScore*100,
+		currentWeights.WPathFTS,
+		currentWeights.WPathPrefix,
+		currentWeights.WContentFTS,
+		currentWeights.WSemanticText,
+		currentWeights.WSemanticImg,
+		currentWeights.WRerankerBlend,
+	)
 
 	// 4. Atomic Updates.
 	// Check if grid search found a fundamentally different, strictly superior tuning.
-	if bestWPath != currentWeights.WPathFTS || bestWContent != currentWeights.WContentFTS || bestWVec != currentWeights.WSemanticText {
-		log.Printf("[Optimizer] Applying New Weights! Score improved to %.2f. Deltas:", bestScore)
-		log.Printf("[Optimizer]   WPathFTS:      %.1f -> %.1f", currentWeights.WPathFTS, bestWPath)
-		log.Printf("[Optimizer]   WContentFTS:   %.1f -> %.1f", currentWeights.WContentFTS, bestWContent)
-		log.Printf("[Optimizer]   WSemanticText: %.1f -> %.1f", currentWeights.WSemanticText, bestWVec)
-		
+	if bestWeights.WPathFTS != currentWeights.WPathFTS ||
+		bestWeights.WPathPrefix != currentWeights.WPathPrefix ||
+		bestWeights.WContentFTS != currentWeights.WContentFTS ||
+		bestWeights.WSemanticText != currentWeights.WSemanticText ||
+		bestWeights.WSemanticImg != currentWeights.WSemanticImg ||
+		bestWeights.WRerankerBlend != currentWeights.WRerankerBlend {
+		log.Printf("[Optimizer] Applying New Weights! Preference score improved to %.1f. Deltas:", bestScore*100)
+		log.Printf("[Optimizer]   WPathFTS:       %.1f -> %.1f", currentWeights.WPathFTS, bestWeights.WPathFTS)
+		log.Printf("[Optimizer]   WPathPrefix:    %.1f -> %.1f", currentWeights.WPathPrefix, bestWeights.WPathPrefix)
+		log.Printf("[Optimizer]   WContentFTS:    %.1f -> %.1f", currentWeights.WContentFTS, bestWeights.WContentFTS)
+		log.Printf("[Optimizer]   WSemanticText:  %.1f -> %.1f", currentWeights.WSemanticText, bestWeights.WSemanticText)
+		log.Printf("[Optimizer]   WSemanticImage: %.1f -> %.1f", currentWeights.WSemanticImg, bestWeights.WSemanticImg)
+		log.Printf("[Optimizer]   WRerankerBlend: %.2f -> %.2f", currentWeights.WRerankerBlend, bestWeights.WRerankerBlend)
+
 		tx, err := db.BeginTx(o.ctx, nil)
 		if err != nil {
 			log.Printf("[Optimizer] Failed to begin transaction: %v", err)
@@ -296,9 +493,12 @@ func (o *TelemetryOptimizer) optimize() {
 			key   string
 			value float64
 		}{
-			{"w_path_fts", bestWPath},
-			{"w_content_fts", bestWContent},
-			{"w_semantic_text", bestWVec},
+			{"w_path_fts", bestWeights.WPathFTS},
+			{"w_path_prefix", bestWeights.WPathPrefix},
+			{"w_content_fts", bestWeights.WContentFTS},
+			{"w_semantic_text", bestWeights.WSemanticText},
+			{"w_semantic_image", bestWeights.WSemanticImg},
+			{"w_reranker_blend", bestWeights.WRerankerBlend},
 		}
 
 		for _, q := range queries {
@@ -306,7 +506,7 @@ func (o *TelemetryOptimizer) optimize() {
 				INSERT INTO search_config(key, value) VALUES(?, ?) 
 				ON CONFLICT(key) DO UPDATE SET value=?
 			`, q.key, q.value, q.value)
-			
+
 			if err != nil {
 				tx.Rollback()
 				log.Printf("[Optimizer] Failed to update %s: %v", q.key, err)
@@ -320,11 +520,15 @@ func (o *TelemetryOptimizer) optimize() {
 			o.mu.Lock()
 			o.lastRunAt = time.Now()
 			o.lastFeedbackN = len(feedbacks)
-			o.lastAction = fmt.Sprintf("Updated weights — Path: %.1f→%.1f, Content: %.1f→%.1f, Vector: %.1f→%.1f (score %.0f→%.0f)",
-				currentWeights.WPathFTS, bestWPath,
-				currentWeights.WContentFTS, bestWContent,
-				currentWeights.WSemanticText, bestWVec,
-				baselineScore, bestScore)
+			o.lastMetrics = bestMetrics
+			o.lastAction = fmt.Sprintf("Updated weights — Path %.1f→%.1f, Prefix %.1f→%.1f, Content %.1f→%.1f, Text %.1f→%.1f, Image %.1f→%.1f, Blend %.2f→%.2f (preference %.1f→%.1f)",
+				currentWeights.WPathFTS, bestWeights.WPathFTS,
+				currentWeights.WPathPrefix, bestWeights.WPathPrefix,
+				currentWeights.WContentFTS, bestWeights.WContentFTS,
+				currentWeights.WSemanticText, bestWeights.WSemanticText,
+				currentWeights.WSemanticImg, bestWeights.WSemanticImg,
+				currentWeights.WRerankerBlend, bestWeights.WRerankerBlend,
+				baselineScore*100, bestScore*100)
 			o.mu.Unlock()
 		} else {
 			log.Printf("[Optimizer] Failed to commit transactions: %v", err)
@@ -334,7 +538,8 @@ func (o *TelemetryOptimizer) optimize() {
 		o.mu.Lock()
 		o.lastRunAt = time.Now()
 		o.lastFeedbackN = len(feedbacks)
-		o.lastAction = fmt.Sprintf("No change needed — current weights are optimal (score %.0f, %d votes)", bestScore, len(feedbacks))
+		o.lastMetrics = bestMetrics
+		o.lastAction = fmt.Sprintf("No change needed — current weights are optimal (preference %.1f, %d votes)", bestScore*100, len(feedbacks))
 		o.mu.Unlock()
 	}
 }

@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { fade, slide } from 'svelte/transition';
   import { MessageCircle, QrCode, Wifi, WifiOff, LogOut, RefreshCw, ArrowLeft, ExternalLink, Users, ChevronRight } from 'lucide-svelte';
-  import { WAConnect, WADisconnect, WALogout, WAStatus, WAGetChats, WAGetChatMessages, WAGetLastQR, WAOpenChat } from '$lib/wailsjs/go/main/App';
+  import { WAConnect, WADisconnect, WALogout, WAStatus, WAGetChats, WAGetChatMessages, WAGetLastQR, WAForgetSessionAndConnect, WAOpenChat } from '$lib/wailsjs/go/main/App';
   import { Check, Copy } from 'lucide-svelte';
 
   // ── Types ──────────────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@
   let connecting = false;
   let loggingOut = false;
   let error = '';
+  let canForgetSession = false;
 
   let chats: Chat[] = [];
   let selectedChat: Chat | null = null;
@@ -63,8 +64,10 @@
         if (update.event === 'code') {
           qrImage = update.imageBase64;
           error = '';
+          canForgetSession = false;
         } else if (update.event === 'success') {
           qrImage = '';
+          canForgetSession = false;
           status = 'connected';
           loadChats();
         } else if (update.event === 'timeout') {
@@ -104,32 +107,57 @@
   async function connect() {
     connecting = true;
     error = '';
+    canForgetSession = false;
     qrImage = '';
     try {
       await WAConnect();
-      clearInterval(qrPollInterval);
-      qrPollInterval = setInterval(async () => {
-        const s = await WAStatus();
-        status = s as ConnStatus;
-        if (s === 'connected') {
-          clearInterval(qrPollInterval);
-          qrImage = '';
-          connecting = false;
-          loadChats();
-          return;
-        }
-        if (s === 'disconnected' || s === 'logged_out') {
-          clearInterval(qrPollInterval);
-          connecting = false;
-          return;
-        }
-        const qr = await WAGetLastQR();
-        if (qr) { qrImage = qr; connecting = false; }
-      }, 500);
+      startQRPoll();
     } catch (e: any) {
       error = typeof e === 'string' ? e : (e?.message ?? 'Failed to connect');
+      canForgetSession = isSavedSessionError(error);
       connecting = false;
     }
+  }
+
+  async function showNewQR() {
+    connecting = true;
+    error = '';
+    canForgetSession = false;
+    qrImage = '';
+    try {
+      await WAForgetSessionAndConnect();
+      startQRPoll();
+    } catch (e: any) {
+      error = typeof e === 'string' ? e : (e?.message ?? 'Failed to start QR pairing');
+      connecting = false;
+    }
+  }
+
+  function startQRPoll() {
+    clearInterval(qrPollInterval);
+    qrPollInterval = setInterval(async () => {
+      const s = await WAStatus();
+      status = s as ConnStatus;
+      if (s === 'connected') {
+        clearInterval(qrPollInterval);
+        qrImage = '';
+        connecting = false;
+        canForgetSession = false;
+        loadChats();
+        return;
+      }
+      if (s === 'disconnected' || s === 'logged_out') {
+        clearInterval(qrPollInterval);
+        connecting = false;
+        return;
+      }
+      const qr = await WAGetLastQR();
+      if (qr) {
+        qrImage = qr;
+        connecting = false;
+        canForgetSession = false;
+      }
+    }, 500);
   }
 
   async function disconnect() {
@@ -148,6 +176,7 @@
       await WALogout();
       status = 'logged_out';
       qrImage = '';
+      canForgetSession = false;
       chats = [];
       selectedChat = null;
       messages = [];
@@ -217,6 +246,11 @@
         return d.toLocaleDateString([], { weekday: 'short' });
       return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
     } catch { return ''; }
+  }
+
+  function isSavedSessionError(message: string): boolean {
+    const text = message.toLowerCase();
+    return text.includes('whatsapp: reconnect:') || text.includes('websocket') || text.includes('/ws/chat');
   }
 
   function formatMsgTime(ts: string): string {
@@ -298,8 +332,21 @@
 
     <!-- Error -->
     {#if error}
-      <div class="mx-4 mt-2 px-3 py-2 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/30 rounded-none text-[11px] text-red-600 dark:text-red-400" transition:fade>
-        {error}
+      <div class="mx-4 mt-2 px-3 py-2 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/30 rounded-none text-[11px] text-red-600 dark:text-red-400 space-y-2" transition:fade>
+        <p>{error}</p>
+        {#if canForgetSession}
+          <button
+            on:click={showNewQR}
+            disabled={connecting}
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold rounded-none transition-colors disabled:opacity-50"
+          >
+            {#if connecting}
+              <RefreshCw class="w-3 h-3 animate-spin" /> Preparing QR
+            {:else}
+              <QrCode class="w-3 h-3" /> Show new QR
+            {/if}
+          </button>
+        {/if}
       </div>
     {/if}
 

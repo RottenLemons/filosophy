@@ -603,13 +603,10 @@
                     <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
                     <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
                     <!-- Feedback buttons: visible on hover or after voting -->
-                    <div
-                      class="flex gap-1 mt-2 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-50 group-hover:opacity-100'}"
-                      on:click|stopPropagation
-                    >
+                    <div class="flex gap-1 mt-2 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-50 group-hover:opacity-100'}">
                       <button
                         title="Relevant result"
-                        on:click={() => submitFeedback(file, i, 1)}
+                        on:click|stopPropagation={() => submitFeedback(file, i, 1)}
                         class="p-1 rounded transition-colors {feedbackState.get(file.Path) === 1 ? 'text-green-500' : 'text-gray-300 dark:text-gray-600 hover:text-green-500 dark:hover:text-green-400'}"
                         aria-label="Thumbs up"
                       >
@@ -620,7 +617,7 @@
                       </button>
                       <button
                         title="Not relevant"
-                        on:click={() => submitFeedback(file, i, -1)}
+                        on:click|stopPropagation={() => submitFeedback(file, i, -1)}
                         class="p-1 rounded transition-colors {feedbackState.get(file.Path) === -1 ? 'text-red-500' : 'text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400'}"
                         aria-label="Thumbs down"
                       >
@@ -637,10 +634,12 @@
               
               <!-- WA results inline -->
               {#each waMessages as msg (msg.messageId)}
-                <div
-                  class="group relative flex items-start justify-between p-6 cursor-pointer bg-white dark:bg-transparent transition-all duration-200 border-l-4 border-transparent hover:border-gray-200 dark:hover:border-[#2a2a2a] shadow-sm hover:shadow hover:bg-white dark:hover:bg-[#1a1a1a]"
+                <button
+                  type="button"
+                  class="group relative flex w-full items-start justify-between p-6 cursor-pointer text-left bg-white dark:bg-transparent transition-all duration-200 border-l-4 border-transparent hover:border-gray-200 dark:hover:border-[#2a2a2a] shadow-sm hover:shadow hover:bg-white dark:hover:bg-[#1a1a1a]"
                   style="animation: slideFadeIn 0.3s ease-out forwards; opacity: 0; transform: translateY(10px);"
                   on:click={() => { activeView = 'whatsapp'; setTimeout(() => WAOpenChat(msg.chatJid), 100); }}
+                  aria-label="Open WhatsApp chat"
                 >
                   <div class="flex gap-6 items-start">
                     <div class="w-12 h-12 shrink-0 flex items-center justify-center bg-gray-100 dark:bg-[#1a1a1a] text-gray-400 dark:text-gray-500">
@@ -657,7 +656,7 @@
                       </div>
                     </div>
                   </div>
-                </div>
+                </button>
               {/each}
 
               <!-- WA loading indicator -->

@@ -126,6 +126,15 @@
     });
   }
 
+  async function responseError(res: Response): Promise<Error> {
+    let body = '';
+    try {
+      body = (await res.text()).trim();
+    } catch {}
+    const message = body ? `HTTP ${res.status} ${res.statusText}: ${body}` : `HTTP ${res.status} ${res.statusText}`;
+    return new Error(message);
+  }
+
   async function streamResponse(res: Response, assistantMsg: Message): Promise<{ toolCalls: any[] }> {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
@@ -201,7 +210,7 @@
         const assistantMsg: Message = { role: 'assistant', content: '' };
         messages = [...messages, assistantMsg];
         const res = await callLLM(apiMessages, true, abortController.signal);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw await responseError(res);
         const { toolCalls } = await streamResponse(res, assistantMsg);
         apiMessages.push({ role: 'assistant', content: assistantMsg.content || null, tool_calls: toolCalls.length ? toolCalls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) : undefined });
         if (!toolCalls.length) break;
@@ -365,11 +374,11 @@
         
         <div class="flex pb-0.5">
           {#if streaming}
-            <button on:click={cancel} class="group p-1">
+            <button on:click={cancel} class="group p-1" aria-label="Cancel response" title="Cancel response">
               <div class="w-4 h-4 bg-[#474848] group-hover:bg-red-500 transition-colors"></div>
             </button>
           {:else}
-            <button on:click={send} disabled={!input.trim()} class="p-1 transition-colors text-[#474848] hover:text-[#bfc8ca] disabled:opacity-10 cursor-pointer">
+            <button on:click={send} disabled={!input.trim()} class="p-1 transition-colors text-[#474848] hover:text-[#bfc8ca] disabled:opacity-10 cursor-pointer" aria-label="Send message" title="Send message">
               <Send class="w-5 h-5" />
             </button>
           {/if}

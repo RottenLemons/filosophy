@@ -39,7 +39,9 @@
       class="relative w-full max-w-sm bg-white dark:bg-[#111] border border-gray-200 dark:border-[#2a2a2a] shadow-2xl p-6 flex flex-col gap-5"
       transition:scale={{ duration: 150, start: 0.96 }}
       on:click|stopPropagation
+      on:keydown|stopPropagation={() => {}}
       role="dialog"
+      tabindex="-1"
       aria-modal="true"
       aria-labelledby="confirm-title"
     >

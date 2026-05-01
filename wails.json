@@ -17,7 +17,7 @@
     "comments": "AI-Powered Local File Search"
   },
   "frontend:dir": "./frontend",
-  "build:dir": "./frontend/build",
+  "build:dir": "./build",
   "wailsjsdir": "./frontend/src/lib",
   "appargs": "",
   "nsisType": "multiple"

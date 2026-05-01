@@ -21,17 +21,16 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
 )
 
 // APIServer is the external HTTP server. It is started/stopped by the App
 // when the user toggles the API on or off in Settings.
 type APIServer struct {
-	app      *App
-	srv      *http.Server
-	mcp      *MCPServer
-	mu       sync.Mutex
-	running  bool
+	app     *App
+	srv     *http.Server
+	mcp     *MCPServer
+	mu      sync.Mutex
+	running bool
 }
 
 func newAPIServer(app *App) *APIServer {
@@ -197,9 +196,11 @@ func (s *APIServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply a minimum score threshold to match the quality bar of the UI.
-	// Results below 0.15 are typically noise (unrelated files that share incidental tokens).
-	const minScore = 0.15
+	// Apply the configured minimum score threshold to match the quality bar of the UI.
+	minScore := 0.15
+	if engine.Weights != nil {
+		minScore = engine.Weights.Get().MinScore
+	}
 	items := make([]searchResultItem, 0, len(raw))
 	for _, r := range raw {
 		if len(items) >= req.Limit {
@@ -229,10 +230,10 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	idxStatus := s.app.GetIndexingStatus()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"engine":     status,
-		"indexing":   idxStatus.IsIndexing,
-		"progress":   idxStatus.Progress,
-		"message":    idxStatus.StatusMessage,
+		"engine":   status,
+		"indexing": idxStatus.IsIndexing,
+		"progress": idxStatus.Progress,
+		"message":  idxStatus.StatusMessage,
 	})
 }
 

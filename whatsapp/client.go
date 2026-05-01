@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image/png"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -55,12 +56,13 @@ type OnStatusChange func(Status)
 
 // Client wraps a whatsmeow client with session persistence and reconnect logic.
 type Client struct {
-	mu       sync.Mutex
-	wac      *whatsmeow.Client   // nil until Connect is called
-	store    *Store              // our local message DB
-	dir      string              // working directory for session DB
-	status   Status
-	lastQR   string              // last QR base64 PNG, so frontend can poll it
+	mu        sync.Mutex
+	wac       *whatsmeow.Client // nil until Connect is called
+	sessionDB *sql.DB
+	store     *Store // our local message DB
+	dir       string // working directory for session DB
+	status    Status
+	lastQR    string // last QR base64 PNG, so frontend can poll it
 
 	onQR     OnQRUpdate
 	onStatus OnStatusChange
@@ -128,6 +130,14 @@ func (c *Client) connect(appCtx context.Context, allowPairing bool) error {
 		log.Println("[WhatsApp] Connect: already connected, no-op")
 		return nil
 	}
+	if c.wac != nil {
+		c.wac.Disconnect()
+		c.wac = nil
+	}
+	if c.sessionDB != nil {
+		_ = c.sessionDB.Close()
+		c.sessionDB = nil
+	}
 	c.mu.Unlock()
 
 	c.setStatus(StatusConnecting)
@@ -179,6 +189,7 @@ func (c *Client) connect(appCtx context.Context, allowPairing bool) error {
 	wac := whatsmeow.NewClient(device, waLogger{prefix: "client"})
 	c.mu.Lock()
 	c.wac = wac
+	c.sessionDB = sessionDB
 	c.mu.Unlock()
 
 	// Register event handler (defined in events.go)
@@ -234,6 +245,44 @@ func (c *Client) Logout(ctx context.Context) error {
 	err := wac.Logout(ctx)
 	c.setStatus(StatusLoggedOut)
 	return err
+}
+
+// ResetSession forgets the local WhatsApp session so the next Connect starts QR pairing.
+func (c *Client) ResetSession() error {
+	c.mu.Lock()
+	cancel := c.cancelReconnect
+	wac := c.wac
+	sessionDB := c.sessionDB
+	c.cancelReconnect = nil
+	c.wac = nil
+	c.sessionDB = nil
+	c.lastQR = ""
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if wac != nil {
+		wac.Disconnect()
+	}
+	if sessionDB != nil {
+		_ = sessionDB.Close()
+	}
+
+	sessionPath := filepath.Join(c.dir, "whatsapp-session.db")
+	var removeErr error
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		path := sessionPath + suffix
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && removeErr == nil {
+			removeErr = err
+		}
+	}
+
+	c.setStatus(StatusLoggedOut)
+	if removeErr != nil {
+		return fmt.Errorf("whatsapp: reset session: %w", removeErr)
+	}
+	return nil
 }
 
 // ── QR Pairing ────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import (
 	crand "crypto/rand"
 	"embed"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -34,7 +35,9 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-//go:embed all:frontend/build
+// Embed only browser assets. Keep native build artifacts outside this tree so
+// generated executables are never bundled into the app binary.
+//go:embed all:frontend/dist/_app frontend/dist/index.html frontend/dist/robots.txt
 var assets embed.FS
 
 //go:embed cmd/daemon/icon.ico
@@ -1048,17 +1051,40 @@ func (a *App) GetEngineStatus() string {
 // TestLLMEndpoint performs a GET request from the Go side (bypasses WebView2
 // loopback restrictions) and returns an empty string on success or an error
 // message on failure.
-func (a *App) TestLLMEndpoint(url string) string {
+func (a *App) TestLLMEndpoint(url string, apiKey string) string {
 	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Get(url)
+	log.Printf("[LLMTest] GET %s auth=%t", url, apiKey != "")
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
+		log.Printf("[LLMTest] request build failed: %v", err)
+		return err.Error()
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[LLMTest] request failed: %v", err)
 		return err.Error()
 	}
 	defer resp.Body.Close()
+	body := readBodyPreview(resp.Body, 4096)
+	log.Printf("[LLMTest] response status=%d body=%q", resp.StatusCode, body)
 	if resp.StatusCode >= 400 {
+		if body != "" {
+			return fmt.Sprintf("HTTP %d %s: %s", resp.StatusCode, resp.Status, body)
+		}
 		return fmt.Sprintf("HTTP %d %s", resp.StatusCode, resp.Status)
 	}
 	return ""
+}
+
+func readBodyPreview(r io.Reader, limit int64) string {
+	data, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return fmt.Sprintf("failed to read response body: %v", err)
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func (a *App) Search(query string) ([]shared.SearchResult, error) {
@@ -1466,6 +1492,17 @@ func (a *App) WALogout() error {
 	return a.waClient.Logout(a.ctx)
 }
 
+// WAForgetSessionAndConnect clears a broken saved WhatsApp session and starts QR pairing.
+func (a *App) WAForgetSessionAndConnect() error {
+	if a.waClient == nil {
+		return fmt.Errorf("whatsapp store not initialised")
+	}
+	if err := a.waClient.ResetSession(); err != nil {
+		return err
+	}
+	return a.WAConnect()
+}
+
 // WASearchMessages performs a full-text search over indexed WhatsApp messages.
 func (a *App) WASearchMessages(query string) ([]whatsapp.Message, error) {
 	if a.waStore == nil {
@@ -1559,8 +1596,10 @@ func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "missing url param", http.StatusBadRequest)
 			return
 		}
+		log.Printf("[LLMProxy] %s %s auth=%t", r.Method, target, r.Header.Get("Authorization") != "")
 		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 		if err != nil {
+			log.Printf("[LLMProxy] request build failed: %v", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -1572,10 +1611,12 @@ func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := http.DefaultClient.Do(proxyReq)
 		if err != nil {
+			log.Printf("[LLMProxy] request failed: %v", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		log.Printf("[LLMProxy] response status=%d content-type=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
 		// Copy response headers then body (supports streaming/SSE)
 		for k, vs := range resp.Header {
 			for _, v := range vs {

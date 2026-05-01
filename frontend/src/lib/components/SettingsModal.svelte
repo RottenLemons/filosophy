@@ -99,7 +99,7 @@
         ? `${base}/api/tags`
         : `${base}/models`;
       // Route through Go to avoid WebView2 loopback network restrictions
-      const errMsg: string = await TestLLMEndpoint(url);
+      const errMsg: string = await TestLLMEndpoint(url, llmConfig.apiKey);
       if (!errMsg) {
         llmTestStatus = 'ok';
         llmTestMessage = 'Connected successfully';
@@ -228,6 +228,14 @@
       optimizerStatus = await GetOptimizerStatus();
     } catch {}
     optimizerLoading = false;
+  }
+
+  function formatMetric(value: number | undefined, digits = 2) {
+    return typeof value === 'number' ? value.toFixed(digits) : '--';
+  }
+
+  function formatPreferenceScore(value: number | undefined) {
+    return typeof value === 'number' ? value.toFixed(1) : '--';
   }
 
   // Poll every 15s while the ranking tab is visible.
@@ -909,6 +917,33 @@
                         <span class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-60">Feedback votes</span>
                         <span class="text-sm font-mono text-[#bfc8ca] font-bold">{optimizerStatus.feedbackCount}</span>
                       </div>
+                      <div class="flex items-center gap-2">
+                        <span class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-60">Preference score</span>
+                        <span class="text-sm font-mono text-[#bfc8ca] font-bold">{formatPreferenceScore(optimizerStatus.preferenceScore)}</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <span class="text-[10px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-60">Baseline</span>
+                        <span class="text-sm font-mono text-[#acabab] font-bold opacity-70">{formatPreferenceScore(optimizerStatus.baselineScore)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
+                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">NDCG@10</div>
+                      <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.ndcg10)}</div>
+                    </div>
+                    <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
+                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">MRR@10</div>
+                      <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.mrr10)}</div>
+                    </div>
+                    <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
+                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">Recall@{optimizerStatus.currentWeights?.RerankTopN ?? 20}</div>
+                      <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.recallAtRerank)}</div>
+                    </div>
+                    <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
+                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">Downvote penalty</div>
+                      <div class="text-lg font-mono text-red-400">{formatMetric(optimizerStatus.downvotePenalty)}</div>
                     </div>
                   </div>
                 {/if}
@@ -943,6 +978,7 @@
                           { label: 'Semantic Image', key: 'WSemanticImg' },
                           { label: 'Filename', key: 'WFilename' },
                           { label: 'Recency', key: 'WRecency' },
+                          { label: 'Reranker Blend', key: 'WRerankerBlend' },
                         ] as row}
                           {@const current = optimizerStatus.currentWeights[row.key] ?? 0}
                           {@const def = optimizerStatus.defaultWeights[row.key] ?? 0}
@@ -966,7 +1002,7 @@
               <section class="p-6 bg-[#131313] border-l-2 border-[#bfc8ca] rounded-sm shadow-sm">
                 <h5 class="text-[#bfc8ca] text-[10px] font-bold uppercase tracking-widest mb-3">How It Works</h5>
                 <p class="text-[11px] font-sans text-[#acabab] leading-relaxed opacity-80">
-                  Every 15 seconds the optimizer runs a grid search over your recent feedback, simulating different weight combinations to find which one best predicts your preferences. When it finds a better set of weights, it applies them automatically. The more feedback you give, the more accurate your rankings become.
+                  Every 10 minutes the optimizer scores weight combinations with NDCG@10, MRR@10, and Recall@rerank-top-N. Thumbs up means the document was relevant; thumbs down applies a harsh top-rank penalty so unwanted topics stop winning.
                 </p>
               </section>
             </div>

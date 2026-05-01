@@ -12,36 +12,38 @@ import (
 // SearchWeights holds all tunable ranking parameters loaded from search_config.
 // Fields are read by the search pipeline and written only by the reload goroutine.
 type SearchWeights struct {
-	WPathFTS      float64 // RRF weight: path FTS exact + all-word signals
-	WPathPrefix   float64 // RRF weight: path FTS prefix signals
-	WSemanticText float64 // RRF weight: text vector signal
-	WSemanticImg  float64 // RRF weight: image vector signal
-	WContentFTS   float64 // RRF weight: content FTS (phrase + keyword) signal
-	WFilename     float64 // Multiplier applied on top of filename/fuzzy boosts
-	WRecency      float64 // Additive recency score weight
-	RecencyHalf   float64 // Recency half-life in days (score decays to ~37% after this)
-	RRFK          float64 // RRF smoothing constant k
-	MinScore      float64 // Minimum score threshold exposed to REST API
-	RerankTopN    int     // How many results pass to the cross-encoder reranker
-	PathOnlyCap   float64 // Score cap for path-only results (no content signal)
-	UseNewPipeline bool   // Feature flag: activates the weighted fusion pipeline
+	WPathFTS       float64 // RRF weight: path FTS exact + all-word signals
+	WPathPrefix    float64 // RRF weight: path FTS prefix signals
+	WSemanticText  float64 // RRF weight: text vector signal
+	WSemanticImg   float64 // RRF weight: image vector signal
+	WContentFTS    float64 // RRF weight: content FTS (phrase + keyword) signal
+	WFilename      float64 // Multiplier applied on top of filename/fuzzy boosts
+	WRecency       float64 // Additive recency score weight
+	RecencyHalf    float64 // Recency half-life in days (score decays to ~37% after this)
+	RRFK           float64 // RRF smoothing constant k
+	MinScore       float64 // Minimum score threshold exposed to REST API
+	RerankTopN     int     // How many results pass to the cross-encoder reranker
+	WRerankerBlend float64 // Blend alpha: 0=pure RRF preservation, 1=pure reranker score
+	PathOnlyCap    float64 // Score cap for path-only results (no content signal)
+	UseNewPipeline bool    // Feature flag: activates the weighted fusion pipeline
 }
 
 // defaultWeights mirrors the INSERT OR IGNORE defaults in InitIndexTables.
 var defaultWeights = SearchWeights{
-	WPathFTS:      3.0,
-	WPathPrefix:   1.5,
-	WSemanticText: 1.0,
-	WSemanticImg:  1.1,
-	WContentFTS:   1.0,
-	WFilename:     1.0,
-	WRecency:      0.3,
-	RecencyHalf:   30.0,
-	RRFK:          60.0,
-	MinScore:      0.15,
-	RerankTopN:    20,
-	PathOnlyCap:   0.12,
-	UseNewPipeline: false,
+	WPathFTS:       3.0,
+	WPathPrefix:    1.5,
+	WSemanticText:  1.0,
+	WSemanticImg:   1.1,
+	WContentFTS:    1.0,
+	WFilename:      1.0,
+	WRecency:       0.3,
+	RecencyHalf:    30.0,
+	RRFK:           60.0,
+	MinScore:       0.15,
+	RerankTopN:     20,
+	WRerankerBlend: 0.5,
+	PathOnlyCap:    0.12,
+	UseNewPipeline: true,
 }
 
 // WeightStore caches search_config values and reloads them periodically.
@@ -117,19 +119,54 @@ func (ws *WeightStore) reload() {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	w := defaultWeights // start from defaults, overlay DB values
-	if v, ok := m["w_path_fts"]; ok { w.WPathFTS = v }
-	if v, ok := m["w_path_prefix"]; ok { w.WPathPrefix = v }
-	if v, ok := m["w_semantic_text"]; ok { w.WSemanticText = v }
-	if v, ok := m["w_semantic_image"]; ok { w.WSemanticImg = v }
-	if v, ok := m["w_content_fts"]; ok { w.WContentFTS = v }
-	if v, ok := m["w_filename"]; ok { w.WFilename = v }
-	if v, ok := m["w_recency"]; ok { w.WRecency = v }
-	if v, ok := m["recency_half_life"]; ok { w.RecencyHalf = v }
-	if v, ok := m["rrf_k"]; ok && v > 0 { w.RRFK = v }
-	if v, ok := m["min_score"]; ok { w.MinScore = v }
-	if v, ok := m["rerank_top_n"]; ok && v >= 1 { w.RerankTopN = int(v) }
-	if v, ok := m["path_only_cap"]; ok { w.PathOnlyCap = v }
-	if v, ok := m["use_new_pipeline"]; ok { w.UseNewPipeline = v != 0 }
+	if v, ok := m["w_path_fts"]; ok {
+		w.WPathFTS = v
+	}
+	if v, ok := m["w_path_prefix"]; ok {
+		w.WPathPrefix = v
+	}
+	if v, ok := m["w_semantic_text"]; ok {
+		w.WSemanticText = v
+	}
+	if v, ok := m["w_semantic_image"]; ok {
+		w.WSemanticImg = v
+	}
+	if v, ok := m["w_content_fts"]; ok {
+		w.WContentFTS = v
+	}
+	if v, ok := m["w_filename"]; ok {
+		w.WFilename = v
+	}
+	if v, ok := m["w_recency"]; ok {
+		w.WRecency = v
+	}
+	if v, ok := m["recency_half_life"]; ok {
+		w.RecencyHalf = v
+	}
+	if v, ok := m["rrf_k"]; ok && v > 0 {
+		w.RRFK = v
+	}
+	if v, ok := m["min_score"]; ok {
+		w.MinScore = v
+	}
+	if v, ok := m["rerank_top_n"]; ok && v >= 1 {
+		w.RerankTopN = int(v)
+	}
+	if v, ok := m["w_reranker_blend"]; ok {
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		w.WRerankerBlend = v
+	}
+	if v, ok := m["path_only_cap"]; ok {
+		w.PathOnlyCap = v
+	}
+	if v, ok := m["use_new_pipeline"]; ok {
+		w.UseNewPipeline = v != 0
+	}
 	ws.weights = w
 }
 

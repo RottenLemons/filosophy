@@ -103,7 +103,7 @@ var (
 // Engine holds the models and database connection for embedding operations.
 type Engine struct {
 	db                *core.SQLiteStore
-	sqlDB             *sql.DB // separate connection for the files table
+	sqlDB             *sql.DB                     // separate connection for the files table
 	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx)
 	textTok           *tokenizers.Tokenizer       // tokenizer for the BERT text encoder
 	clipTok           *tokenizers.Tokenizer
@@ -119,8 +119,8 @@ type Engine struct {
 	writerWg          sync.WaitGroup
 
 	// Ranking infrastructure — initialised after InitIndexTables succeeds.
-	Weights   *WeightStore          // hot-reloaded ranking weights from search_config
-	optimizer *TelemetryOptimizer   // set by optimizer.Start(); nil until then
+	Weights   *WeightStore        // hot-reloaded ranking weights from search_config
+	optimizer *TelemetryOptimizer // set by optimizer.Start(); nil until then
 
 	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
 	Hardware HardwareConfig
@@ -410,7 +410,6 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
 
-
 		clipTok.Close()
 		ort.DestroyEnvironment()
 		sqlDB.Close()
@@ -421,7 +420,6 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 	if err != nil {
 		clipVisionSession.Destroy()
 		clipTextSession.Destroy()
-
 
 		clipTok.Close()
 		ort.DestroyEnvironment()
@@ -1386,11 +1384,25 @@ func (s *Engine) InitIndexTables() error {
 		{"rrf_k", 60.0},             // RRF smoothing constant
 		{"min_score", 0.15},         // Minimum score threshold (used by REST API)
 		{"rerank_top_n", 20.0},      // How many results to pass to cross-encoder reranker
+		{"w_reranker_blend", 0.5},   // Blend alpha: 0=pure RRF, 1=pure reranker
 		{"path_only_cap", 0.12},     // Score cap for path-only results (no content signal)
-		{"use_new_pipeline", 0.0},   // Feature flag: 0=old pipeline, 1=new weighted pipeline
+		{"use_new_pipeline", 1.0},   // Feature flag: 0=old pipeline, 1=new weighted pipeline
 	}
 	for _, kv := range defaultConfigs {
 		s.sqlDB.ExecContext(ctx, `INSERT OR IGNORE INTO search_config(key, value) VALUES (?, ?)`, kv[0], kv[1])
+	}
+
+	// Existing databases may still carry the old default (0). Flip that default
+	// once, while preserving the user's ability to turn the pipeline off later.
+	var migratedNewPipelineDefault int
+	_ = s.sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM search_config WHERE key = 'migrated_new_pipeline_default'`).Scan(&migratedNewPipelineDefault)
+	if migratedNewPipelineDefault == 0 {
+		if _, err := s.sqlDB.ExecContext(ctx, `UPDATE search_config SET value = 1 WHERE key = 'use_new_pipeline' AND value = 0`); err != nil {
+			return fmt.Errorf("failed to migrate use_new_pipeline default: %w", err)
+		}
+		if _, err := s.sqlDB.ExecContext(ctx, `INSERT OR IGNORE INTO search_config(key, value) VALUES ('migrated_new_pipeline_default', 1)`); err != nil {
+			return fmt.Errorf("failed to mark use_new_pipeline migration: %w", err)
+		}
 	}
 
 	// search_feedback: telemetry for ranking weight adjustment.
@@ -1609,17 +1621,33 @@ type SearchResult struct {
 //  6. Exact/prefix/substring filename match boost
 //  7. Trigram fuzzy path similarity — typo tolerance
 
-// GetRawSignals performs vector and FTS search but returns the raw, unweighted
-// signal maps for each query. This is used strictly by the telemetry optimizer
-// to run in-memory parameter grid sweeps without repeating ONNX inference.
-func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vectorSignals map[string]float64) {
+// RawSearchSignals holds unweighted signal maps for a query. This is used by
+// the telemetry optimizer to run in-memory parameter sweeps without repeating
+// vector search and reranker inference for each candidate weight set.
+type RawSearchSignals struct {
+	PathFTS       map[string]float64
+	PathPrefix    map[string]float64
+	ContentFTS    map[string]float64
+	SemanticText  map[string]float64
+	SemanticImage map[string]float64
+	Reranker      map[string]float64
+}
+
+// GetRawSignals performs vector, FTS, and optional reranker scoring but returns
+// raw, unweighted signal maps for each query.
+func (s *Engine) GetRawSignals(query string) RawSearchSignals {
 	ctx := context.Background()
 	pq := ParseQuery(query)
 	qText := pq.Text
 
-	pathSignals = make(map[string]float64)
-	contentSignals = make(map[string]float64)
-	vectorSignals = make(map[string]float64)
+	signals := RawSearchSignals{
+		PathFTS:       make(map[string]float64),
+		PathPrefix:    make(map[string]float64),
+		ContentFTS:    make(map[string]float64),
+		SemanticText:  make(map[string]float64),
+		SemanticImage: make(map[string]float64),
+		Reranker:      make(map[string]float64),
+	}
 
 	var textQueryVec []float32
 	textEmbs, err := s.embedText([]string{qText})
@@ -1627,10 +1655,21 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 		textQueryVec = textEmbs[0]
 	}
 
-	textResults, _ := s.db.Search(ctx, textQueryVec, core.SearchOptions{
-		Collection: textCollection,
-		TopK:       200,
-	})
+	var textResults []core.ScoredEmbedding
+	if textQueryVec != nil {
+		textResults, _ = s.db.Search(ctx, textQueryVec, core.SearchOptions{
+			Collection: textCollection,
+			TopK:       200,
+		})
+	}
+
+	var imageResults []core.ScoredEmbedding
+	if clipEmbs, err := s.embedClipText([]string{qText}); err == nil && len(clipEmbs) > 0 {
+		imageResults, _ = s.db.Search(ctx, clipEmbs[0], core.SearchOptions{
+			Collection: imageCollection,
+			TopK:       50,
+		})
+	}
 
 	var sigWg sync.WaitGroup
 	var mu sync.Mutex
@@ -1638,14 +1677,19 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
-		m := make(map[string]float64)
-		s.addPathFTSScores(ctx, qText, m, 1.0)
-		s.addPathFTSAllWords(ctx, qText, m, 1.0)
-		s.addPathFTSPrefixScores(ctx, qText, m, 1.0)
-		s.addPathFTSShortPrefixScores(ctx, qText, m, 1.0)
+		exact := make(map[string]float64)
+		prefix := make(map[string]float64)
+		s.addPathFTSScores(ctx, qText, exact, 1.0)
+		s.addPathFTSAllWords(ctx, qText, exact, 4.0/3.0)
+		s.addPathFTSPrefixScores(ctx, qText, prefix, 1.0)
+		s.addPathFTSShortPrefixScores(ctx, qText, prefix, 2.0/3.0)
+		s.addPathSubstringScores(ctx, qText, prefix, 0.5)
 		mu.Lock()
-		for p, v := range m {
-			pathSignals[p] = v
+		for p, v := range exact {
+			signals.PathFTS[p] = v
+		}
+		for p, v := range prefix {
+			signals.PathPrefix[p] = v
 		}
 		mu.Unlock()
 	}()
@@ -1661,7 +1705,7 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 		}
 		mu.Lock()
 		for p, v := range m {
-			contentSignals[p] = v
+			signals.ContentFTS[p] = v
 		}
 		mu.Unlock()
 	}()
@@ -1669,20 +1713,29 @@ func (s *Engine) GetRawSignals(query string) (pathSignals, contentSignals, vecto
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
-		m := make(map[string]float64)
 		k := rrfK
 		for i, res := range textResults {
-			m[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
+			signals.SemanticText[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
 		}
-		mu.Lock()
-		for p, v := range m {
-			vectorSignals[p] = v
+		for i, res := range imageResults {
+			signals.SemanticImage[res.Metadata["path"]] += 1.0 / (k + float64(i+1))
 		}
-		mu.Unlock()
 	}()
 
 	sigWg.Wait()
-	return
+
+	candidateSet := make(map[string]bool)
+	for _, signal := range []map[string]float64{signals.PathFTS, signals.PathPrefix, signals.ContentFTS, signals.SemanticText, signals.SemanticImage} {
+		for p := range signal {
+			candidateSet[p] = true
+		}
+	}
+	candidates := make([]string, 0, len(candidateSet))
+	for p := range candidateSet {
+		candidates = append(candidates, p)
+	}
+	signals.Reranker = s.scoreRerankerCandidates(qText, candidates)
+	return signals
 }
 
 func (s *Engine) Search(query string) ([]SearchResult, error) {
@@ -1892,11 +1945,10 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	}
 
 	rerankN := rerankerTopN
-	if w.UseNewPipeline && w.RerankTopN > 0 {
+	if w.RerankTopN > 0 {
 		rerankN = w.RerankTopN
 	}
-	_ = rerankN // rerank() uses its own internal top-N; expose via weights in a future pass
-	results = s.rerank(query, results)
+	results = s.rerank(query, results, rerankN, w.WRerankerBlend)
 	results = s.applyFilters(results, pq)
 	return results, nil
 }
@@ -2023,7 +2075,16 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 
 	out := s.buildResultsFromScores(ctx, scores)
 	sortResults(out)
-	out = s.rerank(query, out)
+	rerankN := rerankerTopN
+	rerankerBlend := defaultWeights.WRerankerBlend
+	if s.Weights != nil {
+		w := s.Weights.Get()
+		rerankerBlend = w.WRerankerBlend
+		if w.RerankTopN > 0 {
+			rerankN = w.RerankTopN
+		}
+	}
+	out = s.rerank(query, out, rerankN, rerankerBlend)
 	out = s.applyFilters(out, pq)
 	return out, nil
 }
@@ -2836,19 +2897,28 @@ func serializeMetadataPayload(path string, size int64, modified string, snippet 
 	return sb.String()
 }
 
-// rerank re-scores the top rerankerTopN text results using the cross-encoder.
+// rerank re-scores the top rerankTopN text results using the cross-encoder.
 // Images are partitioned out before reranking (cross-encoder needs text) and
 // re-inserted after by their original RRF rank, so they compete fairly with
 // reranked text rather than being stranded at the bottom by score-range mismatch.
 // No-ops if the reranker session was not loaded.
-func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
+func (s *Engine) rerank(query string, results []SearchResult, rerankTopN int, rerankerBlend float64) []SearchResult {
 	if s.rerankerSession == nil || len(results) == 0 {
 		return results
 	}
+	if rerankTopN <= 0 {
+		rerankTopN = rerankerTopN
+	}
+	if rerankerBlend < 0 {
+		rerankerBlend = 0
+	}
+	if rerankerBlend > 1 {
+		rerankerBlend = 1
+	}
 
 	n := len(results)
-	if n > rerankerTopN {
-		n = rerankerTopN
+	if n > rerankTopN {
+		n = rerankTopN
 	}
 	top := results[:n]
 	rest := results[n:]
@@ -3078,7 +3148,7 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 				for i, item := range textItems {
 					rerankerProb := 1.0 / (1.0 + math.Exp(float64(-docMax[i]))) // sigmoid → [0,1]
 					rrfNorm := item.result.Score / maxRRF                       // normalised RRF → [0,1]
-					blended := float32(0.5*rerankerProb + 0.5*rrfNorm)
+					blended := float32(rerankerBlend*rerankerProb + (1-rerankerBlend)*rrfNorm)
 					r := item.result
 					r.Score = float64(blended)
 					if debug {
@@ -3121,10 +3191,173 @@ func (s *Engine) rerank(query string, results []SearchResult) []SearchResult {
 	if debug {
 		log.Printf("reranker final order:")
 		for i, r := range out {
-			if i >= rerankerTopN {
+			if i >= rerankTopN {
 				break
 			}
 			log.Printf("  #%d  %.4f  %s", i+1, r.Score, r.Path)
+		}
+	}
+	return out
+}
+
+// scoreRerankerCandidates returns sigmoid-normalized cross-encoder scores for
+// candidate paths. It is used by the optimizer once per unique query, then the
+// cached scores can be blended with many simulated RRF weight combinations.
+func (s *Engine) scoreRerankerCandidates(query string, paths []string) map[string]float64 {
+	out := make(map[string]float64)
+	if s.rerankerSession == nil || len(paths) == 0 {
+		return out
+	}
+
+	const maxSnippetsPerDoc = 3
+	docSnippets := make(map[string][]string, len(paths))
+	basenames := make(map[string]string, len(paths))
+	unique := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if p == "" || seen[p] || IsImageFile(p) {
+			continue
+		}
+		seen[p] = true
+		unique = append(unique, p)
+		base := filepath.Base(p)
+		if decoded, err := url.PathUnescape(base); err == nil {
+			base = decoded
+		}
+		basenames[p] = base
+	}
+	if len(unique) == 0 {
+		return out
+	}
+
+	ftsQuery := buildFTSQuery(query)
+	placeholders := strings.Repeat("?,", len(unique))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, 1+len(unique)+1)
+	args = append(args, ftsQuery)
+	for _, p := range unique {
+		args = append(args, p)
+	}
+	rows, err := s.vDB.QueryContext(context.Background(), `
+		SELECT json_extract(e.metadata, '$.path'), content
+		FROM chunks_fts
+		JOIN embeddings e ON chunks_fts.rowid = e.rowid
+		WHERE chunks_fts MATCH ?
+		  AND json_extract(e.metadata, '$.path') IN (`+placeholders+`)
+		  AND length(content) > 0
+		ORDER BY bm25(chunks_fts)
+		LIMIT ?
+	`, append(args, len(unique)*maxSnippetsPerDoc)...)
+	if err == nil {
+		for rows.Next() {
+			var path, content string
+			if rows.Scan(&path, &content) == nil {
+				remaining := maxSnippetsPerDoc - len(docSnippets[path])
+				if remaining > 0 {
+					windows := extractSnippets(content, query, remaining)
+					docSnippets[path] = append(docSnippets[path], windows...)
+				}
+			}
+		}
+		rows.Close()
+	}
+
+	qEnc := s.rerankerTok.EncodeWithOptions(query, false)
+	qIDs := qEnc.IDs
+	type pairTokens struct {
+		ids  []int64
+		mask []int64
+	}
+	pairs := make([]pairTokens, 0, len(unique)*maxSnippetsPerDoc)
+	pairPath := make([]string, 0, len(unique)*maxSnippetsPerDoc)
+
+	encodePair := func(text string) pairTokens {
+		dEnc := s.rerankerTok.EncodeWithOptions(text, false)
+		dIDs := dEnc.IDs
+		total := 1 + len(qIDs) + 2 + len(dIDs) + 1
+		ids64 := make([]int64, 0, total)
+		mask64 := make([]int64, 0, total)
+		push := func(id int64) { ids64 = append(ids64, id); mask64 = append(mask64, 1) }
+		push(0)
+		for _, id := range qIDs {
+			push(int64(id))
+		}
+		push(2)
+		push(2)
+		for _, id := range dIDs {
+			push(int64(id))
+		}
+		push(2)
+		if len(ids64) > rerankerMaxToks {
+			ids64 = ids64[:rerankerMaxToks]
+			mask64 = mask64[:rerankerMaxToks]
+		}
+		return pairTokens{ids64, mask64}
+	}
+
+	for _, path := range unique {
+		snippets := docSnippets[path]
+		if len(snippets) == 0 {
+			snippets = []string{"Filename: " + basenames[path]}
+		}
+		for _, snip := range snippets {
+			payload := serializeMetadataPayload(path, 0, "", snip)
+			pairs = append(pairs, encodePair(payload))
+			pairPath = append(pairPath, path)
+		}
+	}
+	if len(pairs) == 0 {
+		return out
+	}
+
+	maxSeqLen := 0
+	for _, p := range pairs {
+		if len(p.ids) > maxSeqLen {
+			maxSeqLen = len(p.ids)
+		}
+	}
+	nPairs := len(pairs)
+	flatIDs := make([]int64, nPairs*maxSeqLen)
+	flatMask := make([]int64, nPairs*maxSeqLen)
+	for i, p := range pairs {
+		copy(flatIDs[i*maxSeqLen:], p.ids)
+		copy(flatMask[i*maxSeqLen:], p.mask)
+	}
+
+	shape := ort.NewShape(int64(nPairs), int64(maxSeqLen))
+	tIDs, err1 := ort.NewTensor(shape, flatIDs)
+	tMask, err2 := ort.NewTensor(shape, flatMask)
+	tOut, err3 := ort.NewEmptyTensor[float32](ort.NewShape(int64(nPairs), 1))
+	if err1 != nil || err2 != nil || err3 != nil {
+		if tIDs != nil {
+			tIDs.Destroy()
+		}
+		if tMask != nil {
+			tMask.Destroy()
+		}
+		if tOut != nil {
+			tOut.Destroy()
+		}
+		return out
+	}
+
+	s.gpuMutex.Lock()
+	runErr := s.rerankerSession.Run([]ort.Value{tIDs, tMask}, []ort.Value{tOut})
+	s.gpuMutex.Unlock()
+	logits := tOut.GetData()
+	tIDs.Destroy()
+	tMask.Destroy()
+	tOut.Destroy()
+	if runErr != nil {
+		log.Printf("optimizer reranker inference warning: %v", runErr)
+		return out
+	}
+
+	for i, logit := range logits {
+		path := pairPath[i]
+		score := 1.0 / (1.0 + math.Exp(float64(-logit)))
+		if score > out[path] {
+			out[path] = score
 		}
 	}
 	return out
