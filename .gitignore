@@ -65,6 +65,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*.tmp.*
 
 # Jupyter notebooks
 test.ipynb

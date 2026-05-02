@@ -82,7 +82,7 @@
         <div class="dropdown" transition:slide={{ duration: 150 }}>
           <div class="dropdown-header">
             <span class="dropdown-title">Home Folder</span>
-            <span class="dropdown-hint">Uncheck to exclude from indexing</span>
+            <span class="dropdown-hint">Only checked folders are indexed</span>
           </div>
 
           <div class="folder-tree">

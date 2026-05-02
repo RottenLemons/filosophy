@@ -37,6 +37,7 @@ import (
 
 // Embed only browser assets. Keep native build artifacts outside this tree so
 // generated executables are never bundled into the app binary.
+//
 //go:embed all:frontend/dist/_app frontend/dist/index.html frontend/dist/robots.txt
 var assets embed.FS
 
@@ -103,34 +104,31 @@ func getHomeSubdirs(home string) []string {
 	return names
 }
 
-// getContentDirs returns the absolute paths of home subdirectories that are
-// not excluded. These are passed to pass1/pass2 for content indexing.
+// getContentDirs returns the absolute paths selected for path and content indexing.
 func (a *App) getContentDirs() []string {
-	subdirs := getHomeSubdirs(a.home)
 	var dirs []string
+	seen := make(map[string]bool)
+	add := func(dir string) {
+		key := strings.ToLower(filepath.Clean(dir))
+		if key == "" || seen[key] || a.config.IsExcluded(dir) {
+			return
+		}
+		seen[key] = true
+		dirs = append(dirs, dir)
+	}
+	for _, dir := range shared.DefaultIndexedDirs(a.home) {
+		if a.config.IsIncluded(dir) {
+			add(dir)
+		}
+	}
+	for _, d := range a.config.GetExtraDirs() {
+		add(d)
+	}
+	subdirs := getHomeSubdirs(a.home)
 	for _, name := range subdirs {
 		p := filepath.Join(a.home, name)
-		if !a.config.IsExcluded(p) {
-			dirs = append(dirs, p)
-		}
-	}
-	if len(dirs) == 0 {
-		dirs = []string{a.home}
-	}
-	// Append extra directories (manually added) from config.
-	for _, d := range a.config.GetExtraDirs() {
-		if !a.config.IsExcluded(d) {
-			dirs = append(dirs, d)
-		}
-	}
-	// Auto-detect mapped network drives and include them.
-	seen := make(map[string]bool)
-	for _, d := range dirs {
-		seen[strings.ToLower(d)] = true
-	}
-	for _, nd := range shared.NetworkDrives() {
-		if !seen[strings.ToLower(nd)] && !a.config.IsExcluded(nd) {
-			dirs = append(dirs, nd)
+		if a.config.IsIncluded(p) {
+			add(p)
 		}
 	}
 	return dirs
@@ -152,13 +150,11 @@ func (a *App) makeFolderState(name, path string) FolderState {
 	return FolderState{
 		Name:        name,
 		Path:        path,
-		Indexed:     !a.config.IsExcluded(path),
+		Indexed:     a.config.IsIncluded(path) && !a.config.IsExcluded(path),
 		PathOnly:    a.config.IsPathOnly(path),
 		HasChildren: hasSubdirs(path),
 	}
 }
-
-
 
 func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
@@ -403,7 +399,7 @@ var systemPathSkipDirs = map[string]bool{
 var junkExtensions = map[string]bool{
 	".tmp": true, ".temp": true, ".log": true, ".etl": true,
 	".dmp": true, ".mdmp": true,
-	".pf":  true, ".sdf": true,
+	".pf": true, ".sdf": true,
 	".db-wal": true, ".db-shm": true,
 }
 
@@ -436,27 +432,27 @@ func isJunkFile(name string) bool {
 // this folder? If no, it belongs here.
 var contentSkipDirNames = map[string]bool{
 	// ── System / Windows ────────────────────────────────────────────────────
-	"appdata":        true, // roaming + local + locallow
-	"program files":  true,
-	"program files (x86)": true,
-	"programdata":    true,
-	"windows":        true,
-	"$windows.~bt":   true,
-	"$windows.~ws":   true,
+	"appdata":                   true, // roaming + local + locallow
+	"program files":             true,
+	"program files (x86)":       true,
+	"programdata":               true,
+	"windows":                   true,
+	"$windows.~bt":              true,
+	"$windows.~ws":              true,
 	"system volume information": true,
-	"$recycle.bin":   true,
-	"recovery":       true,
+	"$recycle.bin":              true,
+	"recovery":                  true,
 
 	// ── Package / dependency caches ─────────────────────────────────────────
 	// Go
-	"pkg":            true, // catches go\pkg\mod — checked via path prefix below too
+	"pkg": true, // catches go\pkg\mod — checked via path prefix below too
 	// Rust
-	".cargo":         true,
+	".cargo": true,
 	// Java / Kotlin
-	".m2":            true,
-	".gradle":        true,
+	".m2":     true,
+	".gradle": true,
 	// .NET
-	".nuget":         true,
+	".nuget": true,
 	// Python
 	"__pycache__":   true,
 	".venv":         true,
@@ -471,25 +467,25 @@ var contentSkipDirNames = map[string]bool{
 	"gems":    true,
 
 	// ── Version control internals ────────────────────────────────────────────
-	".git":           true,
-	".hg":            true,
-	".svn":           true,
+	".git": true,
+	".hg":  true,
+	".svn": true,
 
 	// ── IDE / editor state ───────────────────────────────────────────────────
-	".vscode":        true,
-	".idea":          true,
-	".vs":            true,
-	".eclipse":       true,
-	".metadata":      true, // Eclipse workspace metadata
-	".settings":      true, // Eclipse project settings
+	".vscode":   true,
+	".idea":     true,
+	".vs":       true,
+	".eclipse":  true,
+	".metadata": true, // Eclipse workspace metadata
+	".settings": true, // Eclipse project settings
 
 	// ── Build outputs ────────────────────────────────────────────────────────
-	"target":         true, // Rust / Maven / Gradle build output
-	"dist":           true, // JS/Python dist
-	"build":          true, // common build dir
-	"out":            true, // common output dir
-	"bin":            true, // compiled binaries
-	"obj":            true, // .NET intermediate objects
+	"target":        true, // Rust / Maven / Gradle build output
+	"dist":          true, // JS/Python dist
+	"build":         true, // common build dir
+	"out":           true, // common output dir
+	"bin":           true, // compiled binaries
+	"obj":           true, // .NET intermediate objects
 	".next":         true, // Next.js build cache
 	".nuxt":         true,
 	".output":       true,
@@ -497,10 +493,10 @@ var contentSkipDirNames = map[string]bool{
 	".parcel-cache": true,
 
 	// ── Container / VM ───────────────────────────────────────────────────────
-	".docker":        true,
-	"virtualbox vms": true,
+	".docker":          true,
+	"virtualbox vms":   true,
 	"virtual machines": true, // Hyper-V / VMware
-	"vmware":         true,
+	"vmware":           true,
 
 	// ── Games (Documents sub-folders & top-level) ────────────────────────────
 	"my games":               true,
@@ -533,19 +529,19 @@ var contentSkipDirNames = map[string]bool{
 	"thumbnailcache": true,
 
 	// ── Media libraries (large files, not text-searchable content) ───────────
-	"music":          true,
-	"videos":         true,
-	"movies":         true,
-	"tv shows":       true,
+	"music":    true,
+	"videos":   true,
+	"movies":   true,
+	"tv shows": true,
 
 	// ── Misc tool dirs ───────────────────────────────────────────────────────
 	".android": true, // Android SDK AVDs
 	"android":  true,
-	".ssh":           true, // private keys — never index
-	".gnupg":         true, // GPG keys
-	".aws":           true, // credentials
-	".azure":         true,
-	".kube":          true, // kubeconfig
+	".ssh":     true, // private keys — never index
+	".gnupg":   true, // GPG keys
+	".aws":     true, // credentials
+	".azure":   true,
+	".kube":    true, // kubeconfig
 }
 
 // isContentSkippedDir returns true if this directory should be entirely skipped.
@@ -744,6 +740,7 @@ func (a *App) startup(ctx context.Context) {
 		home = cwd
 	}
 	a.home = home
+	a.config.EnsureDefaultIncludedDirs(a.home)
 
 	if a.config.HasCheckedGPU {
 		a.hasGPU.Store(a.config.HasGPU)
@@ -777,7 +774,6 @@ func (a *App) startup(ctx context.Context) {
 			a.config.Save()
 		}()
 	}
-
 
 	log.Println("[Boot 3] Initializing logger...")
 
@@ -841,6 +837,9 @@ func (a *App) startup(ctx context.Context) {
 			log.Println("[Boot 8] Running background metadata sync...")
 			// runPass1 checks for new/deleted files (Metadata)
 			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+			if err := a.engine.PruneOutsideRoots(dirs); err != nil {
+				log.Printf("[Indexer] scoped prune error: %v", err)
+			}
 
 			// Deterministically block until pass 1 metadata has landed on disk
 			a.engine.Flush()
@@ -866,7 +865,6 @@ func (a *App) startup(ctx context.Context) {
 			shared.NewTelemetryOptimizer(idxCtx, a.engine).Start()
 			a.daemon = daemon.NewDaemon(dirs, a.engine)
 			a.daemon.Start()
-			go runSystemPathIndex(idxCtx, a.engine)
 		}()
 	}()
 
@@ -1148,17 +1146,9 @@ func (a *App) GetHomeFolders() []FolderState {
 		result = append(result, a.makeFolderState(name, p))
 	}
 	// Append manually added extra directories.
-	seen := make(map[string]bool)
 	for _, d := range a.config.GetExtraDirs() {
 		name := filepath.Base(d)
 		result = append(result, a.makeFolderState(name+" (extra)", d))
-		seen[strings.ToLower(d)] = true
-	}
-	// Auto-detected network drives.
-	for _, nd := range shared.NetworkDrives() {
-		if !seen[strings.ToLower(nd)] {
-			result = append(result, a.makeFolderState(nd+" (network)", nd))
-		}
 	}
 	return result
 }
@@ -1189,6 +1179,7 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	if a.engine == nil {
 		return fmt.Errorf("backend engine not initialized")
 	}
+	a.config.SetIncluded(folderPath, indexed)
 	a.config.SetExcluded(folderPath, !indexed)
 	if err := a.config.Save(); err != nil {
 		return err
@@ -1200,6 +1191,13 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	}
 
 	if !indexed {
+		if err := a.engine.DeletePathsUnderDir(folderPath); err != nil {
+			log.Printf("SetFolderIndexed: delete disabled folder path error: %v", err)
+		}
+		if err := a.engine.PruneOutsideRoots(a.getContentDirs()); err != nil {
+			log.Printf("SetFolderIndexed: prune outside roots error: %v", err)
+		}
+		a.engine.Flush()
 		// Just disable — restart daemon and done.
 		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
 		a.daemon.Start()
@@ -1308,10 +1306,18 @@ func (a *App) RemoveExtraDirectory(dirPath string) error {
 	if !a.config.RemoveExtraDir(dirPath) {
 		return nil // wasn't present
 	}
+	a.config.SetIncluded(dirPath, false)
+	a.config.SetExcluded(dirPath, true)
 	if err := a.config.Save(); err != nil {
 		return err
 	}
 	log.Printf("Removed extra directory: %s", dirPath)
+	if a.engine != nil {
+		if err := a.engine.DeletePathsUnderDir(dirPath); err != nil {
+			log.Printf("RemoveExtraDirectory: delete indexed paths error: %v", err)
+		}
+		a.engine.Flush()
+	}
 	if a.daemon != nil {
 		a.daemon.Stop()
 	}
@@ -1563,9 +1569,9 @@ func main() {
 	go runTray(app)
 
 	err := wails.Run(&options.App{
-		Title:  "Filosophy",
-		Width:  1280,
-		Height: 800,
+		Title:             "Filosophy",
+		Width:             1280,
+		Height:            800,
 		HideWindowOnClose: true,
 		AssetServer: &assetserver.Options{
 			Assets:  assets,

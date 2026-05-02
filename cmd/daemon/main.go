@@ -52,7 +52,6 @@ func getHomeSubdirs(home string) []string {
 	return names
 }
 
-
 func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -68,37 +67,36 @@ func main() {
 		log.SetOutput(lf)
 	}
 
-// Compute which home subdirectories to watch (same logic as main.go).
+	// Compute which home subdirectories to watch (same logic as main.go).
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal("daemon: cannot determine home directory:", err)
 	}
 	config := shared.LoadConfig(cwd)
+	config.EnsureDefaultIncludedDirs(home)
 	subdirs := getHomeSubdirs(home)
 	var baseDirs []string
+	seen := make(map[string]bool)
+	add := func(dir string) {
+		key := strings.ToLower(filepath.Clean(dir))
+		if key == "" || seen[key] || config.IsExcluded(dir) {
+			return
+		}
+		seen[key] = true
+		baseDirs = append(baseDirs, dir)
+	}
+	for _, dir := range shared.DefaultIndexedDirs(home) {
+		if config.IsIncluded(dir) {
+			add(dir)
+		}
+	}
+	for _, d := range config.GetExtraDirs() {
+		add(d)
+	}
 	for _, name := range subdirs {
 		p := filepath.Join(home, name)
-		if !config.IsExcluded(p) {
-			baseDirs = append(baseDirs, p)
-		}
-	}
-	if len(baseDirs) == 0 {
-		baseDirs = []string{home}
-	}
-	// Include extra directories (e.g. network drives) from config.
-	for _, d := range config.GetExtraDirs() {
-		if !config.IsExcluded(d) {
-			baseDirs = append(baseDirs, d)
-		}
-	}
-	// Auto-detect mapped network drives.
-	seen := make(map[string]bool)
-	for _, d := range baseDirs {
-		seen[strings.ToLower(d)] = true
-	}
-	for _, nd := range shared.NetworkDrives() {
-		if !seen[strings.ToLower(nd)] && !config.IsExcluded(nd) {
-			baseDirs = append(baseDirs, nd)
+		if config.IsIncluded(p) {
+			add(p)
 		}
 	}
 

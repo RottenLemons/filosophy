@@ -517,7 +517,7 @@
               <div class="shrink-0">
                 <h4 class="text-3xl font-serif text-[#e7e5e5] tracking-[-0.02em] font-medium mb-3 text-pretty">Content Libraries</h4>
                 <p class="text-xs text-[#acabab] font-sans tracking-tight leading-relaxed max-w-lg opacity-80">
-                  Select the directories you want Filosophy to monitor. Folders are recursively indexed for semantic search and metadata extraction.
+                  Filosophy indexes Desktop, Documents, and Downloads by default. Add or enable more folders here to include their paths and contents in search.
                 </p>
               </div>
 

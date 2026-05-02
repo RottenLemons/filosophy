@@ -1,0 +1,142 @@
+/* Global styles for Filosophy */
+/* Carbon g10 (warm light) theme is applied via the layout */
+
+:root {
+  --f-accent:     #1B5E8E;
+  --f-accent-lt:  #EBF3FA;
+  --f-accent-md:  #C5DDEF;
+  --f-bg:         #F7F6F3;
+  --f-bg2:        #FFFFFF;
+  --f-bg3:        #F0EFEB;
+  --f-bg4:        #E8E6E1;
+  --f-border:     #E2E0DB;
+  --f-border-md:  #D0CEC8;
+  --f-text:       #1A1916;
+  --f-text-2:     #4A4844;
+  --f-text-3:     #8A8882;
+  --f-green:      #1A7A4A;
+  --f-green-lt:   #E8F5EE;
+  --f-font-ui:    'IBM Plex Sans', sans-serif;
+  --f-font-serif: 'IBM Plex Serif', Georgia, serif;
+  --f-radius:     8px;
+  --f-shadow-sm:  0 1px 3px rgba(0,0,0,0.07);
+  --f-shadow-md:  0 4px 16px rgba(0,0,0,0.09);
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--f-bg);
+  color: var(--f-text);
+  font-family: var(--f-font-ui);
+}
+
+/* ── Override Carbon shell to match our warm palette ── */
+.bx--header {
+  background: var(--f-bg2) !important;
+  border-bottom: 1px solid var(--f-border) !important;
+}
+.bx--header__name {
+  color: var(--f-text) !important;
+  font-family: var(--f-font-serif) !important;
+  font-weight: 500 !important;
+}
+.bx--header__action:hover,
+.bx--header__menu-trigger:hover {
+  background: var(--f-bg3) !important;
+}
+.bx--side-nav {
+  background: var(--f-bg2) !important;
+  border-right: 1px solid var(--f-border) !important;
+}
+.bx--side-nav__item:not(.bx--side-nav__item--active) > .bx--side-nav__link:hover {
+  background: var(--f-bg3) !important;
+  color: var(--f-text) !important;
+}
+.bx--side-nav__link--current,
+.bx--side-nav__item--active > .bx--side-nav__link {
+  background: var(--f-accent-lt) !important;
+  color: var(--f-accent) !important;
+}
+.bx--side-nav__link--current::before,
+.bx--side-nav__item--active > .bx--side-nav__link::before {
+  background: var(--f-accent) !important;
+}
+.bx--side-nav__link-text {
+  color: inherit !important;
+}
+.bx--side-nav__icon {
+  fill: currentColor !important;
+}
+
+/* Search input */
+.bx--search-input {
+  background: var(--f-bg2) !important;
+  border-bottom-color: var(--f-border-md) !important;
+}
+.bx--search-input:focus {
+  outline: 2px solid var(--f-accent) !important;
+}
+
+/* Buttons */
+.bx--btn--primary {
+  background: var(--f-accent) !important;
+}
+.bx--btn--primary:hover {
+  background: #1a5280 !important;
+}
+.bx--btn--ghost {
+  color: var(--f-accent) !important;
+}
+
+/* Tags */
+.bx--tag--blue {
+  background: var(--f-accent-lt) !important;
+  color: var(--f-accent) !important;
+}
+.bx--tag--green {
+  background: var(--f-green-lt) !important;
+  color: var(--f-green) !important;
+}
+
+/* Tile */
+.bx--tile {
+  background: var(--f-bg2) !important;
+  border: 1px solid var(--f-border) !important;
+}
+.bx--tile:hover,
+.bx--clickable-tile:hover {
+  background: var(--f-bg3) !important;
+  border-color: var(--f-border-md) !important;
+}
+
+/* Content layout */
+.f-content {
+  margin-left: 256px; /* width of collapsed+expanded side nav */
+  padding-top: 48px;  /* height of header */
+  min-height: 100vh;
+  background: var(--f-bg);
+}
+
+/* Animation utilities */
+@keyframes f-fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes f-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes f-result-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes f-blink {
+  0%,100% { opacity: 1; }
+  50%     { opacity: 0; }
+}
+
+.f-fade-up  { animation: f-fade-up  0.4s cubic-bezier(0.4,0,0.2,1) both; }
+.f-fade-in  { animation: f-fade-in  0.3s ease both; }
+.f-result-in{ animation: f-result-in 0.35s cubic-bezier(0.4,0,0.2,1) both; }

@@ -9,13 +9,19 @@ import (
 	"sync"
 )
 
+// AppConfig is the persisted application configuration.
+//
+// The exported fields are serialized to filosophy_config.json. The unexported
+// normalized slices are rebuilt after every mutation so path checks stay cheap
+// during large indexing walks.
 type AppConfig struct {
-	ExcludedPaths   []string `json:"ExcludedPaths"`
-	PathOnlyDirs    []string `json:"PathOnlyDirs,omitempty"`
-	ExtraDirs       []string `json:"ExtraDirs,omitempty"`
-	GPUEnabled      bool     `json:"GPUEnabled"`
-	HasGPU          bool     `json:"HasGPU"`
-	HasCheckedGPU   bool     `json:"HasCheckedGPU"`
+	ExcludedPaths []string `json:"ExcludedPaths"`
+	IncludedDirs  []string `json:"IncludedDirs,omitempty"`
+	PathOnlyDirs  []string `json:"PathOnlyDirs,omitempty"`
+	ExtraDirs     []string `json:"ExtraDirs,omitempty"`
+	GPUEnabled    bool     `json:"GPUEnabled"`
+	HasGPU        bool     `json:"HasGPU"`
+	HasCheckedGPU bool     `json:"HasCheckedGPU"`
 
 	// External REST API
 	APIEnabled bool   `json:"APIEnabled"`
@@ -26,13 +32,30 @@ type AppConfig struct {
 	MCPEnabled bool   `json:"MCPEnabled"`
 	MCPKey     string `json:"MCPKey"`
 
-	path                  string
-	mu                    sync.RWMutex
-	normalizedPaths       []string `json:"-"`
+	path                   string
+	mu                     sync.RWMutex
+	normalizedPaths        []string `json:"-"`
+	normalizedIncludedDirs []string `json:"-"`
 	normalizedPathOnlyDirs []string `json:"-"`
 }
 
+// DefaultIndexedFolderNames names the home-directory folders enabled for
+// indexing when no user-selected include list exists yet.
+var DefaultIndexedFolderNames = []string{"Desktop", "Documents", "Downloads"}
 
+// DefaultIndexedDirs expands DefaultIndexedFolderNames beneath home.
+func DefaultIndexedDirs(home string) []string {
+	dirs := make([]string, 0, len(DefaultIndexedFolderNames))
+	for _, name := range DefaultIndexedFolderNames {
+		dirs = append(dirs, filepath.Join(home, name))
+	}
+	return dirs
+}
+
+// rebuildCacheLocked refreshes normalized path lookup caches.
+//
+// Callers must hold c.mu. Paths are stored in slash form with a trailing slash
+// so descendant checks can be made with simple prefix comparisons.
 func (c *AppConfig) rebuildCacheLocked() {
 	c.normalizedPaths = make([]string, len(c.ExcludedPaths))
 	for i, p := range c.ExcludedPaths {
@@ -41,6 +64,14 @@ func (c *AppConfig) rebuildCacheLocked() {
 			v += "/"
 		}
 		c.normalizedPaths[i] = v
+	}
+	c.normalizedIncludedDirs = make([]string, len(c.IncludedDirs))
+	for i, p := range c.IncludedDirs {
+		v := strings.ToLower(filepath.ToSlash(p))
+		if !strings.HasSuffix(v, "/") {
+			v += "/"
+		}
+		c.normalizedIncludedDirs[i] = v
 	}
 	c.normalizedPathOnlyDirs = make([]string, len(c.PathOnlyDirs))
 	for i, p := range c.PathOnlyDirs {
@@ -52,11 +83,16 @@ func (c *AppConfig) rebuildCacheLocked() {
 	}
 }
 
+// LoadConfig reads filosophy_config.json from dir, applies defaults, and
+// migrates the old filosophy_excluded.json file when present.
+//
+// Invalid or missing config files fall back to defaults so app startup is not
+// blocked by a corrupt local settings file.
 func LoadConfig(dir string) *AppConfig {
 	path := filepath.Join(dir, "filosophy_config.json")
 	// Try to migrate from old excluded config if it exists
 	oldPath := filepath.Join(dir, "filosophy_excluded.json")
-	
+
 	config := &AppConfig{
 		ExcludedPaths: []string{".git", "node_modules", "anaconda3", "miniconda3"},
 		GPUEnabled:    false,
@@ -83,11 +119,25 @@ func LoadConfig(dir string) *AppConfig {
 	return config
 }
 
+// EnsureDefaultIncludedDirs initializes the include list to the standard home
+// folders the first time the app runs.
+func (c *AppConfig) EnsureDefaultIncludedDirs(home string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	if len(c.IncludedDirs) > 0 {
+		c.rebuildCacheLocked()
+		return
+	}
+	c.IncludedDirs = DefaultIndexedDirs(home)
+	c.rebuildCacheLocked()
+}
+
+// Save de-duplicates, sorts, and writes the config file.
 func (c *AppConfig) Save() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	// Normalize paths
 	unique := make(map[string]bool)
 	var paths []string
@@ -100,6 +150,18 @@ func (c *AppConfig) Save() error {
 	}
 	sort.Strings(paths)
 	c.ExcludedPaths = paths
+
+	unique = make(map[string]bool)
+	var included []string
+	for _, p := range c.IncludedDirs {
+		l := strings.ToLower(p)
+		if !unique[l] {
+			unique[l] = true
+			included = append(included, p)
+		}
+	}
+	sort.Strings(included)
+	c.IncludedDirs = included
 	c.rebuildCacheLocked()
 
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -109,6 +171,8 @@ func (c *AppConfig) Save() error {
 	return os.WriteFile(c.path, data, 0644)
 }
 
+// IsExcluded reports whether path is exactly excluded or is inside an excluded
+// directory.
 func (c *AppConfig) IsExcluded(path string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -120,6 +184,46 @@ func (c *AppConfig) IsExcluded(path string) bool {
 		}
 	}
 	return false
+}
+
+// IsIncluded reports whether path is exactly included or is inside an included
+// directory.
+func (c *AppConfig) IsIncluded(path string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	lower := strings.ToLower(filepath.ToSlash(path))
+	for _, included := range c.normalizedIncludedDirs {
+		if lower == strings.TrimSuffix(included, "/") || strings.HasPrefix(lower, included) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetIncluded adds or removes path from the content indexing include list.
+func (c *AppConfig) SetIncluded(path string, included bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	lower := strings.ToLower(path)
+	newDirs := []string{}
+	found := false
+	for _, p := range c.IncludedDirs {
+		if strings.ToLower(p) == lower {
+			found = true
+			if included {
+				newDirs = append(newDirs, p)
+			}
+		} else {
+			newDirs = append(newDirs, p)
+		}
+	}
+	if included && !found {
+		newDirs = append(newDirs, path)
+	}
+	c.IncludedDirs = newDirs
+	c.rebuildCacheLocked()
 }
 
 // IsPathOnly returns true if path is under a path-only directory.
@@ -164,14 +268,15 @@ func (c *AppConfig) SetPathOnly(path string, pathOnly bool) {
 	c.rebuildCacheLocked()
 }
 
+// SetExcluded adds or removes path from the exclusion list.
 func (c *AppConfig) SetExcluded(path string, excluded bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	lower := strings.ToLower(path)
 	newPaths := []string{}
 	found := false
-	
+
 	for _, p := range c.ExcludedPaths {
 		if strings.ToLower(p) == lower {
 			if excluded {
@@ -182,17 +287,12 @@ func (c *AppConfig) SetExcluded(path string, excluded bool) {
 			newPaths = append(newPaths, p)
 		}
 	}
-	
+
 	if excluded && !found {
 		newPaths = append(newPaths, path)
 	}
-	
-	if !excluded {
-		// If we are removing an exclusion, we just filter it out
-		c.ExcludedPaths = newPaths
-	} else {
-		c.ExcludedPaths = newPaths
-	}
+
+	c.ExcludedPaths = newPaths
 	c.rebuildCacheLocked()
 }
 

@@ -1,6 +1,7 @@
-// Package Engine provides embedding generation and vector search functionality
+// Package shared provides embedding generation and vector search functionality
 // using onnxruntime_go (ONNX inference) and sqvect (SQLite vector DB).
-// It replaces the Python Engine.py with a native Go library.
+// The Engine type owns local inference sessions, SQLite metadata, vector
+// storage, and ranking helpers used by the desktop app and API server.
 package shared
 
 /*
@@ -1525,6 +1526,113 @@ func (s *Engine) PruneStale(livePaths []string) error {
 		return nil
 	}
 	return s.DeletePaths(stale)
+}
+
+// PruneOutsideRoots deletes indexed records whose paths no longer live under
+// any configured root. It is used when the user narrows the indexing scope so
+// old results do not remain searchable.
+func (s *Engine) PruneOutsideRoots(roots []string) error {
+	if len(roots) == 0 {
+		return nil
+	}
+	normalizedRoots := make([]string, 0, len(roots)*2)
+	for _, root := range roots {
+		clean := filepath.Clean(root)
+		if clean == "." || clean == "" {
+			continue
+		}
+		for _, candidate := range []string{clean, filepath.ToSlash(clean)} {
+			candidate = strings.ToLower(candidate)
+			if !strings.HasSuffix(candidate, string(filepath.Separator)) && !strings.HasSuffix(candidate, "/") {
+				candidate += "/"
+			}
+			normalizedRoots = append(normalizedRoots, candidate)
+		}
+	}
+	if len(normalizedRoots) == 0 {
+		return nil
+	}
+
+	paths, err := s.allIndexedPaths()
+	if err != nil {
+		return err
+	}
+	var outside []string
+	for _, p := range paths {
+		lower := strings.ToLower(filepath.ToSlash(p))
+		inScope := false
+		for _, root := range normalizedRoots {
+			root = filepath.ToSlash(root)
+			if lower == strings.TrimSuffix(root, "/") || strings.HasPrefix(lower, root) {
+				inScope = true
+				break
+			}
+		}
+		if !inScope {
+			outside = append(outside, p)
+		}
+	}
+	return s.DeletePaths(outside)
+}
+
+// DeletePathsUnderDir removes all indexed records for dirPath and descendants.
+// Both file metadata and path-only FTS entries are scanned because directories
+// can be indexed without corresponding file records.
+func (s *Engine) DeletePathsUnderDir(dirPath string) error {
+	clean := filepath.Clean(dirPath)
+	prefixes := []string{
+		strings.TrimRight(clean, `\/`) + string(filepath.Separator),
+		strings.TrimRight(filepath.ToSlash(clean), `\/`) + "/",
+	}
+	var matches []string
+	for _, prefix := range prefixes {
+		for _, table := range []string{"files", "paths_fts"} {
+			rows, err := s.sqlDB.QueryContext(context.Background(), `SELECT path FROM `+table+` WHERE path = ? OR path LIKE ?`, strings.TrimRight(prefix, `\/`), prefix+"%")
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var p string
+				if err := rows.Scan(&p); err != nil {
+					rows.Close()
+					return err
+				}
+				matches = append(matches, p)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+	}
+	return s.DeletePaths(matches)
+}
+
+func (s *Engine) allIndexedPaths() ([]string, error) {
+	seen := make(map[string]bool)
+	var paths []string
+	for _, table := range []string{"files", "paths_fts"} {
+		rows, err := s.sqlDB.QueryContext(context.Background(), `SELECT path FROM `+table)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
 }
 
 // MarkContentIndexed sets content_indexed=1 for the given paths without storing

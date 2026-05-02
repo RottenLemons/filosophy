@@ -47,8 +47,8 @@ type Metadata struct {
 var imageExtensions = map[string]struct{}{
 	// Formats vipsthumbnail reliably handles and that are meaningful for CLIP.
 	".jpg": {}, ".jpeg": {}, ".jfif": {}, ".pjpeg": {}, ".pjp": {},
-	".png": {},
-	".gif": {},
+	".png":  {},
+	".gif":  {},
 	".webp": {},
 	// Explicitly excluded (vips fails or format is useless for semantic image search):
 	// .ico  — Windows icons, tiny, vips exits 0xffffffff
@@ -61,7 +61,7 @@ var imageExtensions = map[string]struct{}{
 // vipsthumbnail fails on them and they have no semantic search value.
 var imageSkipExtensions = map[string]struct{}{
 	".ico": {}, ".cur": {}, ".ani": {},
-	".bmp": {},
+	".bmp":  {},
 	".tiff": {}, ".tif": {},
 	".heic": {}, ".heif": {},
 	".avif": {},
@@ -171,9 +171,9 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 	if sc == nil {
 		return
 	}
-	
+
 	item := Metadata{content, path, hash, mtime, size, ctime, atime}
-	
+
 	select {
 	case chunks <- item:
 		// Queued successfully
@@ -189,12 +189,12 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 				done = true
 			}
 		}
-		
+
 		// Attempt to queue the current item again or just include it in batch
 		if len(items) < cap(chunks) {
 			items = append(items, item)
 		} else {
-			// Extremely rare: channel refilled while we were draining. 
+			// Extremely rare: channel refilled while we were draining.
 			// Process separately.
 			IndexBatch([]Metadata{item}, mode, sc)
 		}
@@ -244,7 +244,7 @@ func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorCo
 		return
 	}
 	hash := mtime ^ size
-	
+
 	// Add job to batched vips pipeline
 	cfg.Batcher.Add(ImageJob{
 		Path:  path,
@@ -336,14 +336,13 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	}
 }
 
-// ProcessDirectory adds directory path to the chunks channel.
+// ProcessDirectory indexes a directory path for path/filename search.
 func ProcessDirectory(path string, cfg *ProcessorConfig) {
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
 	HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, 0, 0, 0, 0)
 }
-
 
 // NewProcessorConfig creates a new ProcessorConfig with default settings.
 // Creates a temp directory for image conversions; caller must call CleanupTempDir() when done.
@@ -379,7 +378,7 @@ func NewProcessorConfig(chunkSize, chunkCap, imageCap int, sc *Engine, hw Hardwa
 	return cfg, nil
 }
 
-// Flush pending batches
+// Flush forces pending image and text batches through the indexing pipeline.
 func (cfg *ProcessorConfig) Flush() {
 	if cfg != nil && cfg.Batcher != nil {
 		cfg.Batcher.Flush()
