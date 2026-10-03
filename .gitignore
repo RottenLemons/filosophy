@@ -37,6 +37,7 @@ yarn-error.log*
 .pnpm-debug.log*
 frontend/dist/
 frontend/.svelte-kit/
+/dist/
 
 # Go
 go.sum          # (optional, but you may wish to keep it in version control)
@@ -45,6 +46,7 @@ vendor/
 *.dll
 *.so
 *.dylib
+libtokenizers.a
 filosophy       # binary name
 
 # Wails
@@ -80,6 +82,9 @@ check_dll.py
 reranker.onnx
 tokenizer.json
 filosophy.log
+*.log
+filosophy_config.json
+frontend/package.json.md5
 filosophy-app.pid
 filosophy-daemon.pid
 filosophy-config.json

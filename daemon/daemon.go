@@ -2,7 +2,6 @@
 package daemon
 
 import (
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 
 	"filosophy/shared"
 
-	"github.com/cespare/xxhash"
 	"github.com/syncthing/notify"
 )
 
@@ -77,17 +75,7 @@ func (s sentinel) Sys() interface{}    { return nil }
 
 // hashFile returns the xxhash of a file's contents as int64 (for SQLite compatibility).
 func hashFile(path string) (int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	h := xxhash.New()
-	if _, err := io.Copy(h, io.LimitReader(f, 65536)); err != nil {
-		return 0, err
-	}
-	return int64(h.Sum64()), nil
+	return shared.HashFile(path)
 }
 
 // getHash returns the cached hash for a path, or queries the DB on cache miss.

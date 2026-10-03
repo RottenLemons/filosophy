@@ -1,11 +1,6 @@
 <script lang="ts">
-  import WhatsAppTab from '$lib/components/WhatsAppTab.svelte';
-
-  let showWhatsApp = true;
-
   const connections = [
     { name: 'Local files', status: 'Enabled', detail: 'Indexed folders are managed in Settings.' },
-    { name: 'WhatsApp', status: 'Available', detail: 'Connect and search message history locally.' },
     { name: 'Local LLM', status: 'Optional', detail: 'Configure an Ollama, LM Studio, or OpenAI-compatible endpoint in Settings.' },
     { name: 'Local API', status: 'Optional', detail: 'Expose search to scripts and tools from Settings.' }
   ];
@@ -33,22 +28,6 @@
     {/each}
   </div>
 
-  <section class="f-panel whatsapp-panel">
-    <div class="panel-head">
-      <div>
-        <h2>WhatsApp</h2>
-        <p>Connect, browse, and search messages from the desktop app.</p>
-      </div>
-      <button class="f-button" type="button" on:click={() => showWhatsApp = !showWhatsApp}>
-        {showWhatsApp ? 'Hide' : 'Show'}
-      </button>
-    </div>
-    {#if showWhatsApp}
-      <div class="wa-wrap">
-        <WhatsAppTab />
-      </div>
-    {/if}
-  </section>
 </div>
 
 <style>
@@ -60,7 +39,6 @@
   }
 
   h1,
-  h2,
   p {
     margin: 0;
   }
@@ -71,13 +49,7 @@
     margin-bottom: 6px;
   }
 
-  h2 {
-    font-size: 17px;
-    font-weight: 650;
-  }
-
   .page-head p,
-  .panel-head p,
   .connection-card p {
     color: var(--f-text-2);
     line-height: 1.5;
@@ -106,21 +78,4 @@
     font-size: 13px;
   }
 
-  .whatsapp-panel {
-    overflow: hidden;
-  }
-
-  .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 16px;
-    border-bottom: 1px solid var(--f-border);
-  }
-
-  .wa-wrap {
-    height: 620px;
-    overflow: hidden;
-  }
 </style>

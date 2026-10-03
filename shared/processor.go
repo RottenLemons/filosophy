@@ -3,6 +3,7 @@ package shared
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -42,6 +43,7 @@ type Metadata struct {
 	Size          int64
 	Ctime         int64
 	Atime         int64
+	FileDone      bool
 }
 
 var imageExtensions = map[string]struct{}{
@@ -94,59 +96,31 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	if sc == nil || len(items) == 0 {
 		return
 	}
-	// Separate items into:
-	//   contentItems — have real content, need embedding
-	//   skipPaths    — processed but no extractable content (binary files, etc.)
-	//                  must be marked content_indexed=1 so they are never reprocessed
-	var contentItems []Metadata
-	var skipPaths []string
-	for _, item := range items {
-		if item.Hash == empty {
-			// No content — still mark as indexed so UnindexedFiles() skips them next run.
-			skipPaths = append(skipPaths, item.Path)
-		} else {
-			contentItems = append(contentItems, item)
-		}
-	}
+	plan := makeIndexBatchPlan(items)
 
-	// Mark skip items immediately (single transaction, fast).
-	if len(skipPaths) > 0 {
-		if err := sc.MarkContentIndexed(skipPaths); err != nil {
+	if len(plan.skipPaths) > 0 {
+		if err := sc.MarkContentIndexed(plan.skipPaths, plan.skipHashes, plan.skipMtimes, plan.skipSizes, plan.skipCtimes, plan.skipAtimes); err != nil {
 			log.Printf("IndexBatch MarkContentIndexed error: %v", err)
 		}
 	}
 
-	if len(contentItems) == 0 {
+	if len(plan.contentItems) == 0 {
 		return
 	}
 
-	contents := make([]string, len(contentItems))
-	paths := make([]string, len(contentItems))
-	filePaths := make([]string, 0, len(contentItems))
-	fileHashes := make([]int64, 0, len(contentItems))
-	fileMtimes := make([]int64, 0, len(contentItems))
-	fileSizes := make([]int64, 0, len(contentItems))
-	fileCtimes := make([]int64, 0, len(contentItems))
-	fileAtimes := make([]int64, 0, len(contentItems))
+	contents := make([]string, len(plan.contentItems))
+	paths := make([]string, len(plan.contentItems))
 
-	for i, item := range contentItems {
+	for i, item := range plan.contentItems {
 		contents[i] = item.Content
 		paths[i] = item.Path
-		// Only the first chunk of a file has the real hash; subsequent chunks use empty.
-		// Here contentItems only contains items with hash != empty (first chunks only).
-		filePaths = append(filePaths, item.Path)
-		fileHashes = append(fileHashes, item.Hash)
-		fileMtimes = append(fileMtimes, item.Mtime)
-		fileSizes = append(fileSizes, item.Size)
-		fileCtimes = append(fileCtimes, item.Ctime)
-		fileAtimes = append(fileAtimes, item.Atime)
 	}
 
 	var err error
 	if mode == "image" {
-		err = sc.IndexImage(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes)
+		err = sc.IndexImage(contents, paths, plan.filePaths, plan.fileHashes, plan.fileMtimes, plan.fileSizes, plan.fileCtimes, plan.fileAtimes, plan.completePaths)
 	} else {
-		err = sc.IndexText(contents, paths, filePaths, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes)
+		err = sc.IndexText(contents, paths, plan.filePaths, plan.fileHashes, plan.fileMtimes, plan.fileSizes, plan.fileCtimes, plan.fileAtimes, plan.completePaths)
 	}
 	if err != nil {
 		log.Printf("IndexBatch %s error: %v", mode, err)
@@ -164,6 +138,51 @@ func IndexBatch(items []Metadata, mode string, sc *Engine) {
 	sc.IndexPathsFTS(uniquePaths)
 }
 
+type indexBatchPlan struct {
+	contentItems                      []Metadata
+	skipPaths                         []string
+	skipHashes, skipMtimes, skipSizes []int64
+	skipCtimes, skipAtimes            []int64
+	filePaths                         []string
+	fileHashes, fileMtimes, fileSizes []int64
+	fileCtimes, fileAtimes            []int64
+	completePaths                     []string
+}
+
+func makeIndexBatchPlan(items []Metadata) indexBatchPlan {
+	var plan indexBatchPlan
+	seenFiles := make(map[string]struct{})
+	for _, item := range items {
+		if item.Content == "" {
+			plan.skipPaths = append(plan.skipPaths, item.Path)
+			plan.skipHashes = append(plan.skipHashes, item.Hash)
+			plan.skipMtimes = append(plan.skipMtimes, item.Mtime)
+			plan.skipSizes = append(plan.skipSizes, item.Size)
+			plan.skipCtimes = append(plan.skipCtimes, item.Ctime)
+			plan.skipAtimes = append(plan.skipAtimes, item.Atime)
+			continue
+		}
+		plan.contentItems = append(plan.contentItems, item)
+		if item.FileDone {
+			plan.completePaths = append(plan.completePaths, item.Path)
+		}
+		if item.Mtime == 0 && item.Size == 0 && item.Ctime == 0 && item.Atime == 0 {
+			continue
+		}
+		if _, exists := seenFiles[item.Path]; exists {
+			continue
+		}
+		seenFiles[item.Path] = struct{}{}
+		plan.filePaths = append(plan.filePaths, item.Path)
+		plan.fileHashes = append(plan.fileHashes, item.Hash)
+		plan.fileMtimes = append(plan.fileMtimes, item.Mtime)
+		plan.fileSizes = append(plan.fileSizes, item.Size)
+		plan.fileCtimes = append(plan.fileCtimes, item.Ctime)
+		plan.fileAtimes = append(plan.fileAtimes, item.Atime)
+	}
+	return plan
+}
+
 // HandleChunk adds metadata to a channel and flushes when full.
 // Contention issue fixed: Mutex removed from hot path as channels are natively thread-safe.
 // Flushing now uses a non-blocking select to drain efficiently.
@@ -172,8 +191,19 @@ func HandleChunk(chunks chan Metadata, sc *Engine, mode, content, path string, h
 		return
 	}
 
-	item := Metadata{content, path, hash, mtime, size, ctime, atime}
+	enqueueChunk(chunks, sc, mode, Metadata{
+		Content:  content,
+		Path:     path,
+		Hash:     hash,
+		Mtime:    mtime,
+		Size:     size,
+		Ctime:    ctime,
+		Atime:    atime,
+		FileDone: true,
+	})
+}
 
+func enqueueChunk(chunks chan Metadata, sc *Engine, mode string, item Metadata) {
 	select {
 	case chunks <- item:
 		// Queued successfully
@@ -236,14 +266,15 @@ type ProcessorConfig struct {
 }
 
 // ProcessImage converts an image to JPEG via vips and queues it for indexing.
-// Hash is derived from mtime^size to avoid reading the full file just for dedup.
-// On vipsthumbnail failure the file is still marked content_indexed=1 via the
-// empty sentinel so it is never retried on subsequent startups.
 func ProcessImage(path string, mtime, size, ctime, atime int64, cfg *ProcessorConfig) {
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
-	hash := mtime ^ size
+	hash, err := HashFile(path)
+	if err != nil {
+		log.Printf("ProcessImage: hash %s: %v", path, err)
+		return
+	}
 
 	// Add job to batched vips pipeline
 	cfg.Batcher.Add(ImageJob{
@@ -262,35 +293,57 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
-	// Skip unsupported extensions immediately — no kreuzberg call, no embedding,
-	// but still mark the file as content_indexed=1 via the empty-hash sentinel
-	// so UnindexedFiles() never returns it again.
+	hash, err := HashFile(path)
+	if err != nil {
+		log.Printf("ProcessText: hash %s: %v", path, err)
+		return
+	}
+
+	// Unsupported file types remain available to path search but have no text vectors.
 	ext := strings.ToLower(filepath.Ext(path))
 	if !textAllowExtensions[ext] {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
 	result, err := kreuzberg.ExtractFileSync(path, nil)
 	if err != nil || result == nil || result.Content == "" {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
-	hash := int64(xxhash.Sum64String(result.Content))
 	splits, err := cfg.Splitter.SplitText(result.Content)
 	if err != nil {
 		log.Println("Failed to split text:", err)
 		return
 	}
+	if len(splits) == 0 {
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
+		return
+	}
 
 	first := true
-	for _, chunk := range splits {
+	for i, chunk := range splits {
+		item := Metadata{Content: chunk, Path: path, FileDone: i == len(splits)-1}
 		if first {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, hash, mtime, size, ctime, atime)
+			item.Hash, item.Mtime, item.Size, item.Ctime, item.Atime = hash, mtime, size, ctime, atime
 			first = false
-		} else {
-			HandleChunk(cfg.Chunks, cfg.Engine, "text", chunk, path, empty, 0, 0, 0, 0)
 		}
+		enqueueChunk(cfg.Chunks, cfg.Engine, "text", item)
 	}
+}
+
+// HashFile returns the xxhash of the complete raw file contents.
+func HashFile(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	h := xxhash.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, err
+	}
+	return int64(h.Sum64()), nil
 }
 
 // ProcessFile processes a single file (image or text) based on its type.
@@ -310,7 +363,12 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	// Skip content extraction and embedding — just mark as indexed so it
 	// never re-appears in UnindexedFiles() on future startups.
 	if cfg.IsPathOnly != nil && cfg.IsPathOnly(path) {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
+		hash, err := HashFile(path)
+		if err != nil {
+			log.Printf("ProcessFile: hash %s: %v", path, err)
+			return
+		}
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
 
@@ -326,7 +384,12 @@ func ProcessFile(path string, cfg *ProcessorConfig) {
 	// Image formats that vips can't handle or have no semantic search value:
 	// skip immediately and mark as indexed so they're never retried.
 	if _, skip := imageSkipExtensions[ext]; skip {
-		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, empty, mtime, size, ctime, atime)
+		hash, err := HashFile(path)
+		if err != nil {
+			log.Printf("ProcessFile: hash %s: %v", path, err)
+			return
+		}
+		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
 	if IsImageFile(path) {

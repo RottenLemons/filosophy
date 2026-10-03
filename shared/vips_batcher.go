@@ -59,7 +59,7 @@ func (v *VipsBatcher) Add(job ImageJob) {
 	v.mu.Lock()
 	v.pending = append(v.pending, job)
 	batch := v.pending
-	
+
 	if v.flushTimer != nil {
 		v.flushTimer.Stop()
 	}
@@ -100,7 +100,7 @@ func (v *VipsBatcher) flushBatch(jobs []ImageJob) {
 	// We must ensure no two files in a single exec call have the same base name,
 	// otherwise vips will overwrite the generated thumbnail.
 	subBatches := [][]ImageJob{}
-	
+
 	// Create sub-batches guaranteeing unique base names per batch
 	for len(jobs) > 0 {
 		var currentBatch []ImageJob
@@ -132,16 +132,18 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 	}
 
 	args := make([]string, 0, len(jobs)+10)
-	
+
 	// Inject dynamic resource flags based on hardware profile.
 	args = append(args, fmt.Sprintf("--vips-concurrency=%d", v.cfg.Hardware.VIPSThreads))
 	args = append(args, fmt.Sprintf("--vips-cache-max=%d", v.cfg.Hardware.VIPSCache))
 	args = append(args, fmt.Sprintf("--vips-cache-max-memory=%d", v.cfg.Hardware.VIPSCache))
 
 	for _, j := range jobs {
+		base := strings.TrimSuffix(filepath.Base(j.Path), filepath.Ext(j.Path))
+		_ = os.Remove(filepath.Join(v.cfg.TempDir, base+"_v.jpg"))
 		args = append(args, j.Path)
 	}
-	
+
 	// -s 256x256! forces exact fit.
 	args = append(args, "-s", "256x256!")
 	// -o outputs to temp dir with the original basename + .jpg
@@ -149,11 +151,11 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 	args = append(args, "-o", outFmt+"[Q=80,strip]")
 
 	cmd := exec.Command(vipsThumbnailPath(), args...)
-	
+
 	// Use semaphore to restrict concurrency of external VIPS calls.
 	vipsSemaphore <- struct{}{}
 	defer func() { <-vipsSemaphore }()
-	
+
 	// We don't necessarily care about individual errors stopping the whole batch
 	if output, err := cmd.CombinedOutput(); err != nil {
 		outStr := strings.TrimSpace(string(output))
@@ -173,15 +175,28 @@ func (v *VipsBatcher) runVipsExec(jobs []ImageJob) {
 	for _, j := range jobs {
 		base := strings.TrimSuffix(filepath.Base(j.Path), filepath.Ext(j.Path))
 		expectedOut := filepath.Join(v.cfg.TempDir, base+"_v.jpg")
-		finalOut := filepath.Join(v.cfg.TempDir, fmt.Sprintf("%d.jpg", j.Hash))
 
 		if _, err := os.Stat(expectedOut); err == nil {
-			// Success: Rename to hash.jpg
-			os.Rename(expectedOut, finalOut)
-			HandleChunk(v.cfg.Images, v.cfg.Engine, "image", finalOut, j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime)
+			out, err := os.CreateTemp(v.cfg.TempDir, "thumb-*.jpg")
+			if err == nil {
+				finalOut := out.Name()
+				if closeErr := out.Close(); closeErr != nil {
+					err = closeErr
+				} else if removeErr := os.Remove(finalOut); removeErr != nil {
+					err = removeErr
+				} else {
+					err = os.Rename(expectedOut, finalOut)
+				}
+				if err == nil {
+					HandleChunk(v.cfg.Images, v.cfg.Engine, "image", finalOut, j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime)
+					continue
+				}
+				_ = os.Remove(finalOut)
+			}
+			log.Printf("vips output error for %s: %v", j.Path, err)
+			HandleChunk(v.cfg.Chunks, v.cfg.Engine, "text", "", j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime)
 		} else {
-			// Failed for this specific image: Create empty sentinel to prevent endless retrying
-			HandleChunk(v.cfg.Chunks, v.cfg.Engine, "text", "", j.Path, empty, j.MTime, j.Size, j.CTime, j.ATime)
+			HandleChunk(v.cfg.Chunks, v.cfg.Engine, "text", "", j.Path, j.Hash, j.MTime, j.Size, j.CTime, j.ATime)
 		}
 	}
 }

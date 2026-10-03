@@ -5,14 +5,11 @@
   import DocumentIcon from 'carbon-icons-svelte/lib/Document.svelte';
   import ImageIcon from 'carbon-icons-svelte/lib/Image.svelte';
   import PDFIcon from 'carbon-icons-svelte/lib/PDF.svelte';
-  import MessageIcon from 'carbon-icons-svelte/lib/Chat.svelte';
-  import { Search, OpenFileNative, WASearchMessages, WAOpenChat } from '$lib/wailsjs/go/main/App';
+  import { Search, OpenFileNative } from '$lib/wailsjs/go/main/App';
 
   let searchValue = '';
   let files: any[] = [];
-  let messages: any[] = [];
   let searching = false;
-  let messageSearching = false;
   let error = '';
   let ticket = 0;
 
@@ -71,12 +68,10 @@
 
     if (!query) {
       files = [];
-      messages = [];
       return;
     }
 
     searching = true;
-    messageSearching = true;
 
     Search(query).then((result) => {
       if (current !== ticket) return;
@@ -89,15 +84,6 @@
       if (current === ticket) searching = false;
     });
 
-    WASearchMessages(query).then((result) => {
-      if (current !== ticket) return;
-      messages = result || [];
-    }).catch(() => {
-      if (current !== ticket) return;
-      messages = [];
-    }).finally(() => {
-      if (current === ticket) messageSearching = false;
-    });
   }
 </script>
 
@@ -120,10 +106,10 @@
   </div>
 
   <div class="meta">
-    {#if searching || messageSearching}
+    {#if searching}
       Searching...
     {:else if searchValue.trim()}
-      {files.length + messages.length} results
+      {files.length} results
     {:else}
       Enter a search term to begin.
     {/if}
@@ -136,9 +122,9 @@
     </div>
   {/if}
 
-  {#if !searching && !messageSearching && searchValue.trim() && files.length === 0 && messages.length === 0 && !error}
+  {#if !searching && searchValue.trim() && files.length === 0 && !error}
     <div class="f-panel empty">
-      No matching files or messages found.
+      No matching files found.
     </div>
   {/if}
 
@@ -165,18 +151,6 @@
       </button>
     {/each}
 
-    {#each messages as msg}
-      <button class="f-panel result" type="button" on:click={() => WAOpenChat(msg.chatJid)}>
-        <span class="result-icon">
-          <MessageIcon size={22} />
-        </span>
-        <span class="result-body">
-          <strong>{msg.chatName || msg.chatJid}</strong>
-          <small>{msg.text}</small>
-          <span class="details">WhatsApp · {msg.senderName || 'Unknown sender'} · {formatDate(msg.timestamp)}</span>
-        </span>
-      </button>
-    {/each}
   </div>
 </div>
 

@@ -143,19 +143,20 @@ const (
 )
 
 type WriteOperation struct {
-	Op         WriteOpType
-	Paths      []string
-	FilePaths  []string
-	FileHashes []int64
-	FileMtimes []int64
-	FileSizes  []int64
-	FileCtimes []int64
-	FileAtimes []int64
-	Contents   []string
-	SqEmbs     []*core.Embedding
-	OldPaths   []string
-	NewPaths   []string
-	Done       chan struct{}
+	Op            WriteOpType
+	Paths         []string
+	FilePaths     []string
+	FileHashes    []int64
+	FileMtimes    []int64
+	FileSizes     []int64
+	FileCtimes    []int64
+	FileAtimes    []int64
+	Contents      []string
+	SqEmbs        []*core.Embedding
+	CompletePaths []string
+	OldPaths      []string
+	NewPaths      []string
+	Done          chan struct{}
 
 	// Feedback fields (OpSubmitFeedback)
 	FeedbackSessionID string
@@ -491,6 +492,52 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 	return engine, nil
 }
 
+func (s *Engine) vectorIDsForPaths(ctx context.Context, paths []string) ([]string, error) {
+	ids := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		rows, err := s.vDB.QueryContext(ctx,
+			"SELECT id FROM embeddings WHERE json_extract(metadata, '$.path') = ?", path)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return ids, nil
+}
+
+func (s *Engine) allVectorIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.vDB.QueryContext(ctx, "SELECT id FROM embeddings")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (s *Engine) runWriter() {
 	s.writerWg.Add(1)
 	defer s.writerWg.Done()
@@ -514,21 +561,44 @@ func (s *Engine) runWriter() {
 
 		var sqEmbsBatch []*core.Embedding
 		var deletePathIDs []string
+		var completePaths []string
+		vectorReadErr := error(nil)
+		metadataWriteErr := error(nil)
 
 		for _, op := range batch {
 			switch op.Op {
 			case OpIndexText, OpIndexImage:
 				const query = `
 					INSERT INTO files(path, hash, mtime, size, content_indexed, ext, ctime, atime)
-					VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+					VALUES (?, ?, ?, ?, 0, ?, ?, ?)
 					ON CONFLICT(path) DO UPDATE SET
-						hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=1,
+						hash=excluded.hash, mtime=excluded.mtime, size=excluded.size, content_indexed=0,
 						ext=excluded.ext, atime=excluded.atime`
+				metadataValid := len(op.FilePaths) == len(op.FileHashes) && len(op.FilePaths) == len(op.FileMtimes) &&
+					len(op.FilePaths) == len(op.FileSizes) && len(op.FilePaths) == len(op.FileCtimes) && len(op.FilePaths) == len(op.FileAtimes)
+				if !metadataValid && len(op.FilePaths) > 0 {
+					log.Printf("writer received incomplete file metadata for %d paths", len(op.FilePaths))
+					vectorReadErr = fmt.Errorf("incomplete file metadata")
+				}
 				for i := range op.FilePaths {
+					if !metadataValid {
+						break
+					}
 					ext := strings.ToLower(filepath.Ext(op.FilePaths[i]))
-					tx.ExecContext(ctx, query, op.FilePaths[i], op.FileHashes[i], op.FileMtimes[i], op.FileSizes[i], ext, op.FileCtimes[i], op.FileAtimes[i])
+					if _, err := tx.ExecContext(ctx, query, op.FilePaths[i], op.FileHashes[i], op.FileMtimes[i], op.FileSizes[i], ext, op.FileCtimes[i], op.FileAtimes[i]); err != nil {
+						metadataWriteErr = err
+						log.Printf("writer pending metadata error for %s: %v", op.FilePaths[i], err)
+					}
+				}
+				ids, err := s.vectorIDsForPaths(ctx, op.FilePaths)
+				if err != nil {
+					vectorReadErr = err
+					log.Printf("writer vector lookup error: %v", err)
+				} else {
+					deletePathIDs = append(deletePathIDs, ids...)
 				}
 				sqEmbsBatch = append(sqEmbsBatch, op.SqEmbs...)
+				completePaths = append(completePaths, op.CompletePaths...)
 
 			case OpIndexMetadata:
 				const qFiles = `
@@ -542,30 +612,46 @@ func (s *Engine) runWriter() {
 				}
 
 			case OpMarkContentIndexed:
-				const query = `UPDATE files SET content_indexed=1 WHERE path=?`
-				for _, p := range op.Paths {
-					tx.ExecContext(ctx, query, p)
+				metadataValid := len(op.Paths) == len(op.FileHashes) && len(op.Paths) == len(op.FileMtimes) &&
+					len(op.Paths) == len(op.FileSizes) && len(op.Paths) == len(op.FileCtimes) && len(op.Paths) == len(op.FileAtimes)
+				for i, p := range op.Paths {
+					if _, err := tx.ExecContext(ctx, "UPDATE files SET content_indexed=0 WHERE path=?", p); err != nil {
+						metadataWriteErr = err
+						log.Printf("writer pending metadata error for %s: %v", p, err)
+					}
+					if metadataValid && (op.FileMtimes[i] != 0 || op.FileSizes[i] != 0 || op.FileCtimes[i] != 0 || op.FileAtimes[i] != 0) {
+						if _, err := tx.ExecContext(ctx, `UPDATE files SET hash=?, mtime=?, size=?, ext=?, ctime=?, atime=?, content_indexed=0 WHERE path=?`,
+							op.FileHashes[i], op.FileMtimes[i], op.FileSizes[i], strings.ToLower(filepath.Ext(p)), op.FileCtimes[i], op.FileAtimes[i], p); err != nil {
+							metadataWriteErr = err
+							log.Printf("writer file metadata error for %s: %v", p, err)
+						}
+					}
 				}
+				ids, err := s.vectorIDsForPaths(ctx, op.Paths)
+				if err != nil {
+					vectorReadErr = err
+					log.Printf("writer vector lookup error: %v", err)
+				} else {
+					deletePathIDs = append(deletePathIDs, ids...)
+				}
+				completePaths = append(completePaths, op.Paths...)
 
 			case OpIndexPathsFTS:
 				const query = `INSERT INTO paths_fts(searchable, path) VALUES (?, ?)`
 				for _, p := range op.Paths {
+					tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", p)
 					tx.ExecContext(ctx, query, pathUnescape(p), p)
 				}
 
 			case OpDeletePaths:
+				ids, err := s.vectorIDsForPaths(ctx, op.Paths)
+				if err != nil {
+					vectorReadErr = err
+					log.Printf("writer delete lookup error: %v", err)
+				} else {
+					deletePathIDs = append(deletePathIDs, ids...)
+				}
 				for _, path := range op.Paths {
-					rows, errQ := s.vDB.QueryContext(ctx, "SELECT id FROM embeddings WHERE json_extract(metadata, '$.path') = ?", path)
-					if errQ == nil && rows != nil {
-						var ids []string
-						for rows.Next() {
-							var id string
-							rows.Scan(&id)
-							ids = append(ids, id)
-						}
-						rows.Close()
-						deletePathIDs = append(deletePathIDs, ids...)
-					}
 					tx.ExecContext(ctx, "DELETE FROM files WHERE path = ?", path)
 					tx.ExecContext(ctx, "DELETE FROM paths_fts WHERE path = ?", path)
 				}
@@ -580,8 +666,21 @@ func (s *Engine) runWriter() {
 				}
 
 			case OpResetContentIndex:
-				tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`)
-				tx.ExecContext(ctx, `DELETE FROM paths_fts`)
+				if _, err := tx.ExecContext(ctx, `UPDATE files SET content_indexed = 0, hash = 0`); err != nil {
+					metadataWriteErr = err
+					log.Printf("writer reset metadata error: %v", err)
+				}
+				if _, err := tx.ExecContext(ctx, `DELETE FROM paths_fts`); err != nil {
+					metadataWriteErr = err
+					log.Printf("writer reset paths error: %v", err)
+				}
+				ids, err := s.allVectorIDs(ctx)
+				if err != nil {
+					vectorReadErr = err
+					log.Printf("writer reset vector lookup error: %v", err)
+				} else {
+					deletePathIDs = append(deletePathIDs, ids...)
+				}
 
 			case OpSubmitFeedback:
 				tx.ExecContext(ctx, `INSERT INTO search_feedback
@@ -594,17 +693,39 @@ func (s *Engine) runWriter() {
 
 		if err := tx.Commit(); err != nil {
 			log.Printf("writer commit error: %v", err)
+			batch = batch[:0]
+			return
 		}
 
-		if len(sqEmbsBatch) > 0 {
+		vectorWriteErr := vectorReadErr
+		if metadataWriteErr != nil {
+			vectorWriteErr = metadataWriteErr
+		}
+		if vectorWriteErr == nil && len(deletePathIDs) > 0 {
+			if err := s.db.DeleteBatch(ctx, deletePathIDs); err != nil {
+				vectorWriteErr = err
+				log.Printf("writer sqvect delete error: %v", err)
+			}
+		}
+		if vectorWriteErr == nil && len(sqEmbsBatch) > 0 {
 			if err := s.db.UpsertBatch(ctx, sqEmbsBatch); err != nil {
+				vectorWriteErr = err
 				log.Printf("writer sqvect upsert error: %v", err)
 			}
 		}
-
-		if len(deletePathIDs) > 0 {
-			if err := s.db.DeleteBatch(ctx, deletePathIDs); err != nil {
-				log.Printf("writer sqvect delete error: %v", err)
+		if vectorWriteErr == nil && len(completePaths) > 0 {
+			markTx, err := s.sqlDB.BeginTx(ctx, nil)
+			if err != nil {
+				log.Printf("writer completion begin tx error: %v", err)
+			} else {
+				for _, path := range completePaths {
+					if _, err := markTx.ExecContext(ctx, "UPDATE files SET content_indexed=1 WHERE path=?", path); err != nil {
+						log.Printf("writer completion update error for %s: %v", path, err)
+					}
+				}
+				if err := markTx.Commit(); err != nil {
+					log.Printf("writer completion commit error: %v", err)
+				}
 			}
 		}
 
@@ -1251,7 +1372,7 @@ func getStats(startCPU int64, startTime time.Time) string {
 // contents and paths must have the same length.
 // filePaths/fileHashes are optional file-level metadata for deduplication.
 // Embedding generation runs outside the write lock; only the DB writes are locked.
-func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
+func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64, completePaths []string) error {
 	// Generate embeddings outside the lock — ONNX session is thread-safe behind gpuMutex.
 	embs, err := s.embedText(contents)
 	if err != nil {
@@ -1273,14 +1394,15 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 	}
 
 	s.writeChan <- WriteOperation{
-		Op:         OpIndexText,
-		FilePaths:  filePaths,
-		FileHashes: fileHashes,
-		FileMtimes: fileMtimes,
-		FileSizes:  fileSizes,
-		FileCtimes: fileCtimes,
-		FileAtimes: fileAtimes,
-		SqEmbs:     sqEmbs,
+		Op:            OpIndexText,
+		FilePaths:     filePaths,
+		FileHashes:    fileHashes,
+		FileMtimes:    fileMtimes,
+		FileSizes:     fileSizes,
+		FileCtimes:    fileCtimes,
+		FileAtimes:    fileAtimes,
+		SqEmbs:        sqEmbs,
+		CompletePaths: completePaths,
 	}
 	return nil
 }
@@ -1289,7 +1411,7 @@ func (s *Engine) IndexText(contents, paths []string, filePaths []string, fileHas
 // imagePaths are the filesystem paths to load images from.
 // paths are the logical paths stored as metadata.
 // Embedding generation runs outside the write lock; only the DB writes are locked.
-func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64) error {
+func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, fileHashes, fileMtimes, fileSizes, fileCtimes, fileAtimes []int64, completePaths []string) error {
 	// Generate image embeddings outside the lock.
 	// In practice IndexImage is always called from a single draining goroutine
 	// (HandleChunk/DrainRemaining), never concurrently, so clipVisionSession is safe.
@@ -1313,14 +1435,15 @@ func (s *Engine) IndexImage(imagePaths, paths []string, filePaths []string, file
 	}
 
 	s.writeChan <- WriteOperation{
-		Op:         OpIndexText,
-		FilePaths:  filePaths,
-		FileHashes: fileHashes,
-		FileMtimes: fileMtimes,
-		FileSizes:  fileSizes,
-		FileCtimes: fileCtimes,
-		FileAtimes: fileAtimes,
-		SqEmbs:     sqEmbs,
+		Op:            OpIndexImage,
+		FilePaths:     filePaths,
+		FileHashes:    fileHashes,
+		FileMtimes:    fileMtimes,
+		FileSizes:     fileSizes,
+		FileCtimes:    fileCtimes,
+		FileAtimes:    fileAtimes,
+		SqEmbs:        sqEmbs,
+		CompletePaths: completePaths,
 	}
 	return nil
 }
@@ -1635,16 +1758,20 @@ func (s *Engine) allIndexedPaths() ([]string, error) {
 	return paths, nil
 }
 
-// MarkContentIndexed sets content_indexed=1 for the given paths without storing
-// any embedding. Used for files that were processed but yielded no extractable
-// content (binaries, unsupported formats, etc.) so they are never re-queued.
-func (s *Engine) MarkContentIndexed(paths []string) error {
+// MarkContentIndexed queues files with no extractable content for completion
+// after any existing vectors have been removed.
+func (s *Engine) MarkContentIndexed(paths []string, hashes, mtimes, sizes, ctimes, atimes []int64) error {
 	if len(paths) == 0 {
 		return nil
 	}
 	s.writeChan <- WriteOperation{
-		Op:    OpMarkContentIndexed,
-		Paths: paths,
+		Op:         OpMarkContentIndexed,
+		Paths:      paths,
+		FileHashes: hashes,
+		FileMtimes: mtimes,
+		FileSizes:  sizes,
+		FileCtimes: ctimes,
+		FileAtimes: atimes,
 	}
 	return nil
 }
@@ -1685,7 +1812,7 @@ func (s *Engine) ResetContentIndex() error {
 	s.writeChan <- WriteOperation{
 		Op: OpResetContentIndex,
 	}
-	return nil
+	return s.Flush()
 }
 
 // ResetContentIndexForDir resets the content_indexed flag for all files under
@@ -1989,7 +2116,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	// Phase 2: filename/fuzzy boosts require the merged scores map from phase 1.
 	// Track the filename-boost delta per path so the path-only cap can exempt
-	// files that genuinely matched the query by name (images, WhatsApp chats, etc).
+	// files that genuinely matched the query by name (for example, images).
 	filenameDeltas := make(map[string]float64, len(scores))
 	if w.UseNewPipeline && w.WFilename != 1.0 {
 		// Capture pre-boost scores to compute the delta, then scale the delta.
@@ -2019,7 +2146,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	// Cap path-only results. Any path with zero content signal (no vector hit,
 	// no BM25 hit) can only have scored from path FTS + filename/fuzzy boosts.
 	// Cap these so they can never beat a real content match — BUT exempt paths
-	// that got a strong filename match (e.g. images, WhatsApp chats). These files
+	// that got a strong filename match (for example, images). These files
 	// have no text content to generate a content signal, yet the user clearly
 	// searched for them by name.
 	pathOnlyScoreCap := 0.12
@@ -2242,7 +2369,7 @@ func (s *Engine) DeletePaths(paths []string) error {
 		Op:    OpDeletePaths,
 		Paths: paths,
 	}
-	return nil
+	return s.Flush()
 }
 
 // RenamePaths updates path references in sqvect embeddings and the files table.

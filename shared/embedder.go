@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -26,8 +27,8 @@ type StaticEmbedder struct {
 
 // safetensorsHeader is the JSON structure at the start of a .safetensors file.
 type safetensorsHeader map[string]struct {
-	Dtype       string  `json:"dtype"`
-	Shape       []int64 `json:"shape"`
+	Dtype       string   `json:"dtype"`
+	Shape       []int64  `json:"shape"`
 	DataOffsets [2]int64 `json:"data_offsets"`
 }
 
@@ -69,17 +70,27 @@ func LoadStaticEmbedder(modelPath, tokenizerPath string) (*StaticEmbedder, error
 		return nil, fmt.Errorf("MapViewOfFile: %w", err)
 	}
 
-	// 2. Parse the header (always 8 bytes for length + JSON)
-	// We can access the memory directly via unsafe pointer
+	releaseMapping := func() {
+		_ = syscall.UnmapViewOfFile(ptr)
+		_ = syscall.CloseHandle(hMapping)
+		tok.Close()
+	}
+	if size < 8 {
+		releaseMapping()
+		return nil, fmt.Errorf("safetensors file is shorter than its header")
+	}
+
+	// 2. Parse the 8-byte header length and validate it before slicing the mapping.
 	headerLenBuf := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), 8)
 	headerLen := binary.LittleEndian.Uint64(headerLenBuf)
-
-	headerJSONBuf := unsafe.Slice((*byte)(unsafe.Pointer(ptr+8)), headerLen)
+	if headerLen > uint64(size-8) {
+		releaseMapping()
+		return nil, fmt.Errorf("safetensors header length exceeds file size")
+	}
+	headerJSONBuf := unsafe.Slice((*byte)(unsafe.Pointer(ptr+8)), int(headerLen))
 	var header safetensorsHeader
 	if err := json.Unmarshal(headerJSONBuf, &header); err != nil {
-		syscall.UnmapViewOfFile(ptr)
-		syscall.CloseHandle(hMapping)
-		tok.Close()
+		releaseMapping()
 		return nil, fmt.Errorf("parse safetensors header: %w", err)
 	}
 
@@ -100,36 +111,67 @@ func LoadStaticEmbedder(modelPath, tokenizerPath string) (*StaticEmbedder, error
 		}
 	}
 	if tensorName == "" {
-		syscall.UnmapViewOfFile(ptr)
-		syscall.CloseHandle(hMapping)
-		tok.Close()
+		releaseMapping()
 		return nil, fmt.Errorf("no embedding tensor found")
 	}
 
 	meta := header[tensorName]
-	vocabSize := int(meta.Shape[0])
-	dim := int(meta.Shape[1])
+	if len(meta.Shape) != 2 || meta.Shape[0] <= 0 || meta.Shape[1] <= 0 || meta.Shape[0] > int64(^uint(0)>>1)/meta.Shape[1] {
+		releaseMapping()
+		return nil, fmt.Errorf("embedding tensor must have a valid 2D shape")
+	}
+	vocabSize, dim := int(meta.Shape[0]), int(meta.Shape[1])
 	totalFloats := vocabSize * dim
-
-	// 4. Zero-copy slicing into the data section
-	// Data section starts after 8 bytes + headerLen
-	dataStart := 8 + int64(headerLen) + meta.DataOffsets[0]
-	dataEnd := 8 + int64(headerLen) + meta.DataOffsets[1]
-
-	if dataEnd > size {
-		syscall.UnmapViewOfFile(ptr)
-		syscall.CloseHandle(hMapping)
-		tok.Close()
+	if meta.DataOffsets[0] < 0 || meta.DataOffsets[1] < meta.DataOffsets[0] {
+		releaseMapping()
+		return nil, fmt.Errorf("invalid tensor data offsets")
+	}
+	payloadSize := size - 8 - int64(headerLen)
+	if meta.DataOffsets[1] > payloadSize {
+		releaseMapping()
 		return nil, fmt.Errorf("tensor data range out of bounds")
 	}
 
-	// 5. Direct cast: map the byte range to a float32 slice
-	// This only works if the system is Little Endian (Safetensors default).
-	// Modern Windows/Intel/AMD CPUs are Little Endian.
-	matrixPtr := ptr + uintptr(dataStart)
-	matrix := unsafe.Slice((*float32)(unsafe.Pointer(matrixPtr)), totalFloats)
+	dtype := strings.ToUpper(meta.Dtype)
+	bytesPerValue := int64(0)
+	switch dtype {
+	case "F32":
+		bytesPerValue = 4
+	case "F16", "BF16":
+		bytesPerValue = 2
+	default:
+		releaseMapping()
+		return nil, fmt.Errorf("unsupported embedding dtype %q", meta.Dtype)
+	}
+	if int64(totalFloats) > payloadSize/bytesPerValue {
+		releaseMapping()
+		return nil, fmt.Errorf("tensor shape exceeds available data")
+	}
+	expectedBytes := int64(totalFloats) * bytesPerValue
+	if meta.DataOffsets[1]-meta.DataOffsets[0] != expectedBytes {
+		releaseMapping()
+		return nil, fmt.Errorf("tensor data size does not match its shape and dtype")
+	}
 
-	log.Printf("mmap: loaded %q (%d dimensions) zero-copy from %s", tensorName, dim, modelPath)
+	dataStart := 8 + int64(headerLen) + meta.DataOffsets[0]
+	dataPtr := ptr + uintptr(dataStart)
+	var matrix []float32
+	if dtype == "F32" {
+		matrix = unsafe.Slice((*float32)(unsafe.Pointer(dataPtr)), totalFloats)
+	} else {
+		data := unsafe.Slice((*byte)(unsafe.Pointer(dataPtr)), totalFloats*2)
+		matrix, err = decode16BitWeights(data, dtype)
+		if err != nil {
+			releaseMapping()
+			return nil, err
+		}
+	}
+
+	if dtype == "F32" {
+		log.Printf("mmap: loaded %q (%d dimensions) zero-copy from %s", tensorName, dim, modelPath)
+	} else {
+		log.Printf("mmap: loaded %q (%d dimensions) converted from %s in %s", tensorName, dim, dtype, modelPath)
+	}
 
 	return &StaticEmbedder{
 		matrix: matrix,
@@ -138,6 +180,54 @@ func LoadStaticEmbedder(modelPath, tokenizerPath string) (*StaticEmbedder, error
 		handle: hMapping,
 		ptr:    ptr,
 	}, nil
+}
+
+func decode16BitWeights(data []byte, dtype string) ([]float32, error) {
+	if len(data)%2 != 0 {
+		return nil, fmt.Errorf("16-bit tensor data has an odd byte length")
+	}
+	dtype = strings.ToUpper(dtype)
+	if dtype != "F16" && dtype != "BF16" {
+		return nil, fmt.Errorf("unsupported 16-bit tensor dtype %q", dtype)
+	}
+
+	values := make([]float32, len(data)/2)
+	for i := range values {
+		bits := binary.LittleEndian.Uint16(data[i*2:])
+		if dtype == "BF16" {
+			values[i] = math.Float32frombits(uint32(bits) << 16)
+		} else {
+			values[i] = float16ToFloat32(bits)
+		}
+	}
+	return values, nil
+}
+
+func float16ToFloat32(value uint16) float32 {
+	sign := uint32(value&0x8000) << 16
+	exponent := (value >> 10) & 0x1f
+	mantissa := uint32(value & 0x03ff)
+	var bits uint32
+
+	switch exponent {
+	case 0:
+		if mantissa == 0 {
+			bits = sign
+			break
+		}
+		exponent32 := uint32(127 - 15 + 1)
+		for mantissa&0x0400 == 0 {
+			mantissa <<= 1
+			exponent32--
+		}
+		mantissa &= 0x03ff
+		bits = sign | exponent32<<23 | mantissa<<13
+	case 0x1f:
+		bits = sign | 0x7f800000 | mantissa<<13
+	default:
+		bits = sign | (uint32(exponent)+(127-15))<<23 | mantissa<<13
+	}
+	return math.Float32frombits(bits)
 }
 
 // Close releases virtual memory mapping and tokenizer resources.

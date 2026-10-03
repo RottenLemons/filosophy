@@ -1,107 +1,87 @@
-# Filosophy - AI-Powered Local File Search
+# Filosophy
 
-**Filosophy** is a privacy-first desktop application that lets you search through personal files, images, and WhatsApp history using natural-language queries. It runs locally and combines semantic embeddings, SQLite-backed vector search, full-text search, and path matching without sending indexed content to the cloud.
+Filosophy is a Windows desktop application for local file search. It combines filename and full-text search with semantic text and image search. Indexes and model inference run on the local machine; optional API and model-provider integrations are disabled until configured.
 
-![Screenshot](screenshot.png) <!-- TODO: Add actual screenshot -->
+## Project layout
 
-## Features
+- `main.go` and `frontend/` contain the Wails desktop application.
+- `shared/` contains file processing, indexing, query parsing, and search.
+- `daemon/` and `cmd/` contain the background indexer and command-line entry points.
+- `api.go` and `mcp.go` provide optional local HTTP and MCP endpoints.
 
-* **Multimodal search** - find images and documents with the same query.
-* **Local-first indexing** - content extraction, embedding, ranking, and storage run on-device.
-* **Live file watching** - indexed folders are scanned and updated as files change.
-* **Hybrid ranking** - combines vector similarity, FTS, filename/path boosts, recency, and optional reranking.
-* **External integrations** - optional localhost REST API, MCP server, CLI client, and WhatsApp indexing.
+## Build requirements
 
-## Architecture
+The supported build target is Windows x64. Install:
 
-Filosophy is organized around a Go backend with a Svelte frontend:
+- Go 1.25.5 or later
+- Node.js 20 or later with npm
+- Wails CLI v2
+- Rust and Cargo
+- A C/C++ GNU toolchain that provides `x86_64-w64-mingw32-gcc` and `ar`
 
-1. **Desktop app** - Wails hosts the Svelte UI in `frontend/` and binds Go methods from `main.go`.
-2. **Indexing pipeline** - `shared/processor.go` extracts file metadata/content, batches image thumbnailing with libvips, and queues writes.
-3. **Search engine** - `shared/engine.go` owns ONNX inference, SQLite metadata, vector storage, FTS tables, ranking weights, and feedback.
-4. **API/MCP surface** - `api.go`, `mcp.go`, and `cmd/filo` expose local automation endpoints.
-5. **WhatsApp integration** - `whatsapp/` manages pairing, message storage, and indexing.
+The application also needs runtime assets that are not committed to this repository:
 
-## Repository Layout
+- `text/tokenizer.json` and `text/model.onnx`
+- `image/tokenizer.json`, `image/text_model.onnx`, and `image/vision_model.onnx`
+- `onnxruntime.dll` (and any provider DLLs required by the selected runtime)
+- `vips-dev-8.18/bin/vipsthumbnail.exe` and the matching libvips runtime files
 
-* `main.go`, `api.go`, `mcp.go`, `tray_windows.go` - Wails app, local API/MCP server, and tray integration.
-* `shared/` - indexing, embeddings, vector search, config, ranking, and platform helpers.
-* `whatsapp/` - WhatsApp client/session logic and searchable message store.
-* `frontend/` - active SvelteKit UI.
-* `cmd/filo/` - small CLI client for the localhost API.
-* `cmd/daemon/`, `daemon/` - background daemon entrypoints and shared daemon logic.
+Place model and runtime folders beside the application executable for release builds. At development time, the app also checks paths relative to the working directory. The ONNX Runtime and model versions must be compatible; GPU acceleration is optional.
 
-## Prerequisites
+## Development build
 
-* **Go** 1.25 or later
-* **Node.js** 18+ (npm or pnpm)
-* **Git** (for cloning the repository)
-* Model/runtime assets expected by the app, including ONNX/tokenizer files and the libvips bundle on Windows.
+From the repository root, prepare the native tokenizer library and frontend dependencies:
 
-## Getting Started
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/yourusername/filosophy.git
-cd filosophy
-```
-
-### 2. Install frontend dependencies
-
-```bash
-cd frontend
-npm install  # or pnpm install
-cd ..
-```
-
-### 3. Run the application in development mode
-
-```bash
+```powershell
+go mod download
+./scripts/build-tokenizers.ps1
+Push-Location frontend
+npm ci
+Pop-Location
 wails dev
 ```
 
-The application window opens, loads the configured folders, and begins indexing according to `filosophy_config.json`.
+Create a production Windows build with:
 
-## Building for Production
-
-To create a standalone executable:
-
-```bash
+```powershell
+Push-Location frontend
+npm ci
+Pop-Location
 wails build
 ```
 
-The output is placed in `build/bin`. Distribute the binary together with the runtime/model assets the app expects, including `vips-dev-8.18` on Windows.
+The executable is written to `build/bin/filosophy.exe`. A distributable release must include the model and native runtime assets listed above; the Wails build does not download or bundle those assets automatically.
 
-## Maintenance Notes
+Create a versioned Windows zip from the local runtime assets with:
 
-* Keep generated data out of version control: `*.db`, `*.db-wal`, logs, model binaries, local sessions, `frontend/.svelte-kit/`, `frontend/dist/`, and `build/bin/`.
-* Prefer adding Go doc comments for exported functions and types. Comments should explain contracts, side effects, and concurrency expectations rather than restating the function name.
-* Run `gofmt` after Go edits and use existing local package patterns before adding new abstractions.
-* Large model/runtime artifacts live beside the app during local development but should be treated as release assets, not source.
+```powershell
+./scripts/package-release.ps1 -Version 1.0.0
+```
+
+The script rebuilds the app, validates the required assets, and writes the zip under `dist/`. Review the archive contents and test it on a clean Windows machine before publishing.
+
+## Verification
+
+Run the Go tests and compile all Go packages with:
+
+```powershell
+go test ./...
+go build ./...
+```
+
+Build the frontend independently with:
+
+```powershell
+Push-Location frontend
+npm ci
+npm run build
+Pop-Location
+```
+
+## Local data and privacy
+
+The app stores its index, configuration, API keys, and logs locally. These files are excluded from version control. Review release archives before publishing and do not include personal indexes, credentials, model-provider keys, or machine-specific data.
 
 ## License
 
-Filosophy is licensed under the GNU General Public License v3.0 (GPLv3). See the [LICENSE](LICENSE) file for the full text.
-
-All source files must include the GPLv3 header comment. A sample header is provided in [LICENSE_HEADER](LICENSE_HEADER).
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request on GitHub.
-
-## Important Notes for Publication
-
-Before publishing this repository, ensure the following items are **not** committed:
-
-* `filosophy.db` (the local vector database)
-* Any `*.bin` vector index files
-* `native/` and `kreuzberg-ffi/` (if they contain proprietary or binary dependencies)
-* Personal configuration files (`.env`, `filosophy_config.json`)
-* Local WhatsApp session databases
-
-Refer to the [.gitignore](.gitignore) for a complete list of excluded patterns.
-
----
-
-Built with Wails, Svelte, SQLite, ONNX Runtime, and local embedding models.
+Filosophy is licensed under GPL-3.0. See [LICENSE](LICENSE).

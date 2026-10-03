@@ -26,7 +26,6 @@ import (
 
 	"filosophy/daemon"
 	"filosophy/shared"
-	"filosophy/whatsapp"
 
 	"github.com/syncthing/notify"
 	"github.com/wailsapp/wails/v2"
@@ -49,6 +48,24 @@ var maxConcurrency = runtime.NumCPU()
 var imageBatchSize = 100 // Defaults, adapted at startup
 
 const appPidFile = "filosophy-app.pid"
+
+var modelAssetFiles = []string{
+	filepath.Join("text", "tokenizer.json"),
+	filepath.Join("text", "model.onnx"),
+	filepath.Join("image", "tokenizer.json"),
+	filepath.Join("image", "text_model.onnx"),
+	filepath.Join("image", "vision_model.onnx"),
+}
+
+func resolveModelAssetDir(exeDir, cwd string) string {
+	for _, file := range modelAssetFiles {
+		info, err := os.Stat(filepath.Join(exeDir, file))
+		if err != nil || !info.Mode().IsRegular() {
+			return cwd
+		}
+	}
+	return exeDir
+}
 
 // FolderState describes a directory and whether it is content-indexed.
 type FolderState struct {
@@ -655,11 +672,6 @@ type App struct {
 	// Used as the session key in search_feedback telemetry rows.
 	sessionID string
 
-	// WhatsApp
-	waClient  *whatsapp.Client
-	waStore   *whatsapp.Store
-	waIndexer *whatsapp.Indexer
-
 	Hardware shared.HardwareConfig
 }
 
@@ -723,8 +735,12 @@ func (a *App) startup(ctx context.Context) {
 	}()
 
 	dbPath := filepath.Join(cwd, "filosophy.db")
-	textModelPath := filepath.Join(cwd, "text")
-	imageModelPath := filepath.Join(cwd, "image")
+	assetDir := cwd
+	if exe, err := os.Executable(); err == nil {
+		assetDir = resolveModelAssetDir(filepath.Dir(exe), cwd)
+	}
+	textModelPath := filepath.Join(assetDir, "text")
+	imageModelPath := filepath.Join(assetDir, "image")
 
 	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 		log.SetOutput(&filteredWriter{w: lf})
@@ -883,25 +899,6 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
-	// Initialise WhatsApp store and client. AutoConnect reconnects any saved
-	// session silently; if there is no session it is a no-op (no QR shown).
-	if waStore, err := whatsapp.OpenStore(cwd); err != nil {
-		log.Printf("[WhatsApp] Failed to open store: %v", err)
-	} else {
-		a.waStore = waStore
-		a.waClient = whatsapp.NewClient(
-			cwd,
-			waStore,
-			func(update whatsapp.QRUpdate) {
-				wailsruntime.EventsEmit(a.ctx, "wa_qr", update)
-			},
-			func(status whatsapp.Status) {
-				wailsruntime.EventsEmit(a.ctx, "wa_status", status)
-			},
-		)
-		a.waClient.AutoConnect(ctx)
-	}
-
 	log.Println("[Boot 13] Startup sequence complete (Main Thread Released)")
 }
 
@@ -917,8 +914,12 @@ func (a *App) RetryEngineInit() error {
 
 	cwd, _ := os.Getwd()
 	dbPath := filepath.Join(cwd, "filosophy.db")
-	textModelPath := filepath.Join(cwd, "text")
-	imageModelPath := filepath.Join(cwd, "image")
+	assetDir := cwd
+	if exe, err := os.Executable(); err == nil {
+		assetDir = resolveModelAssetDir(filepath.Dir(exe), cwd)
+	}
+	textModelPath := filepath.Join(assetDir, "text")
+	imageModelPath := filepath.Join(assetDir, "image")
 
 	a.engineInitializing.Store(true)
 	wailsruntime.EventsEmit(a.ctx, "engine_status", "initializing")
@@ -982,18 +983,9 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.daemon != nil {
 		a.daemon.Stop()
 	}
+	a.apiServer.stop()
 	if a.engine != nil {
 		a.engine.Close()
-	}
-	a.apiServer.stop()
-	if a.waIndexer != nil {
-		a.waIndexer.Stop()
-	}
-	if a.waClient != nil {
-		a.waClient.Disconnect()
-	}
-	if a.waStore != nil {
-		a.waStore.Close()
 	}
 }
 
@@ -1432,131 +1424,6 @@ func (a *App) SetAPIPort(port int) error {
 func (a *App) RegenerateAPIKey() (string, error) {
 	a.config.APIKey = GenerateAPIKey()
 	return a.config.APIKey, a.config.Save()
-}
-
-// ── WhatsApp bindings ─────────────────────────────────────────────────────────
-
-// WAStatus returns the current WhatsApp connection status.
-func (a *App) WAStatus() string {
-	if a.waClient == nil {
-		return string(whatsapp.StatusDisconnected)
-	}
-	return string(a.waClient.Status())
-}
-
-// WAGetLastQR returns the most recently generated QR code as a base64 PNG data URI.
-// The frontend calls this after WAConnect() to display the QR immediately,
-// rather than relying solely on the wa_qr event which may fire before listeners attach.
-func (a *App) WAGetLastQR() string {
-	if a.waClient == nil {
-		return ""
-	}
-	return a.waClient.LastQR()
-}
-
-// WAConnect initialises the WhatsApp client and either reconnects an existing
-// session or begins QR pairing. QR updates are streamed via the "wa_qr" Wails
-// event; status changes via "wa_status".
-func (a *App) WAConnect() error {
-	if a.waClient == nil {
-		return fmt.Errorf("whatsapp store not initialised")
-	}
-
-	// Start indexer if not already running.
-	if a.waIndexer == nil && a.engine != nil {
-		a.waIndexer = whatsapp.NewIndexer(a.waStore, a.engine)
-		a.waIndexer.Start()
-	}
-
-	if err := a.waClient.Connect(a.ctx); err != nil {
-		return err
-	}
-
-	// Kick off a full index pass in the background (covers pre-existing data
-	// from a history sync that already happened in a previous session).
-	if a.waIndexer != nil {
-		go a.waIndexer.IndexAll()
-	}
-
-	return nil
-}
-
-// WADisconnect disconnects the WhatsApp client without logging out.
-// The session is preserved and WAConnect will reconnect without a new QR scan.
-func (a *App) WADisconnect() {
-	if a.waClient != nil {
-		a.waClient.Disconnect()
-	}
-}
-
-// WALogout logs out of WhatsApp and deletes the local session.
-// The next WAConnect call will require a new QR scan.
-func (a *App) WALogout() error {
-	if a.waClient == nil {
-		return nil
-	}
-	return a.waClient.Logout(a.ctx)
-}
-
-// WAForgetSessionAndConnect clears a broken saved WhatsApp session and starts QR pairing.
-func (a *App) WAForgetSessionAndConnect() error {
-	if a.waClient == nil {
-		return fmt.Errorf("whatsapp store not initialised")
-	}
-	if err := a.waClient.ResetSession(); err != nil {
-		return err
-	}
-	return a.WAConnect()
-}
-
-// WASearchMessages performs a full-text search over indexed WhatsApp messages.
-func (a *App) WASearchMessages(query string) ([]whatsapp.Message, error) {
-	if a.waStore == nil {
-		log.Printf("[WASearch] store is nil — not initialised")
-		return nil, fmt.Errorf("whatsapp store not initialised")
-	}
-	total, err := a.waStore.MessageCount()
-	log.Printf("[WASearch] query=%q  total_messages_in_db=%d", query, total)
-	if err != nil {
-		log.Printf("[WASearch] MessageCount error: %v", err)
-	}
-	results, err := a.waStore.SearchMessages(query, 30)
-	if err != nil {
-		log.Printf("[WASearch] SearchMessages error: %v", err)
-		return nil, err
-	}
-	log.Printf("[WASearch] found %d results", len(results))
-	return results, nil
-}
-
-// WAGetChats returns all known chats, most-recently-active first.
-func (a *App) WAGetChats() ([]whatsapp.Chat, error) {
-	if a.waStore == nil {
-		return nil, fmt.Errorf("whatsapp store not initialised")
-	}
-	return a.waStore.GetChats()
-}
-
-// WAGetChatMessages returns recent messages from a specific chat.
-func (a *App) WAGetChatMessages(chatJID string) ([]whatsapp.Message, error) {
-	if a.waStore == nil {
-		return nil, fmt.Errorf("whatsapp store not initialised")
-	}
-	return a.waStore.GetChatMessages(chatJID, 100)
-}
-
-// WAOpenChat opens the given chat in the WhatsApp desktop app via its URI scheme.
-// Individual chats: whatsapp://send?phone=<number>
-// Groups: whatsapp:// (just opens the app; no reliable group deep-link exists)
-func (a *App) WAOpenChat(jid string) {
-	var url string
-	if strings.HasSuffix(jid, "@s.whatsapp.net") {
-		phone := strings.TrimSuffix(jid, "@s.whatsapp.net")
-		url = "whatsapp://send?phone=" + phone
-	} else {
-		url = "whatsapp://"
-	}
-	wailsruntime.BrowserOpenURL(a.ctx, url)
 }
 
 func main() {
