@@ -68,6 +68,7 @@
 
     if (!query) {
       files = [];
+      searching = false;
       return;
     }
 
@@ -92,6 +93,13 @@
 </svelte:head>
 
 <div class="f-page search-page">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Workspace</p>
+      <h1>Search</h1>
+    </div>
+    <span class="local-label"><i></i> Local index</span>
+  </div>
   <div class="search-top">
     <div class="search-box">
       <SearchIcon size={20} />
@@ -155,16 +163,17 @@
 </div>
 
 <style>
-  .search-page {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
+  .search-page { display: flex; flex-direction: column; gap: 17px; }
+  .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 16px; }
+  .page-heading p { margin: 0 0 4px; color: var(--f-text-3); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .page-heading h1 { margin: 0; font-size: 23px; line-height: 1.2; font-weight: 650; }
+  .local-label { display: inline-flex; align-items: center; gap: 7px; color: var(--f-text-2); font-size: 11px; white-space: nowrap; }
+  .local-label i { width: 7px; height: 7px; border-radius: 50%; background: var(--f-success); }
 
   .search-top {
     display: flex;
     gap: 10px;
-    max-width: 860px;
+    max-width: 920px;
   }
 
   .search-box {
@@ -195,7 +204,7 @@
   .results {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 5px;
     max-width: 960px;
   }
 
@@ -203,7 +212,7 @@
     display: flex;
     align-items: flex-start;
     gap: 12px;
-    padding: 14px;
+    padding: 11px 12px;
     text-align: left;
     color: var(--f-text);
     transition: background 150ms ease, border-color 150ms ease;
@@ -215,9 +224,9 @@
   }
 
   .result-icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
+    width: 34px;
+    height: 34px;
+    border-radius: 4px;
     background: var(--f-surface-2);
     color: var(--f-text-3);
     display: flex;
@@ -276,8 +285,12 @@
   }
 
   @media (max-width: 640px) {
+    .page-heading { align-items: center; }
     .search-top {
       flex-direction: column;
     }
+    .search-top .f-button { width: 100%; }
+    .result { align-items: flex-start; }
+    .details { white-space: normal; }
   }
 </style>

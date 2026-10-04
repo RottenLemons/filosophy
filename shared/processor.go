@@ -82,6 +82,18 @@ var textAllowExtensions = map[string]bool{
 	".html": true, ".htm": true,
 }
 
+// IsWhatsAppDatabase identifies WhatsApp's local SQLite stores so indexing
+// never reads or exposes their private message databases.
+func IsWhatsAppDatabase(path string) bool {
+	normalizedPath := strings.ReplaceAll(filepath.ToSlash(path), `\`, "/")
+	lowerPath := strings.ToLower(normalizedPath)
+	base := strings.ToLower(filepath.Base(normalizedPath))
+	if base == "whatsapp.db" || base == "msgstore.db" {
+		return true
+	}
+	return filepath.Ext(lowerPath) == ".db" && strings.Contains(lowerPath, "/whatsapp/")
+}
+
 var empty int64 = int64(xxhash.Sum64String(""))
 
 // IsImageFile checks if the filename has an image extension.
@@ -293,6 +305,9 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 	if cfg == nil || cfg.Engine == nil {
 		return
 	}
+	if IsWhatsAppDatabase(path) {
+		return
+	}
 	hash, err := HashFile(path)
 	if err != nil {
 		log.Printf("ProcessText: hash %s: %v", path, err)
@@ -348,7 +363,7 @@ func HashFile(path string) (int64, error) {
 
 // ProcessFile processes a single file (image or text) based on its type.
 func ProcessFile(path string, cfg *ProcessorConfig) {
-	if cfg == nil {
+	if cfg == nil || IsWhatsAppDatabase(path) {
 		return
 	}
 	info, err := os.Stat(path)

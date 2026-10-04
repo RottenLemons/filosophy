@@ -29,6 +29,42 @@ func TestResolveModelAssetDirFallsBackWhenExecutableAssetsAreIncomplete(t *testi
 	}
 }
 
+func TestSystemPathIndexSkipsGeneratedAndInstalledAppDirs(t *testing.T) {
+	for _, name := range []string{"Program Files", "AppData", "node_modules", "build", "target"} {
+		if !isSystemPathSkippedDir(name) {
+			t.Errorf("isSystemPathSkippedDir(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"Documents", "Projects", "src", "pkg"} {
+		if isSystemPathSkippedDir(name) {
+			t.Errorf("isSystemPathSkippedDir(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestIndexingStatusDistinguishesFastAndEnhancedSearch(t *testing.T) {
+	app := NewApp()
+	initial := app.GetIndexingStatus()
+	if !initial.IsIndexing || initial.SearchReady || initial.EnhancedReady {
+		t.Fatalf("initial status = %+v, want startup busy with neither index ready", initial)
+	}
+	if initial.StatusMessage != "Starting search engine..." {
+		t.Fatalf("initial status message = %q, want startup message", initial.StatusMessage)
+	}
+
+	app.setReadiness(true, false)
+	fast := app.GetIndexingStatus()
+	if !fast.SearchReady || fast.EnhancedReady {
+		t.Fatalf("fast-pass status = %+v, want basic search ready only", fast)
+	}
+
+	app.setReadiness(true, true)
+	complete := app.GetIndexingStatus()
+	if !complete.SearchReady || !complete.EnhancedReady {
+		t.Fatalf("complete status = %+v, want both search modes ready", complete)
+	}
+}
+
 func writeModelAssets(t *testing.T, root string) {
 	t.Helper()
 	for _, file := range modelAssetFiles {

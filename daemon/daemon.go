@@ -26,12 +26,10 @@ const (
 // shouldFilterPath returns true if the path should be ignored for content changes
 func shouldFilterPath(path string) bool {
 	lower := strings.ToLower(filepath.ToSlash(path))
-	if strings.Contains(lower, "/appdata") ||
-		strings.Contains(lower, "/.") ||
-		strings.Contains(lower, "/ntuser") ||
-		strings.Contains(lower, "/node_modules") ||
-		strings.Contains(lower, "/vendor") {
-		return true
+	for _, segment := range strings.Split(lower, "/") {
+		if shouldFilterFolder(segment) {
+			return true
+		}
 	}
 	return false
 }
@@ -39,7 +37,27 @@ func shouldFilterPath(path string) bool {
 // shouldFilterFolder returns true if the folder should be skipped
 func shouldFilterFolder(name string) bool {
 	lowerName := strings.ToLower(name)
-	return lowerName == "appdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(lowerName, "ntuser") || lowerName == "node_modules" || lowerName == "vendor"
+	if strings.HasPrefix(lowerName, ".") || strings.HasPrefix(lowerName, "ntuser") {
+		return true
+	}
+	switch lowerName {
+	case "appdata", "program files", "program files (x86)", "programdata", "windows",
+		"$windows.~bt", "$windows.~ws", "system volume information", "$recycle.bin",
+		"recovery", "perflogs", "node_modules", "vendor", "bower_components",
+		"coverage", "build", "dist", "out", "bin", "obj", "target", "__pycache__",
+		".venv", "venv", "env", ".tox", "site-packages", ".cargo", ".m2", ".gradle",
+		".nuget", ".bundle", "gems", ".git", ".hg", ".svn", ".vscode", ".idea",
+		".vs", ".eclipse", ".metadata", ".settings", ".next", ".nuxt", ".output",
+		".cache", ".parcel-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+		".terraform", ".serverless", "pods", "carthage", "deriveddata", ".yarn",
+		".pnpm-store", ".turbo", ".vite", ".svelte-kit", ".angular", ".astro",
+		".docker", "virtualbox vms", "virtual machines", "vmware", "cache", "caches",
+		"crashreports", "crashpad", "logs", "temp", "tmp", "thumbnailcache",
+		".android", "android", ".ssh", ".gnupg", ".aws", ".azure", ".kube":
+		return true
+	default:
+		return false
+	}
 }
 
 // isFileTooLarge returns true if file is larger than 100MB
@@ -167,6 +185,15 @@ func (t *tracker) rename(newPath, oldPath string) {
 }
 
 func (t *tracker) record(info notify.EventInfo) {
+	if shared.IsWhatsAppDatabase(info.Path()) {
+		fc := t.getOrCreate(info.Path())
+		fc.actions = []change{{action: "remove"}}
+		fc.modified = false
+		t.count++
+		t.prev = info
+		return
+	}
+
 	switch info.Event() {
 	case notify.FileActionAdded:
 		t.getOrCreate(info.Path()).actions = append(t.getOrCreate(info.Path()).actions, change{action: "add"})

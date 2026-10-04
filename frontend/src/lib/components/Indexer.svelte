@@ -99,12 +99,14 @@
     </div>
 
     <!-- Progress bar (only shown in non-flat mode or kept for compatibility) -->
-    {#if $indexingStatus.isIndexing || $indexingStatus.statusMessage}
+    {#if $indexingStatus.statusMessage}
       <div class="progress-wrapper" transition:fade={{ duration: 300 }}>
         <span class="status-label">{$indexingStatus.statusMessage}</span>
-        <div class="progress-track">
-          <div class="progress-fill" style="width: {$indexingStatus.progress}%"></div>
-        </div>
+        {#if $indexingStatus.isIndexing}
+          <div class="progress-track">
+            <div class="progress-fill" class:indeterminate={!$indexingStatus.searchReady} style="width: {$indexingStatus.searchReady ? $indexingStatus.progress : 30}%"></div>
+          </div>
+        {/if}
       </div>
     {/if}
   {:else}
@@ -356,6 +358,15 @@
     background: linear-gradient(to bottom right, #bfc8ca, #3f484a);
     border-radius: 0.125rem;
     transition: width 0.3s ease-out;
+  }
+
+  .progress-fill.indeterminate {
+    animation: scan-progress 1.8s ease-in-out infinite alternate;
+  }
+
+  @keyframes scan-progress {
+    from { transform: translateX(0); }
+    to { transform: translateX(230%); }
   }
 
   /* Custom Scrollbar integration */

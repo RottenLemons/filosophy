@@ -1,13 +1,14 @@
 <script lang="ts">
   import { afterUpdate, createEventDispatcher } from 'svelte';
-  import { fade, slide } from 'svelte/transition';
-  import { X, Trash2, AlertCircle, FileText, Search as SearchIcon, Shield, Check, Send } from 'lucide-svelte';
+  import { fade } from 'svelte/transition';
+  import { X, Trash2, AlertCircle, Search as SearchIcon, Send } from 'lucide-svelte';
   import { Search } from '$lib/wailsjs/go/main/App';
 
   const dispatch = createEventDispatcher();
 
   export let contextFile: any = null;
   export let fileContent: string = '';
+  export let embedded = false;
 
   interface Message {
     role: 'user' | 'assistant' | 'tool';
@@ -92,7 +93,7 @@
     type: 'function',
     function: {
       name: 'search_files',
-      description: `Search files.`,
+      description: 'Search the local file index for files relevant to a query. Returns up to ten matching file paths, not file contents.',
       parameters: {
         type: 'object',
         properties: { query: { type: 'string' } },
@@ -129,47 +130,58 @@
   async function responseError(res: Response): Promise<Error> {
     let body = '';
     try {
-      body = (await res.text()).trim();
+      body = (await res.text()).trim().slice(0, 500);
     } catch {}
     const message = body ? `HTTP ${res.status} ${res.statusText}: ${body}` : `HTTP ${res.status} ${res.statusText}`;
     return new Error(message);
   }
 
   async function streamResponse(res: Response, assistantMsg: Message): Promise<{ toolCalls: any[] }> {
-    const reader = res.body!.getReader();
+    if (!res.body) throw new Error('The assistant response did not include a readable stream.');
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     const toolCallAccum: Record<number, { id: string; name: string; args: string }> = {};
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-        try {
-          const json = JSON.parse(data);
-          const delta = json.choices?.[0]?.delta;
-          if (!delta) continue;
-          if (delta.content) {
-            assistantMsg.content += delta.content;
-            messages = [...messages.slice(0, -1), { ...assistantMsg }];
+    const consumeLine = (line: string) => {
+      if (!line.startsWith('data:')) return;
+      const data = line.slice(5).trimStart();
+      if (!data || data === '[DONE]') return;
+      try {
+        const json = JSON.parse(data);
+        const delta = json.choices?.[0]?.delta;
+        if (!delta) return;
+        if (delta.content) {
+          assistantMsg.content += delta.content;
+          messages = [...messages.slice(0, -1), { ...assistantMsg }];
+        }
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCallAccum[idx]) toolCallAccum[idx] = { id: '', name: '', args: '' };
+            if (tc.id) toolCallAccum[idx].id = tc.id;
+            if (tc.function?.name) toolCallAccum[idx].name += tc.function.name;
+            if (tc.function?.arguments) toolCallAccum[idx].args += tc.function.arguments;
           }
-          if (delta.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const idx = tc.index ?? 0;
-              if (!toolCallAccum[idx]) toolCallAccum[idx] = { id: '', name: '', args: '' };
-              if (tc.id) toolCallAccum[idx].id = tc.id;
-              if (tc.function?.name) toolCallAccum[idx].name += tc.function.name;
-              if (tc.function?.arguments) toolCallAccum[idx].args += tc.function.arguments;
-            }
-          }
-        } catch {}
+        }
+      } catch {
+        // Ignore non-JSON SSE data such as provider comments.
       }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) consumeLine(line);
+      }
+      buffer += decoder.decode();
+      if (buffer) consumeLine(buffer);
+    } finally {
+      reader.releaseLock();
     }
     return { toolCalls: Object.values(toolCallAccum) };
   }
@@ -214,6 +226,7 @@
         const { toolCalls } = await streamResponse(res, assistantMsg);
         apiMessages.push({ role: 'assistant', content: assistantMsg.content || null, tool_calls: toolCalls.length ? toolCalls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) : undefined });
         if (!toolCalls.length) break;
+        if (!assistantMsg.content) messages = messages.slice(0, -1);
 
         for (const tc of toolCalls) {
           let query = '';
@@ -248,9 +261,12 @@
     }
   }
 
-  function cancel() { abortController?.abort(); }
+  function cancel() {
+    abortController?.abort();
+    confirmDeny();
+  }
   function onKeyDown(e: KeyboardEvent) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }
-  function clearChat() { messages = []; error = ''; }
+  function clearChat() { if (streaming) cancel(); messages = []; error = ''; }
 
   function formatContent(text: string): string {
     const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -258,9 +274,9 @@
       `<pre class="my-4 p-4 bg-[#000000] border border-[#474848]/20 rounded-sm font-mono text-xs text-[#acabab] overflow-x-auto whitespace-pre">${code.trimEnd()}</pre>`
     );
     out = out.replace(/`([^`]+)`/g, (_, c) =>
-      `<code class="px-1.5 py-0.5 bg-[#000000] border border-[#474848]/20 rounded-sm text-[11px] font-mono text-[#bfc8ca]">${c}</code>`
+      `<code class="chat-code">${c}</code>`
     );
-    out = out.replace(/\*\*(.+?)\*\*/g, '<strong class="text-[#e7e5e5]">$1</strong>');
+    out = out.replace(/\*\*(.+?)\*\*/g, '<strong class="chat-strong">$1</strong>');
     out = out.replace(/\n/g, '<br>');
     return out;
   }
@@ -269,7 +285,7 @@
   $: providerLabel = cfg.provider !== 'none' && cfg.baseUrl ? cfg.model : null;
 </script>
 
-<aside class="absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px] bg-[#0e0e0e] border-l border-[#1a1a1a] flex flex-col shadow-2xl overflow-hidden">
+<aside class="chat-panel {embedded ? 'embedded-chat' : 'absolute inset-0 z-50 lg:relative lg:inset-auto lg:w-[40%] lg:min-w-[450px]'} bg-[#0e0e0e] border-l border-[#1a1a1a] flex flex-col shadow-2xl overflow-hidden">
   <!-- Header -->
   <header class="h-14 shrink-0 flex items-center justify-between px-6 bg-[#0e0e0e] border-b border-[#1a1a1a]">
     <div class="flex items-center gap-3">
@@ -282,7 +298,9 @@
       {#if messages.length > 0}
         <button on:click={clearChat} class="p-2 text-[#474848] hover:text-[#acabab] transition-colors"><Trash2 class="w-4 h-4" /></button>
       {/if}
-      <button on:click={() => dispatch('close')} class="p-2 text-[#474848] hover:text-[#acabab] transition-colors"><X class="w-5 h-5" /></button>
+      {#if !embedded}
+        <button on:click={() => dispatch('close')} class="p-2 text-[#474848] hover:text-[#acabab] transition-colors" aria-label="Close assistant"><X class="w-5 h-5" /></button>
+      {/if}
     </div>
   </header>
 
@@ -389,6 +407,22 @@
 </aside>
 
 <style>
+  :global(.chat-panel) { background: var(--f-surface) !important; border-color: var(--f-border) !important; color: var(--f-text) !important; box-shadow: -8px 0 28px rgb(21 42 32 / 7%) !important; }
+  :global(.chat-panel header) { background: var(--f-surface) !important; border-color: var(--f-border) !important; }
+  :global(.chat-panel [class*="bg-[#0e0e0e]"], .chat-panel [class*="bg-[#131313]"], .chat-panel [class*="bg-[#252626]"]) { background: var(--f-surface-2) !important; }
+  :global(.chat-panel [class*="text-[#e7e5e5]"]) { color: var(--f-text) !important; }
+  :global(.chat-panel [class*="text-[#acabab]"], .chat-panel [class*="text-[#474848]"]) { color: var(--f-text-2) !important; }
+  :global(.chat-panel [class*="text-[#bfc8ca]"]) { color: var(--f-accent) !important; }
+  :global(.chat-panel [class*="border-[#1a1a1a]"], .chat-panel [class*="border-[#474848]"]) { border-color: var(--f-border) !important; }
+  :global(.chat-panel textarea) { color: var(--f-text) !important; }
+  :global(.chat-panel textarea::placeholder) { color: var(--f-text-3) !important; }
+  :global(.chat-panel .font-serif) { color: var(--f-text) !important; font-family: Inter, "Segoe UI", sans-serif !important; }
+  :global(.chat-panel .h-full) { height: 100%; min-height: 100%; }
+  :global(.chat-code) { padding: 2px 5px; border: 1px solid var(--f-border); border-radius: 3px; background: var(--f-surface-2); color: var(--f-accent); font: 11px ui-monospace, monospace; }
+  :global(.chat-strong) { color: var(--f-text); }
+  :global(.embedded-chat) { position: relative !important; inset: auto !important; width: 100% !important; min-width: 0 !important; min-height: min(700px, calc(100dvh - 220px)); border: 1px solid var(--f-border) !important; border-radius: 6px; box-shadow: none !important; }
+  :global(.embedded-chat > div:last-child) { background: linear-gradient(to top, var(--f-surface) 70%, transparent) !important; }
+  @media (max-width: 760px) { :global(.embedded-chat) { min-height: calc(100dvh - 180px); } }
   :global(.scrollbar-custom::-webkit-scrollbar) { width: 3px; }
   :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
   :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #1a1a1a; }

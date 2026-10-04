@@ -15,40 +15,16 @@
 </svelte:head>
 
 <div class="f-page settings-page">
-  <div class="f-panel settings-card">
-    <h1>Settings</h1>
-    <p>Folder indexing, hardware, model connections, and local API settings are available in the settings window.</p>
-    <button class="f-button primary" type="button" on:click={() => showSettings = true}>Open settings</button>
-  </div>
+  <p class="eyebrow">Workspace</p>
+  <h1>Settings</h1>
+  <p class="settings-summary">Indexing, model connections, and ranking preferences.</p>
 </div>
 
 <SettingsModal bind:show={showSettings} on:close={closeSettings} />
 
 <style>
-  .settings-page {
-    max-width: 760px;
-  }
-
-  .settings-card {
-    padding: 18px;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-  }
-
-  h1,
-  p {
-    margin: 0;
-  }
-
-  h1 {
-    font-size: 24px;
-    font-weight: 650;
-  }
-
-  p {
-    color: var(--f-text-2);
-    line-height: 1.5;
-  }
+  .settings-page { max-width: 760px; }
+  h1 { margin: 0; font-size: 23px; line-height: 1.2; font-weight: 650; }
+  .eyebrow { margin: 0 0 4px; color: var(--f-text-3); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .settings-summary { margin: 6px 0; color: var(--f-text-2); font-size: 13px; }
 </style>

@@ -40,7 +40,7 @@ var defaultWeights = SearchWeights{
 	RecencyHalf:    30.0,
 	RRFK:           60.0,
 	MinScore:       0.15,
-	RerankTopN:     20,
+	RerankTopN:     8,
 	WRerankerBlend: 0.5,
 	PathOnlyCap:    0.12,
 	UseNewPipeline: true,

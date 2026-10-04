@@ -365,13 +365,13 @@
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div 
-    class="fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
+    class="settings-overlay fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
     transition:fade={{ duration: 200 }}
     on:click|self={close}
   >
     <div 
       bind:this={modalElement}
-      class="w-full max-w-4xl h-[640px] bg-[#0e0e0e] border border-[#474848]/20 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.8)] flex overflow-hidden rounded-sm"
+      class="settings-dialog w-full max-w-4xl h-[640px] bg-[#0e0e0e] border border-[#474848]/20 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.8)] flex overflow-hidden rounded-sm"
       transition:fly={{ y: 20, duration: 400, opacity: 0 }}
       role="dialog"
       aria-modal="true"
@@ -938,7 +938,7 @@
                       <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.mrr10)}</div>
                     </div>
                     <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
-                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">Recall@{optimizerStatus.currentWeights?.RerankTopN ?? 20}</div>
+                      <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">Recall@{optimizerStatus.currentWeights?.RerankTopN ?? 8}</div>
                       <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.recallAtRerank)}</div>
                     </div>
                     <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
@@ -1198,6 +1198,32 @@
 {/if}
 
 <style>
+  :global(.settings-dialog) { height: min(760px, calc(100dvh - 40px)); color: var(--f-text) !important; background: var(--f-surface) !important; border-color: var(--f-border) !important; border-radius: 7px !important; box-shadow: 0 20px 70px rgb(9 24 17 / 26%) !important; }
+  :global(.settings-dialog aside) { background: var(--f-surface-2) !important; border-color: var(--f-border) !important; }
+  :global(.settings-dialog main), :global(.settings-dialog header) { background: var(--f-surface) !important; }
+  :global(.settings-dialog [class*="bg-[#0e0e0e]"], .settings-dialog [class*="bg-[#131313]"], .settings-dialog [class*="bg-[#252626]"], .settings-dialog [class*="bg-[#1a1a1a]"]) { background: var(--f-surface-2) !important; }
+  :global(.settings-dialog [class*="text-[#e7e5e5]"]) { color: var(--f-text) !important; }
+  :global(.settings-dialog [class*="text-[#acabab]"]) { color: var(--f-text-2) !important; }
+  :global(.settings-dialog [class*="text-[#bfc8ca]"]) { color: var(--f-accent) !important; }
+  :global(.settings-dialog [class*="border-[#474848]"]) { border-color: var(--f-border) !important; }
+  :global(.settings-dialog h4) { font-family: Inter, "Segoe UI", sans-serif !important; font-size: 22px !important; line-height: 1.3 !important; letter-spacing: 0 !important; }
+  :global(.settings-dialog .font-serif) { font-family: Inter, "Segoe UI", sans-serif !important; color: var(--f-text) !important; }
+  :global(.settings-dialog button) { border-radius: 4px; }
+  :global(.settings-dialog input), :global(.settings-dialog select), :global(.settings-dialog textarea) { color: var(--f-text) !important; }
+  @media (max-width: 640px) {
+    :global(.settings-overlay) { padding: 0 !important; }
+    :global(.settings-dialog) { width: 100% !important; height: 100dvh !important; max-width: none !important; border-radius: 0 !important; flex-direction: column !important; }
+    :global(.settings-dialog > aside) { width: 100% !important; flex: 0 0 auto !important; padding-top: 12px !important; }
+    :global(.settings-dialog > aside > div:first-child) { display: none; }
+    :global(.settings-dialog > aside nav) { display: flex; gap: 4px; overflow-x: auto; padding: 0 8px 8px !important; }
+    :global(.settings-dialog > aside nav) { scrollbar-width: none; }
+    :global(.settings-dialog > aside nav::-webkit-scrollbar) { display: none; }
+    :global(.settings-dialog > aside nav button) { width: auto !important; min-width: max-content; padding: 8px 10px !important; }
+    :global(.settings-dialog > aside nav button span) { font-size: 9px !important; }
+    :global(.settings-dialog > aside > div:last-child) { display: none; }
+    :global(.settings-dialog main > header) { height: 47px !important; padding: 0 16px !important; }
+    :global(.settings-dialog main > div) { padding: 0 16px 22px !important; }
+  }
   :global(.scrollbar-custom::-webkit-scrollbar) { width: 4px; }
   :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
   :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #252626; border-radius: 0px; }

@@ -131,3 +131,67 @@ func TestWriterReplacesVectorsAndMarksOnlyCompletedFiles(t *testing.T) {
 		t.Fatalf("full reset left %d vectors and content_indexed=%d; want 0 and 0", countVectors(), indexed())
 	}
 }
+
+func TestMigrateRerankerBreadth(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "search-config.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE search_config (key TEXT PRIMARY KEY, value REAL NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("migrates old default once", func(t *testing.T) {
+		if _, err := db.Exec(`INSERT INTO search_config(key, value) VALUES ('rerank_top_n', 20)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateRerankerBreadth(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		var got int
+		if err := db.QueryRow(`SELECT value FROM search_config WHERE key = 'rerank_top_n'`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 8 {
+			t.Fatalf("rerank_top_n = %d, want 8", got)
+		}
+		if _, err := db.Exec(`UPDATE search_config SET value = 12 WHERE key = 'rerank_top_n'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateRerankerBreadth(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT value FROM search_config WHERE key = 'rerank_top_n'`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 12 {
+			t.Fatalf("rerank_top_n after migration rerun = %d, want preserved custom value 12", got)
+		}
+	})
+
+	t.Run("preserves non-default value", func(t *testing.T) {
+		customDB, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "custom-search-config.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer customDB.Close()
+		if _, err := customDB.Exec(`CREATE TABLE search_config (key TEXT PRIMARY KEY, value REAL NOT NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := customDB.Exec(`INSERT INTO search_config(key, value) VALUES ('rerank_top_n', 12)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateRerankerBreadth(ctx, customDB); err != nil {
+			t.Fatal(err)
+		}
+		var got int
+		if err := customDB.QueryRow(`SELECT value FROM search_config WHERE key = 'rerank_top_n'`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 12 {
+			t.Fatalf("rerank_top_n = %d, want preserved custom value 12", got)
+		}
+	})
+}

@@ -33,6 +33,7 @@ type TelemetryOptimizer struct {
 	ctx    context.Context
 
 	mu            sync.RWMutex
+	startOnce     sync.Once
 	lastRunAt     time.Time
 	lastAction    string
 	lastFeedbackN int
@@ -50,7 +51,7 @@ func NewTelemetryOptimizer(ctx context.Context, engine *Engine) *TelemetryOptimi
 // Start launches the optimizer's run loop in a background goroutine.
 func (o *TelemetryOptimizer) Start() {
 	o.engine.SetOptimizer(o)
-	go o.runLoop()
+	o.startOnce.Do(func() { go o.runLoop() })
 }
 
 // Status returns a snapshot of the optimizer's last run for the UI.
@@ -157,6 +158,15 @@ type optimizerMetrics struct {
 // A vote 7 days old has ~50% the weight of a brand new vote.
 const feedbackDecayHalfLifeDays = 7.0
 
+func feedbackTimeWeight(createdAt, now int64) float64 {
+	ageSeconds := now - createdAt
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	ageDays := float64(ageSeconds) / (24 * 60 * 60)
+	return math.Exp2(-ageDays / feedbackDecayHalfLifeDays)
+}
+
 const (
 	preferenceEvalK       = 10
 	relevantGain          = 3.0
@@ -174,7 +184,61 @@ func groupFeedbackByQuery(feedbacks []feedbackRow) map[string][]feedbackRow {
 	return grouped
 }
 
-func rankWeightedSignals(sigs RawSearchSignals, w SearchWeights) []docScore {
+func positiveFeedbackMetrics(positives []feedbackRow, rankByPath map[string]int, rerankTopN int) (ndcg, mrr, recall float64) {
+	if len(positives) == 0 {
+		return 0, 0, 0
+	}
+
+	positiveWeight := 0.0
+	maxWeight := 0.0
+	for _, p := range positives {
+		positiveWeight += p.Weight
+		if p.Weight > maxWeight {
+			maxWeight = p.Weight
+		}
+	}
+	if positiveWeight <= 0 || maxWeight <= 0 {
+		return 0, 0, 0
+	}
+
+	dcg := 0.0
+	idcg := 0.0
+	recalledWeight := 0.0
+	idealWeights := make([]float64, 0, len(positives))
+	for _, p := range positives {
+		idealWeights = append(idealWeights, p.Weight)
+		rank := rankByPath[p.ResultPath]
+		if rank > 0 {
+			if rank <= preferenceEvalK {
+				weightedRR := p.Weight / float64(rank) / maxWeight
+				if weightedRR > mrr {
+					mrr = weightedRR
+				}
+			}
+			if rank <= preferenceEvalK {
+				dcg += (math.Pow(2, relevantGain) - 1) * p.Weight / math.Log2(float64(rank+1))
+			}
+			if rank <= rerankTopN {
+				recalledWeight += p.Weight
+			}
+		}
+	}
+	sort.Sort(sort.Reverse(sort.Float64Slice(idealWeights)))
+	idealN := len(idealWeights)
+	if idealN > preferenceEvalK {
+		idealN = preferenceEvalK
+	}
+	for i := 0; i < idealN; i++ {
+		idcg += (math.Pow(2, relevantGain) - 1) * idealWeights[i] / math.Log2(float64(i+2))
+	}
+	if idcg > 0 {
+		ndcg = dcg / idcg
+	}
+	recall = recalledWeight / positiveWeight
+	return ndcg, mrr, recall
+}
+
+func rankWeightedSignals(query string, sigs RawSearchSignals, w SearchWeights) []docScore {
 	combined := make(map[string]float64)
 	for p, v := range sigs.PathFTS {
 		combined[p] += v * w.WPathFTS
@@ -215,6 +279,9 @@ func rankWeightedSignals(sigs RawSearchSignals, w SearchWeights) []docScore {
 			}
 		}
 	}
+	for path, score := range combined {
+		combined[path] = score * codeFileMultiplier(path, query, sigs.CodeQueryMatches)
+	}
 
 	docs := make([]docScore, 0, len(combined))
 	for p, s := range combined {
@@ -236,7 +303,7 @@ func evaluatePreferenceMetrics(grouped map[string][]feedbackRow, queryCache map[
 	out := optimizerMetrics{}
 
 	for query, judgments := range grouped {
-		docs := rankWeightedSignals(queryCache[query], w)
+		docs := rankWeightedSignals(query, queryCache[query], w)
 		rankByPath := make(map[string]int, len(docs))
 		for i, d := range docs {
 			rankByPath[d.Path] = i + 1
@@ -257,53 +324,16 @@ func evaluatePreferenceMetrics(grouped map[string][]feedbackRow, queryCache map[
 			queryWeight = 1
 		}
 
-		ndcg10 := 0.0
-		mrr10 := 0.0
-		recallAtRerank := 0.0
-		if len(positives) > 0 {
-			dcg := 0.0
-			firstPositiveRank := 0
-			recalled := 0
-			for _, p := range positives {
-				rank := rankByPath[p.ResultPath]
-				if rank == 0 {
-					continue
-				}
-				if rank <= preferenceEvalK {
-					dcg += (math.Pow(2, relevantGain) - 1) / math.Log2(float64(rank+1))
-					if firstPositiveRank == 0 || rank < firstPositiveRank {
-						firstPositiveRank = rank
-					}
-				}
-				if rank <= rerankTopN {
-					recalled++
-				}
-			}
-
-			idcg := 0.0
-			idealN := len(positives)
-			if idealN > preferenceEvalK {
-				idealN = preferenceEvalK
-			}
-			for i := 1; i <= idealN; i++ {
-				idcg += (math.Pow(2, relevantGain) - 1) / math.Log2(float64(i+1))
-			}
-			if idcg > 0 {
-				ndcg10 = dcg / idcg
-			}
-			if firstPositiveRank > 0 {
-				mrr10 = 1.0 / float64(firstPositiveRank)
-			}
-			recallAtRerank = float64(recalled) / float64(len(positives))
-		}
+		ndcg10, mrr10, recallAtRerank := positiveFeedbackMetrics(positives, rankByPath, rerankTopN)
 
 		downvotePenalty := 0.0
 		for _, n := range negatives {
 			rank := rankByPath[n.ResultPath]
 			if rank > 0 && rank <= preferenceEvalK {
-				downvotePenalty += 1.0 / math.Log2(float64(rank+1))
+				downvotePenalty += n.Weight / math.Log2(float64(rank+1))
 			}
 		}
+		downvotePenalty /= queryWeight
 
 		score := ndcgObjectiveWeight*ndcg10 +
 			mrrObjectiveWeight*mrr10 +
@@ -349,6 +379,7 @@ func (o *TelemetryOptimizer) optimize() {
 
 	var feedbacks []feedbackRow
 	seen := make(map[string]bool)
+	now := time.Now().Unix()
 	for rows.Next() {
 		var query, path string
 		var feedback int
@@ -366,8 +397,10 @@ func (o *TelemetryOptimizer) optimize() {
 			continue
 		}
 
-		// Calibration: treat all votes as ground truth with equal weight (no time decay).
-		w := 1.0
+		w := feedbackTimeWeight(createdAt, now)
+		if w == 0 {
+			continue
+		}
 
 		feedbacks = append(feedbacks, feedbackRow{
 			Query:      query,

@@ -81,6 +81,8 @@ type IndexingStatus struct {
 	IsIndexing    bool   `json:"isIndexing"`
 	StatusMessage string `json:"statusMessage"`
 	Progress      int    `json:"progress"`
+	SearchReady   bool   `json:"searchReady"`
+	EnhancedReady bool   `json:"enhancedReady"`
 }
 
 // filteredWriter drops log lines that contain noisy strings we never want in the log file.
@@ -173,13 +175,22 @@ func (a *App) makeFolderState(name, path string) FolderState {
 	}
 }
 
-func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) {
+func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, config *shared.AppConfig, pruneStale bool) bool {
+	if sc == nil {
+		return false
+	}
 	log.Println("[Indexer] Phase 1/2: Starting metadata scan...")
+	if ctx != nil {
+		a.setStatus(true, "Scanning fast keyword index...", 0)
+	}
 
 	cfg, err := shared.NewProcessorConfig(512, 4000, imageBatchSize, sc, a.Hardware)
 	if err != nil {
 		log.Printf("runPass1 error: %v", err)
-		return
+		if ctx != nil {
+			a.setStatus(false, "Fast search index failed", 0)
+		}
+		return false
 	}
 	defer cfg.CleanupTempDir()
 
@@ -188,6 +199,7 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	var sizes []int64
 	var ctimes []int64
 	var atimes []int64
+	var whatsappDatabasePaths []string
 
 	// Single walk: collect file metadata AND queue directories simultaneously.
 	// Previously two separate walks were made over the same tree, doubling syscall count.
@@ -217,6 +229,10 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 				shared.ProcessDirectory(path, cfg)
 				return nil
 			}
+			if shared.IsWhatsAppDatabase(path) {
+				whatsappDatabasePaths = append(whatsappDatabasePaths, path)
+				return nil
+			}
 			if isJunkFile(d.Name()) {
 				return nil
 			}
@@ -239,7 +255,16 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 		})
 
 		if ctx != nil && ctx.Err() != nil {
-			return
+			return false
+		}
+	}
+	if sc != nil && len(whatsappDatabasePaths) > 0 {
+		if err := sc.DeletePaths(whatsappDatabasePaths); err != nil {
+			log.Printf("pass1 WhatsApp database cleanup error: %v", err)
+			if ctx != nil {
+				a.setStatus(false, "Fast search index failed", 0)
+			}
+			return false
 		}
 	}
 
@@ -258,10 +283,22 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	}
 
 	if ctx != nil && ctx.Err() != nil {
-		return
+		return false
 	}
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
+	if err := sc.Flush(); err != nil {
+		log.Printf("pass1 flush error: %v", err)
+		if ctx != nil {
+			a.setStatus(false, "Fast search index failed", 0)
+		}
+		return false
+	}
+	a.setReadiness(true, false)
+	if ctx != nil {
+		a.setStatus(true, "Basic search ready · building enhanced index...", 0)
+	}
 	log.Println("[Indexer] Phase 1/2: Metadata scan complete.")
+	return true
 }
 
 func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
@@ -272,16 +309,18 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	paths, _, err := sc.UnindexedFiles()
 	if err != nil {
 		log.Println("pass2 query error:", err)
+		a.setReadiness(true, false)
 		if ctx != nil {
-			a.setStatus(false, "Error querying unindexed files", 0)
+			a.setStatus(false, "Basic search ready · enhanced indexing failed", 0)
 		}
 		return
 	}
 
 	total := len(paths)
 	if total == 0 {
+		a.setReadiness(true, true)
 		if ctx != nil {
-			a.setStatus(false, "Indexing complete.", 100)
+			a.setStatus(false, "Search ready", 100)
 		}
 		log.Println("[Indexer] Phase 2/2: No files to index.")
 		return
@@ -289,13 +328,17 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	log.Printf("[Indexer] Phase 2/2: Starting semantic indexing for %d files...", total)
 
 	if ctx != nil {
-		a.setStatus(true, "Phase 2/2: Starting...", 0)
+		a.setStatus(true, "Enhanced indexing: starting...", 0)
 	}
 
 	start := time.Now()
 	cfg, err := shared.NewProcessorConfig(512, 4000, imageBatchSize, sc, a.Hardware)
 	if err != nil {
 		log.Printf("runPass2 error: %v", err)
+		a.setReadiness(true, false)
+		if ctx != nil {
+			a.setStatus(false, "Basic search ready · enhanced indexing failed", 0)
+		}
 		return
 	}
 	defer cfg.CleanupTempDir()
@@ -338,12 +381,12 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 							lastETATime = time.Now()
 						}
 						if lastETA != "" {
-							statusMsg = fmt.Sprintf("Phase 2/2: %d%% — %s", progressPct, lastETA)
+							statusMsg = fmt.Sprintf("Enhanced index: %d%% — %s", progressPct, lastETA)
 						} else {
-							statusMsg = fmt.Sprintf("Phase 2/2: %d%%", progressPct)
+							statusMsg = fmt.Sprintf("Enhanced index: %d%%", progressPct)
 						}
 					} else {
-						statusMsg = fmt.Sprintf("Phase 2/2: %d%%", progressPct)
+						statusMsg = fmt.Sprintf("Enhanced index: %d%%", progressPct)
 					}
 
 					if progressPct%10 == 0 && progressPct != lastLoggedPct {
@@ -400,7 +443,8 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
 
 	if ctx != nil {
-		a.setStatus(false, "Indexing complete.", 100)
+		a.setReadiness(true, true)
+		a.setStatus(false, "Search ready", 100)
 	}
 }
 
@@ -411,6 +455,11 @@ var systemPathSkipDirs = map[string]bool{
 	"$windows.~ws":              true,
 	"recovery":                  true,
 	"perflogs":                  true,
+}
+
+func isSystemPathSkippedDir(name string) bool {
+	lower := strings.ToLower(name)
+	return systemPathSkipDirs[lower] || isContentSkippedDir(lower)
 }
 
 var junkExtensions = map[string]bool{
@@ -433,6 +482,9 @@ var junkFileNames = map[string]bool{
 }
 
 func isJunkFile(name string) bool {
+	if shared.IsWhatsAppDatabase(name) {
+		return true
+	}
 	lower := strings.ToLower(name)
 	if junkFileNames[lower] {
 		return true
@@ -462,7 +514,6 @@ var contentSkipDirNames = map[string]bool{
 
 	// ── Package / dependency caches ─────────────────────────────────────────
 	// Go
-	"pkg": true, // catches go\pkg\mod — checked via path prefix below too
 	// Rust
 	".cargo": true,
 	// Java / Kotlin
@@ -478,7 +529,25 @@ var contentSkipDirNames = map[string]bool{
 	".tox":          true,
 	"site-packages": true,
 	// Node
-	"node_modules": true,
+	"node_modules":     true,
+	"bower_components": true,
+	"vendor":           true,
+	"coverage":         true,
+	".pytest_cache":    true,
+	".mypy_cache":      true,
+	".ruff_cache":      true,
+	".terraform":       true,
+	".serverless":      true,
+	"pods":             true,
+	"carthage":         true,
+	"deriveddata":      true,
+	".yarn":            true,
+	".pnpm-store":      true,
+	".turbo":           true,
+	".vite":            true,
+	".svelte-kit":      true,
+	".angular":         true,
+	".astro":           true,
 	// Ruby
 	".bundle": true,
 	"gems":    true,
@@ -619,7 +688,7 @@ func runSystemPathIndex(ctx context.Context, sc *shared.Engine) {
 				default:
 				}
 				if d.IsDir() {
-					if systemPathSkipDirs[strings.ToLower(d.Name())] {
+					if isSystemPathSkippedDir(d.Name()) {
 						return filepath.SkipDir
 					}
 					return nil
@@ -653,6 +722,8 @@ type App struct {
 	isIndexing    bool
 	statusMessage string
 	progress      int
+	searchReady   bool
+	enhancedReady bool
 
 	// trayStatusCh receives tray label strings from setStatus so the tray
 	// goroutine can update its menu item without polling. Buffered to avoid blocking.
@@ -677,8 +748,10 @@ type App struct {
 
 func NewApp() *App {
 	a := &App{
-		trayStatusCh: make(chan string, 4),
-		sessionID:    newSessionID(),
+		trayStatusCh:  make(chan string, 4),
+		sessionID:     newSessionID(),
+		isIndexing:    true,
+		statusMessage: "Starting search engine...",
 	}
 	a.apiServer = newAPIServer(a)
 	return a
@@ -820,6 +893,7 @@ func (a *App) startup(ctx context.Context) {
 		if err != nil {
 			log.Printf("[Boot Error] CRITICAL initialization failed: %v", err)
 			log.Printf("The application will continue with search backend disabled.")
+			a.setStatus(false, "Search engine unavailable", 0)
 			wailsruntime.EventsEmit(a.ctx, "engine_status", "offline")
 			if !dbMissing {
 				log.Println("[Boot 10] Engine offline but DB exists; launching daemon (best-effort)...")
@@ -832,6 +906,8 @@ func (a *App) startup(ctx context.Context) {
 		a.mu.Lock()
 		a.engine = engine
 		a.mu.Unlock()
+		optimizer := shared.NewTelemetryOptimizer(idxCtx, engine)
+		engine.SetOptimizer(optimizer)
 		log.Println("[Boot 6] Engine initialized successfully")
 		wailsruntime.EventsEmit(a.ctx, "engine_status", "ready")
 
@@ -841,24 +917,23 @@ func (a *App) startup(ctx context.Context) {
 			}
 		}
 
-		// Push the initial "ready" tray label now the engine is up.
-		select {
-		case a.trayStatusCh <- "Filosophy — Ready":
-		default:
-		}
-
 		log.Println("[Boot 7] Initializing background indexing...")
+		a.setStatus(true, "Scanning fast keyword index...", 0)
 		// Always launch indexing in the background on boot to synchronize changes and resume partial scans
 		go func() {
 			log.Println("[Boot 8] Running background metadata sync...")
 			// runPass1 checks for new/deleted files (Metadata)
-			a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex)
+			if !a.runPass1(idxCtx, a.engine, dirs, a.config, forceIndex) {
+				return
+			}
 			if err := a.engine.PruneOutsideRoots(dirs); err != nil {
 				log.Printf("[Indexer] scoped prune error: %v", err)
 			}
-
-			// Deterministically block until pass 1 metadata has landed on disk
-			a.engine.Flush()
+			if err := a.engine.Flush(); err != nil {
+				log.Printf("[Indexer] metadata sync flush error: %v", err)
+				a.setStatus(false, "Basic search ready · enhanced indexing paused", 0)
+				return
+			}
 
 			// runPass2 processes any unindexed content (Semantic)
 			a.runPass2(idxCtx, a.engine)
@@ -878,7 +953,7 @@ func (a *App) startup(ctx context.Context) {
 			}()
 
 			log.Println("[Boot 9] Initial sync complete. Launching in-process daemon and optimizer...")
-			shared.NewTelemetryOptimizer(idxCtx, a.engine).Start()
+			optimizer.Start()
 			a.daemon = daemon.NewDaemon(dirs, a.engine)
 			a.daemon.Start()
 		}()
@@ -922,6 +997,7 @@ func (a *App) RetryEngineInit() error {
 	imageModelPath := filepath.Join(assetDir, "image")
 
 	a.engineInitializing.Store(true)
+	a.setStatus(true, "Starting search engine...", 0)
 	wailsruntime.EventsEmit(a.ctx, "engine_status", "initializing")
 
 	go func() {
@@ -930,14 +1006,37 @@ func (a *App) RetryEngineInit() error {
 		a.engineInitializing.Store(false)
 		if err != nil {
 			log.Printf("[Retry Error] Re-initialization failed: %v", err)
+			a.setStatus(false, "Search engine unavailable", 0)
 			wailsruntime.EventsEmit(a.ctx, "engine_status", "offline")
 			return
 		}
 		a.mu.Lock()
 		a.engine = engine
 		a.mu.Unlock()
+		idxCtx, cancel := context.WithCancel(a.ctx)
+		a.indexerCancel = cancel
+		dirs := a.getContentDirs()
+		optimizer := shared.NewTelemetryOptimizer(idxCtx, engine)
+		engine.SetOptimizer(optimizer)
 		log.Println("[Retry Success] Engine is now online")
 		wailsruntime.EventsEmit(a.ctx, "engine_status", "ready")
+		go func() {
+			if !a.runPass1(idxCtx, engine, dirs, a.config, false) {
+				return
+			}
+			if err := engine.PruneOutsideRoots(dirs); err != nil {
+				log.Printf("[Retry] scoped prune error: %v", err)
+			}
+			if err := engine.Flush(); err != nil {
+				log.Printf("[Retry] metadata sync flush error: %v", err)
+				a.setStatus(false, "Basic search ready · enhanced indexing paused", 0)
+				return
+			}
+			a.runPass2(idxCtx, engine)
+			optimizer.Start()
+			a.daemon = daemon.NewDaemon(dirs, engine)
+			a.daemon.Start()
+		}()
 	}()
 
 	return nil
@@ -997,6 +1096,8 @@ func (a *App) GetIndexingStatus() IndexingStatus {
 		IsIndexing:    a.isIndexing,
 		StatusMessage: a.statusMessage,
 		Progress:      a.progress,
+		SearchReady:   a.searchReady,
+		EnhancedReady: a.enhancedReady,
 	}
 }
 
@@ -1006,14 +1107,13 @@ func (a *App) setStatus(isIndexing bool, message string, progress int) {
 	a.isIndexing = isIndexing
 	a.statusMessage = message
 	a.progress = progress
+	status := a.indexingStatusLocked()
 	a.statusMutex.Unlock()
 
-	// Emit the standard Wails event so active listeners update
-	wailsruntime.EventsEmit(a.ctx, "indexing_status", IndexingStatus{
-		IsIndexing:    isIndexing,
-		StatusMessage: message,
-		Progress:      progress,
-	})
+	// Emit the standard Wails event so active listeners update.
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", status)
+	}
 
 	// Push a tray label — non-blocking: drop the update if the channel is full
 	// (the tray goroutine will catch the next one).
@@ -1024,6 +1124,27 @@ func (a *App) setStatus(isIndexing bool, message string, progress int) {
 	select {
 	case a.trayStatusCh <- label:
 	default:
+	}
+}
+
+func (a *App) setReadiness(searchReady, enhancedReady bool) {
+	a.statusMutex.Lock()
+	a.searchReady = searchReady
+	a.enhancedReady = enhancedReady
+	status := a.indexingStatusLocked()
+	a.statusMutex.Unlock()
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "indexing_status", status)
+	}
+}
+
+func (a *App) indexingStatusLocked() IndexingStatus {
+	return IndexingStatus{
+		IsIndexing:    a.isIndexing,
+		StatusMessage: a.statusMessage,
+		Progress:      a.progress,
+		SearchReady:   a.searchReady,
+		EnhancedReady: a.enhancedReady,
 	}
 }
 
@@ -1105,10 +1226,13 @@ func (a *App) SubmitFeedback(query, path string, rank int, score float64, feedba
 }
 
 func (a *App) GetOptimizerStatus() *shared.OptimizerStatus {
-	if a.engine == nil {
+	a.mu.Lock()
+	engine := a.engine
+	a.mu.Unlock()
+	if engine == nil {
 		return nil
 	}
-	return a.engine.GetOptimizerStatus()
+	return engine.GetOptimizerStatus()
 }
 
 func (a *App) OpenFileNative(path string) error {
@@ -1217,7 +1341,10 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 		return nil
 	}
 	a.isIndexing = true
+	a.statusMessage = "Scanning fast keyword index..."
+	a.progress = 0
 	a.statusMutex.Unlock()
+	a.setStatus(true, "Scanning fast keyword index...", 0)
 
 	if a.indexerCancel != nil {
 		a.indexerCancel()
@@ -1227,7 +1354,9 @@ func (a *App) SetFolderIndexed(folderPath string, indexed bool) error {
 	dir := folderPath
 
 	go func() {
-		a.runPass1(idxCtx, a.engine, []string{dir}, a.config, false)
+		if !a.runPass1(idxCtx, a.engine, []string{dir}, a.config, false) {
+			return
+		}
 		a.runPass2(idxCtx, a.engine)
 		a.daemon = daemon.NewDaemon(a.getContentDirs(), a.engine)
 		a.daemon.Start()
@@ -1261,7 +1390,9 @@ func (a *App) SetDirPathOnly(dirPath string, pathOnly bool) error {
 		// In both cases run pass1+pass2:
 		// - Enabling: unindexed files get fast-marked (IsPathOnly skips content)
 		// - Disabling: reset files get content-indexed normally
-		a.runPass1(ctx, a.engine, a.getContentDirs(), a.config, false)
+		if !a.runPass1(ctx, a.engine, a.getContentDirs(), a.config, false) {
+			return
+		}
 		a.runPass2(ctx, a.engine)
 	}()
 	return nil

@@ -56,7 +56,7 @@ const (
 
 	// rerankerTopN is how many results from the RRF stage are passed to the
 	// cross-encoder reranker. Everything beyond this position is returned as-is.
-	rerankerTopN       = 20
+	rerankerTopN       = 8
 	rerankerMaxToks    = 8192 // jina-reranker-turbo context length
 	snippetWindowChars = 800  // bytes per extracted window ≈ 200 subword tokens
 
@@ -120,8 +120,9 @@ type Engine struct {
 	writerWg          sync.WaitGroup
 
 	// Ranking infrastructure — initialised after InitIndexTables succeeds.
-	Weights   *WeightStore        // hot-reloaded ranking weights from search_config
-	optimizer *TelemetryOptimizer // set by optimizer.Start(); nil until then
+	Weights     *WeightStore // hot-reloaded ranking weights from search_config
+	optimizerMu sync.RWMutex
+	optimizer   *TelemetryOptimizer
 
 	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
 	Hardware HardwareConfig
@@ -756,17 +757,23 @@ func (s *Engine) runWriter() {
 	}
 }
 
-// SetOptimizer stores a reference to the running TelemetryOptimizer so the
-// app layer can query its status.
-func (s *Engine) SetOptimizer(o *TelemetryOptimizer) { s.optimizer = o }
+// SetOptimizer publishes the optimizer so the app layer can query its status.
+func (s *Engine) SetOptimizer(o *TelemetryOptimizer) {
+	s.optimizerMu.Lock()
+	s.optimizer = o
+	s.optimizerMu.Unlock()
+}
 
 // GetOptimizerStatus returns the optimizer's last-run snapshot, or nil if
 // the optimizer hasn't been started yet.
 func (s *Engine) GetOptimizerStatus() *OptimizerStatus {
-	if s.optimizer == nil {
+	s.optimizerMu.RLock()
+	optimizer := s.optimizer
+	s.optimizerMu.RUnlock()
+	if optimizer == nil {
 		return nil
 	}
-	st := s.optimizer.Status()
+	st := optimizer.Status()
 	return &st
 }
 
@@ -1507,7 +1514,7 @@ func (s *Engine) InitIndexTables() error {
 		{"recency_half_life", 30.0}, // Days for recency score to decay to 37%
 		{"rrf_k", 60.0},             // RRF smoothing constant
 		{"min_score", 0.15},         // Minimum score threshold (used by REST API)
-		{"rerank_top_n", 20.0},      // How many results to pass to cross-encoder reranker
+		{"rerank_top_n", 8.0},       // How many results to pass to cross-encoder reranker
 		{"w_reranker_blend", 0.5},   // Blend alpha: 0=pure RRF, 1=pure reranker
 		{"path_only_cap", 0.12},     // Score cap for path-only results (no content signal)
 		{"use_new_pipeline", 1.0},   // Feature flag: 0=old pipeline, 1=new weighted pipeline
@@ -1527,6 +1534,10 @@ func (s *Engine) InitIndexTables() error {
 		if _, err := s.sqlDB.ExecContext(ctx, `INSERT OR IGNORE INTO search_config(key, value) VALUES ('migrated_new_pipeline_default', 1)`); err != nil {
 			return fmt.Errorf("failed to mark use_new_pipeline migration: %w", err)
 		}
+	}
+
+	if err := migrateRerankerBreadth(ctx, s.sqlDB); err != nil {
+		return err
 	}
 
 	// search_feedback: telemetry for ranking weight adjustment.
@@ -1590,6 +1601,23 @@ func (s *Engine) InitIndexTables() error {
 	// Probe atime availability in the background so it doesn't delay startup.
 	go CheckAtimeEnabled(s.sqlDB)
 
+	return nil
+}
+
+func migrateRerankerBreadth(ctx context.Context, db *sql.DB) error {
+	var migrated int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM search_config WHERE key = 'migrated_rerank_breadth'`).Scan(&migrated); err != nil {
+		return err
+	}
+	if migrated != 0 {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE search_config SET value = 8 WHERE key = 'rerank_top_n' AND value = 20`); err != nil {
+		return fmt.Errorf("failed to migrate reranker breadth: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO search_config(key, value) VALUES ('migrated_rerank_breadth', 1)`); err != nil {
+		return fmt.Errorf("failed to mark reranker breadth migration: %w", err)
+	}
 	return nil
 }
 
@@ -1860,12 +1888,13 @@ type SearchResult struct {
 // the telemetry optimizer to run in-memory parameter sweeps without repeating
 // vector search and reranker inference for each candidate weight set.
 type RawSearchSignals struct {
-	PathFTS       map[string]float64
-	PathPrefix    map[string]float64
-	ContentFTS    map[string]float64
-	SemanticText  map[string]float64
-	SemanticImage map[string]float64
-	Reranker      map[string]float64
+	PathFTS          map[string]float64
+	PathPrefix       map[string]float64
+	ContentFTS       map[string]float64
+	SemanticText     map[string]float64
+	SemanticImage    map[string]float64
+	Reranker         map[string]float64
+	CodeQueryMatches map[string]bool
 }
 
 // GetRawSignals performs vector, FTS, and optional reranker scoring but returns
@@ -1876,12 +1905,13 @@ func (s *Engine) GetRawSignals(query string) RawSearchSignals {
 	qText := pq.Text
 
 	signals := RawSearchSignals{
-		PathFTS:       make(map[string]float64),
-		PathPrefix:    make(map[string]float64),
-		ContentFTS:    make(map[string]float64),
-		SemanticText:  make(map[string]float64),
-		SemanticImage: make(map[string]float64),
-		Reranker:      make(map[string]float64),
+		PathFTS:          make(map[string]float64),
+		PathPrefix:       make(map[string]float64),
+		ContentFTS:       make(map[string]float64),
+		SemanticText:     make(map[string]float64),
+		SemanticImage:    make(map[string]float64),
+		Reranker:         make(map[string]float64),
+		CodeQueryMatches: make(map[string]bool),
 	}
 
 	var textQueryVec []float32
@@ -1933,12 +1963,13 @@ func (s *Engine) GetRawSignals(query string) RawSearchSignals {
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
-		s.addContentFTSPhraseRRF(ctx, qText, m)
+		phraseMatches := s.addContentFTSPhraseRRF(ctx, qText, m)
 		s.addContentFTSRRF(ctx, qText, m)
 		if len(m) < 5 {
-			s.addContentFTSFuzzyRRF(ctx, qText, m)
+			phraseMatches = mergePathMatches(phraseMatches, s.addContentFTSFuzzyRRF(ctx, qText, m))
 		}
 		mu.Lock()
+		signals.CodeQueryMatches = phraseMatches
 		for p, v := range m {
 			signals.ContentFTS[p] = v
 		}
@@ -2052,15 +2083,16 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 
 	// Group B: content FTS signals; fuzzy only runs when exact search finds few docs.
 	contentScores := make(map[string]float64)
+	codePhraseMatches := make(map[string]bool)
 	var contentMu sync.Mutex
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
-		s.addContentFTSPhraseRRF(ctx, query, m)
+		phraseMatches := s.addContentFTSPhraseRRF(ctx, query, m)
 		s.addContentFTSRRF(ctx, query, m)
 		if len(m) < 5 {
-			s.addContentFTSFuzzyRRF(ctx, query, m)
+			phraseMatches = mergePathMatches(phraseMatches, s.addContentFTSFuzzyRRF(ctx, query, m))
 		}
 		// Scale content FTS signal by w_content_fts when new pipeline is active.
 		if w.UseNewPipeline && w.WContentFTS != 1.0 {
@@ -2069,6 +2101,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 			}
 		}
 		contentMu.Lock()
+		codePhraseMatches = phraseMatches
 		for p, v := range m {
 			contentScores[p] += v
 		}
@@ -2184,6 +2217,7 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		rerankN = w.RerankTopN
 	}
 	results = s.rerank(query, results, rerankN, w.WRerankerBlend)
+	applyCodeFilePenalty(results, query, codePhraseMatches)
 	results = s.applyFilters(results, pq)
 	return results, nil
 }
@@ -2261,6 +2295,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	// Phase 1: parallel scoring signals.
 	tsSigCh := make(chan map[string]float64, 3)
 	var tsSigWg sync.WaitGroup
+	codePhraseMatches := make(map[string]bool)
 
 	tsSigWg.Add(1)
 	go func() {
@@ -2277,11 +2312,12 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	go func() {
 		defer tsSigWg.Done()
 		m := make(map[string]float64)
-		s.addContentFTSPhraseRRF(ctx, query, m)
+		phraseMatches := s.addContentFTSPhraseRRF(ctx, query, m)
 		s.addContentFTSRRF(ctx, query, m)
 		if len(m) < 5 {
-			s.addContentFTSFuzzyRRF(ctx, query, m)
+			phraseMatches = mergePathMatches(phraseMatches, s.addContentFTSFuzzyRRF(ctx, query, m))
 		}
+		codePhraseMatches = phraseMatches
 		tsSigCh <- m
 	}()
 
@@ -2320,6 +2356,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		}
 	}
 	out = s.rerank(query, out, rerankN, rerankerBlend)
+	applyCodeFilePenalty(out, query, codePhraseMatches)
 	out = s.applyFilters(out, pq)
 	return out, nil
 }
@@ -2621,13 +2658,13 @@ func (s *Engine) addContentFTSRRF(ctx context.Context, query string, scores map[
 	applyDocRRF(docScores, scores, contentKeywordBoost)
 }
 
-// addContentFTSPhraseRRF queries content for the query as an FTS5 phrase
-// (words adjacent, in order). Documents are scored by top-K chunk average (k-MAX).
-// Only runs for multi-word queries.
-func (s *Engine) addContentFTSPhraseRRF(ctx context.Context, query string, scores map[string]float64) {
+// addContentFTSPhraseRRF finds exact content phrases and scores multi-word matches
+// by top-K chunk average (k-MAX). Single-word matches are returned for code-query
+// exemptions but do not receive a second ranking signal.
+func (s *Engine) addContentFTSPhraseRRF(ctx context.Context, query string, scores map[string]float64) map[string]bool {
 	words := strings.Fields(query)
-	if len(words) < 2 {
-		return
+	if len(words) == 0 {
+		return nil
 	}
 	escaped := strings.ReplaceAll(query, `"`, `""`)
 	ftsQuery := `"` + escaped + `"`
@@ -2642,19 +2679,26 @@ func (s *Engine) addContentFTSPhraseRRF(ctx context.Context, query string, score
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts phrase search warning: %v", err)
-		return
+		return nil
 	}
 	defer rows.Close()
 
 	docScores := topKAvg(rows, contentTopK)
-	applyDocRRF(docScores, scores, contentPhraseBoost)
+	if len(words) >= 2 {
+		applyDocRRF(docScores, scores, contentPhraseBoost)
+	}
+	matches := make(map[string]bool, len(docScores))
+	for path := range docScores {
+		matches[path] = true
+	}
+	return matches
 }
 
 // addContentFTSFuzzyRRF runs a short-prefix content FTS5 query using 3-char
 // anchors. A chunk containing "Albert" and "Camus" is found by "alb"* AND "cam"*
 // even when the query is "albret camuls". Weighted at 0.8x to stay below the
 // exact-keyword signal but above noise.
-func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores map[string]float64) {
+func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores map[string]float64) map[string]bool {
 	words := strings.Fields(strings.ToLower(query))
 	anchors := make([]string, 0, len(words))
 	for _, w := range words {
@@ -2665,7 +2709,7 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 		anchors = append(anchors, `"`+escaped+`"*`)
 	}
 	if len(anchors) == 0 {
-		return
+		return nil
 	}
 	ftsQuery := strings.Join(anchors, " ") // AND semantics
 
@@ -2679,12 +2723,30 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts fuzzy search warning: %v", err)
-		return
+		return nil
 	}
 	defer rows.Close()
 
 	docScores := topKAvg(rows, contentTopK)
 	applyDocRRF(docScores, scores, contentFuzzyBoost)
+	matches := make(map[string]bool, len(docScores))
+	for path := range docScores {
+		matches[path] = true
+	}
+	return matches
+}
+
+func mergePathMatches(first, second map[string]bool) map[string]bool {
+	if len(second) == 0 {
+		return first
+	}
+	if first == nil {
+		first = make(map[string]bool, len(second))
+	}
+	for path := range second {
+		first[path] = true
+	}
+	return first
 }
 
 // topKAvg reads (path, score) rows, keeps the top-k scores per document,
@@ -2975,6 +3037,69 @@ func addFuzzyPathBoosts(query string, scores map[string]float64) {
 	}
 }
 
+var codeFileExtensions = map[string]bool{
+	".go": true, ".py": true, ".pyi": true, ".js": true, ".jsx": true,
+	".mjs": true, ".cjs": true, ".ts": true, ".tsx": true, ".java": true,
+	".kt": true, ".kts": true, ".rs": true, ".c": true, ".h": true,
+	".cc": true, ".cpp": true, ".cxx": true, ".hh": true, ".hpp": true,
+	".cs": true, ".fs": true, ".fsx": true, ".vb": true, ".php": true,
+	".rb": true, ".swift": true, ".scala": true, ".sql": true, ".sh": true,
+	".bash": true, ".zsh": true, ".ps1": true, ".psm1": true, ".bat": true,
+	".cmd": true, ".lua": true, ".pl": true, ".r": true, ".dart": true,
+	".ex": true, ".exs": true, ".erl": true, ".hrl": true, ".hs": true,
+	".lhs": true, ".clj": true, ".cljs": true, ".vue": true, ".svelte": true,
+	".html": true, ".htm": true, ".css": true, ".scss": true, ".less": true,
+	".proto": true, ".graphql": true, ".gql": true,
+}
+
+const codeFileScoreMultiplier = 0.12
+
+func codeFileMultiplier(path, query string, contentQueryMatches map[string]bool) float64 {
+	if !codeFileExtensions[strings.ToLower(filepath.Ext(path))] || contentQueryMatches[path] || filenameNearQuery(query, path) {
+		return 1
+	}
+	return codeFileScoreMultiplier
+}
+
+func filenameNearQuery(query, path string) bool {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if ext := filepath.Ext(query); codeFileExtensions[ext] {
+		query = strings.TrimSuffix(query, ext)
+	}
+	name := filepath.Base(path)
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	name = strings.ToLower(name)
+	if query == "" || name == "" {
+		return false
+	}
+	if query == name || (len(query) >= 4 && strings.Contains(name, query)) {
+		return true
+	}
+
+	queryWords := splitWords(query)
+	nameWords := splitWords(name)
+	if len(queryWords) == 0 || len(nameWords) == 0 {
+		return false
+	}
+	matched := 0
+	for _, queryWord := range queryWords {
+		for _, nameWord := range nameWords {
+			if queryWord == nameWord || (len(queryWord) >= 4 && wordEditSim(queryWord, nameWord) >= 0.8) {
+				matched++
+				break
+			}
+		}
+	}
+	return matched*5 >= len(queryWords)*4
+}
+
+func applyCodeFilePenalty(results []SearchResult, query string, contentQueryMatches map[string]bool) {
+	for i := range results {
+		results[i].Score *= codeFileMultiplier(results[i].Path, query, contentQueryMatches)
+	}
+	sortResults(results)
+}
+
 // applyNoisePenalties multiplies down scores for files that are unlikely to be
 // useful document search results:
 //   - Known binary/compiled extensions (.class, .exe, .dll, .inf, .sys, etc.)
@@ -3158,12 +3283,12 @@ func (s *Engine) rerank(query string, results []SearchResult, rerankTopN int, re
 	top := results[:n]
 	rest := results[n:]
 
-	// Fetch up to 3 BM25-ranked snippets per document across all top-N paths in one query.
+	// Fetch up to 2 BM25-ranked snippets per document across all top-N paths in one query.
 	// snippet() extracts a ~64-token window around the actual match inside each chunk,
 	// so the reranker sees the relevant excerpt rather than an arbitrary prefix.
 	// Multiple snippets per doc cover spread-out occurrences; we take the max reranker
 	// score across snippets as the document score.
-	const maxSnippetsPerDoc = 3
+	const maxSnippetsPerDoc = 2
 	docSnippets := make(map[string][]string, n) // path → ordered snippets
 	basenames := make(map[string]string, n)
 

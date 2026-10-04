@@ -85,39 +85,6 @@
 
   let isFilterOpen = false;
   
-  const loadingMessages = [
-    "Searching for Untitled_final_FINAL_v3.pdf...",
-    "Attempting to decipher your file naming conventions...",
-    "Judging the contents of your Downloads folder...",
-    "Translating your typos into machine logic...",
-    "Interrogating the local language model...",
-    "Melting your CPU to find a single PDF...",
-    "Coercing the vector database...",
-    "Going exactly as fast as your RAM currently allows...",
-    "Forcing the neural network to read your documents...",
-    "Doing actual math. Hold on..."
-  ];
-  let currentMessageIndex = 0;
-  let loadingInterval: ReturnType<typeof setInterval> | undefined = undefined;
-
-  $: {
-    if (searching) {
-      if (!loadingInterval) {
-        currentMessageIndex = Math.floor(Math.random() * loadingMessages.length);
-        loadingInterval = setInterval(() => {
-          let nextIndex;
-          do {
-            nextIndex = Math.floor(Math.random() * loadingMessages.length);
-          } while (nextIndex === currentMessageIndex);
-          currentMessageIndex = nextIndex;
-        }, 1800);
-      }
-    } else {
-      clearInterval(loadingInterval);
-      loadingInterval = undefined;
-    }
-  }
-
   // Task 4: Reset image error on file selection change
   $: if (selectedFile) {
     previewImageError = false;
@@ -198,11 +165,9 @@
     currentSearchTicket++;
     const localTicket = currentSearchTicket;
 
-    // File search — show results as soon as it completes
     Search(searchQuery).then(result => {
       if (localTicket !== currentSearchTicket) return;
       files = result || [];
-      selectedFile = null;
       searchErrorMsg = null;
     }).catch(err => {
       if (localTicket !== currentSearchTicket) return;
@@ -314,7 +279,7 @@
 </script>
 
 
-<div class="h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
+<div class="home-root h-screen flex flex-col bg-[#FAF9F6] dark:bg-[#111] text-slate-800 dark:text-gray-100 overflow-hidden font-sans relative">
   <div class="absolute top-6 right-8 flex items-center gap-6 z-[9999]">
     <!-- Engine Status (Integrated) -->
     {#if searchErrorMsg !== 'backend engine not initialized'}
@@ -363,7 +328,7 @@
 
   <SettingsModal bind:show={showSettings} on:close={() => showSettings = false} />
   
-  <header class="w-full px-12 py-6 z-50 shrink-0">
+  <header class="home-brand-header w-full px-12 py-6 z-50 shrink-0">
     <h1 class="text-3xl font-serif text-slate-900 dark:text-gray-100 tracking-tight">Filosophy</h1>
   </header>
 
@@ -372,6 +337,11 @@
     
     <div class="flex-1 overflow-y-auto px-12 pb-12 flex flex-col scrollbar-custom border-r border-gray-100 dark:border-[#2a2a2a] transition-all duration-300">
       <div class="w-full max-w-5xl mx-auto space-y-8 pr-6">
+
+        <div class="home-page-title">
+          <p>Workspace</p>
+          <h2>Search</h2>
+        </div>
         
         <div class="space-y-4">
           <div class="flex items-center gap-4 w-full border-b border-gray-200 dark:border-[#2a2a2a] pb-2 transition-colors focus-within:border-blue-500">
@@ -515,17 +485,11 @@
               {/if}
             </div>
           {:else if searching}
-            <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-8" transition:fade>
-              <svg class="animate-spin" style="animation-duration: 6s;" width="80" height="80" viewBox="0 0 80 80" fill="none" stroke="#757575" stroke-width="8" stroke-linecap="square">
-                <circle cx="40" cy="40" r="30" stroke-dasharray="140 48"></circle>
+            <div class="p-12 flex flex-col justify-center items-center bg-transparent gap-4" transition:fade>
+              <svg class="animate-spin" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#757575" stroke-width="3" stroke-linecap="square" aria-hidden="true">
+                <circle cx="16" cy="16" r="12" stroke-dasharray="36 18"></circle>
               </svg>
-              <div class="h-8 relative w-full flex justify-center">
-                {#key currentMessageIndex}
-                  <span transition:fade={{duration: 600}} class="absolute text-[18px] text-[#acabab] text-center tracking-wide" style="font-family: 'Inter', sans-serif;">
-                    {loadingMessages[currentMessageIndex]}
-                  </span>
-                {/key}
-              </div>
+              <span class="text-sm text-[#acabab]">Searching…</span>
               <button 
                 on:click={cancelSearch}
                 class="px-4 py-1.5 border border-gray-300 dark:border-[#2a2a2a] text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-[10px] font-bold uppercase tracking-widest transition-colors"
@@ -725,6 +689,59 @@
 <APIConfirmDialog request={apiConfirmRequest} on:reply={handleConfirmReply} />
 
 <style>
+  :global(.app-main:has(.home-root)) { padding: 0; }
+  .home-root { height: calc(100dvh - 1px); min-height: 560px; background: var(--f-bg) !important; color: var(--f-text) !important; }
+  .home-brand-header { display: none; }
+  .home-root > main { min-height: 0; }
+  .home-root > main > div:first-child { padding: 30px 30px 24px; border-color: var(--f-border) !important; }
+  .home-root > div:first-child { display: none; }
+  .home-root > main > div:first-child > div { max-width: 960px; padding-right: 12px; }
+  .home-root > main > div:first-child > div > * + * { margin-top: 15px !important; }
+  .home-page-title { display: flex; flex-direction: column; gap: 3px; }
+  .home-page-title p { margin: 0; color: var(--f-text-3); font: 700 10px/1.4 Inter, "Segoe UI", sans-serif; text-transform: uppercase; }
+  .home-page-title h2 { margin: 0; color: var(--f-text); font: 650 23px/1.2 Inter, "Segoe UI", sans-serif; }
+  .home-root > main > div:first-child > div > div:nth-child(2) > div:first-child { gap: 10px; min-height: 44px; padding: 4px 10px; border: 1px solid var(--f-border); border-radius: 5px; background: var(--f-surface); }
+  .home-root > main > div:first-child > div > div:nth-child(2) input { font-size: 14px !important; font-family: Inter, "Segoe UI", sans-serif !important; }
+  .home-root > main > div:first-child > div > div:nth-child(2) button { border-radius: 4px !important; }
+  .home-root input { color: var(--f-text) !important; }
+  .home-root input::placeholder { color: var(--f-text-3) !important; }
+  .home-root [role="listbox"] { gap: 5px !important; }
+  .home-root [role="option"] { min-height: 92px; padding: 13px 14px !important; border: 1px solid var(--f-border) !important; border-radius: 5px; background: var(--f-surface) !important; box-shadow: none !important; }
+  .home-root [role="option"]:hover, .home-root [role="option"][aria-selected="true"] { border-color: var(--f-border-strong) !important; background: var(--f-surface-2) !important; }
+  .home-root [role="option"] > div:first-child { gap: 14px !important; }
+  .home-root [role="option"] > div:first-child > div:first-child { width: 36px; height: 36px; border-radius: 4px; background: var(--f-surface-2) !important; color: var(--f-accent) !important; }
+  .home-root [role="option"] h3 { color: var(--f-text) !important; font: 600 15px/1.35 Inter, "Segoe UI", sans-serif !important; }
+  .home-root [role="option"] p { color: var(--f-text-3) !important; font-size: 11px !important; }
+  .home-root [role="option"] [class*="uppercase"] { color: var(--f-text-2) !important; }
+  .home-root [role="option"] > div:last-child > div:first-child { color: var(--f-accent) !important; font-size: 19px !important; }
+  .home-root [role="option"] > div:last-child { padding-right: 0 !important; }
+  .home-root aside { background: var(--f-bg) !important; border-color: var(--f-border) !important; box-shadow: -8px 0 28px rgb(21 42 32 / 7%) !important; }
+  .home-root aside > div { padding: 27px !important; }
+  .home-root aside h2 { color: var(--f-text) !important; font: 650 23px/1.25 Inter, "Segoe UI", sans-serif !important; overflow-wrap: anywhere; }
+  .home-root aside button:not([aria-label="Close Preview"]) { border-radius: 4px; }
+  .home-root aside > div > div:last-child { border-radius: 5px; border: 1px solid var(--f-border); background: var(--f-surface) !important; box-shadow: none !important; }
+  .home-root aside > div > div:last-child p { color: var(--f-text-2) !important; }
+  .home-root aside [class*="text-blue-"] { color: var(--f-accent) !important; }
+  .home-root [class*="bg-blue-"] { background: var(--f-accent-soft) !important; }
+  .home-root [class*="border-gray-"] { border-color: var(--f-border) !important; }
+  .home-root [class*="text-gray-"] { color: var(--f-text-2) !important; }
+  .home-root [class*="bg-gray-"] { background: var(--f-surface-2) !important; }
+  .home-root [class*="dark:bg-[#111]"] { background: var(--f-surface) !important; }
+  .home-root [class*="dark:bg-[#1a1a1a]"] { background: var(--f-surface-2) !important; }
+  @media (max-width: 760px) {
+    :global(.app-main:has(.home-root)) { padding: 0; }
+    .home-root { height: calc(100dvh - 101px); min-height: 480px; }
+    .home-root > div:first-child { display: none; }
+    .home-root > main { overflow: auto; }
+    .home-root > main > div:first-child { padding: 19px 16px !important; }
+    .home-root > main > div:first-child > div { padding-right: 0; }
+    .home-root [role="option"] { min-height: 82px; }
+    .home-root [role="option"] > div:last-child > div:first-child { font-size: 16px !important; }
+    .home-root aside { position: absolute !important; inset: 0 !important; width: 100% !important; min-width: 0 !important; }
+    .home-root aside > div { padding: 19px !important; }
+    .home-root aside h2 { font-size: 20px !important; }
+  }
+
   :global(.scrollbar-custom::-webkit-scrollbar) { width: 6px; }
   :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }
   :global(.scrollbar-custom::-webkit-scrollbar-thumb) { background: #E2E8F0; border-radius: 4px; }
