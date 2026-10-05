@@ -55,6 +55,7 @@
   }
 
   let searchQuery = "";
+  let searchedQuery = "";
   let selectedFile: any = null;
   let files: any[] = [];
   let searching = false;       // files still loading
@@ -62,6 +63,13 @@
 
   let currentSearchTicket = 0;
   let renderLimit = 50;
+
+  $: if (!searchQuery.trim()) {
+    searchedQuery = "";
+    files = [];
+    selectedFile = null;
+    searchErrorMsg = null;
+  }
 
   // feedback: maps file.Path → +1 | -1 so a result can't be voted twice per session.
   let feedbackState = new Map<string, number>();
@@ -147,8 +155,6 @@
     return { destroy() { document.removeEventListener('click', handleClick, true); } }
   }
 
-  let searchTimeout: ReturnType<typeof setTimeout> | undefined = undefined;
-
   // Keep file results responsive while the search engine runs.
   async function performingSearch() {
     if (!searchQuery.trim()) {
@@ -165,7 +171,7 @@
     currentSearchTicket++;
     const localTicket = currentSearchTicket;
 
-    Search(searchQuery).then(result => {
+    Search(searchQuery.trim()).then(result => {
       if (localTicket !== currentSearchTicket) return;
       files = result || [];
       searchErrorMsg = null;
@@ -180,23 +186,9 @@
 
   }
 
-  function debouncedSearch() {
-    clearTimeout(searchTimeout);
-    if (!searchQuery.trim()) {
-        files = [];
-        selectedFile = null;
-        searching = false;
-        searchErrorMsg = null;
-        renderLimit = 50;
-        return;
-    }
-    searching = true;
-    searchTimeout = setTimeout(performingSearch, 300);
-  }
-
-  function onKeyUp(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      clearTimeout(searchTimeout);
+  function onSearchKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
       performingSearch();
     }
   }
@@ -209,7 +201,6 @@
   }
 
   function cancelSearch() {
-    clearTimeout(searchTimeout);
     currentSearchTicket++; // Invalidate pending search
     searching = false;
     searchErrorMsg = null;
@@ -219,12 +210,6 @@
     renderLimit += 50;
   }
 
-  function formatScore(score: number) {
-    let percentage = Math.round(score * 100);
-    if (percentage < 1) percentage = 1;
-    if (percentage > 100) percentage = 100;
-    return percentage + "%";
-  }
 
   function formatSize(bytes: number) {
     if (bytes === 0 || !bytes) return '0 B';
@@ -290,7 +275,7 @@
         <div class="relative flex items-center justify-center">
             <div class="w-1.5 h-1.5 rounded-full bg-[#bfc8ca] animate-pulse"></div>
         </div>
-        <span class="font-sans text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-[#acabab]">
+        <span class="font-sans text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-[#acabab] whitespace-pre-line">
           {$indexingStatus.isIndexing ? ($indexingStatus.statusMessage || 'Indexing') : 'Ready'}
         </span>
         
@@ -298,7 +283,8 @@
           <div class="w-12 h-0.5 bg-gray-200 dark:bg-[#131313] rounded-full overflow-hidden">
             <div 
               class="h-full bg-[#bfc8ca] transition-all duration-300"
-              style="width: {$indexingStatus.progress}%"
+              class:animate-pulse={!$indexingStatus.searchReady}
+              style="width: {$indexingStatus.searchReady ? $indexingStatus.progress : 30}%"
             ></div>
           </div>
         {/if}
@@ -345,13 +331,19 @@
         
         <div class="space-y-4">
           <div class="flex items-center gap-4 w-full border-b border-gray-200 dark:border-[#2a2a2a] pb-2 transition-colors focus-within:border-blue-500">
-            <div class="text-gray-400">
+            <button
+              type="button"
+              on:click={performingSearch}
+              disabled={searching || !searchQuery.trim()}
+              class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors focus:outline-none disabled:opacity-40 flex items-center justify-center cursor-pointer"
+              aria-label="Search"
+              title="Search"
+            >
               <SearchIcon size={20} />
-            </div>
+            </button>
             <input 
               bind:value={searchQuery}
-              on:input={debouncedSearch}
-              on:keyup={onKeyUp}
+              on:keydown={onSearchKeydown}
               class="flex-1 bg-transparent border-none focus:ring-0 text-2xl font-serif placeholder:text-gray-300 dark:placeholder:text-gray-600 pb-0.5 outline-none text-slate-700 dark:text-gray-100" 
               placeholder="Search the collection..." 
               type="text"
@@ -533,11 +525,9 @@
                       </div>
                     </div>
                   </div>
-                  <div class="flex flex-col items-end pr-4">
-                    <div class="text-4xl font-bold {selectedFile === file ? 'text-blue-600 dark:text-white' : 'text-gray-300 dark:text-gray-600'}">{formatScore(file.Score)}</div>
-                    <div class="text-[8px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mt-1">Match</div>
+                  <div class="flex items-center justify-center shrink-0 pr-2">
                     <!-- Feedback buttons: visible on hover or after voting -->
-                    <div class="flex gap-1 mt-2 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-50 group-hover:opacity-100'}">
+                    <div class="flex gap-1 transition-opacity duration-150 {feedbackState.has(file.Path) ? 'opacity-100' : 'opacity-50 group-hover:opacity-100'}">
                       <button
                         title="Relevant result"
                         on:click|stopPropagation={() => submitFeedback(file, i, 1)}
@@ -574,7 +564,7 @@
                 </button>
               {/if}
             </div>
-          {:else if searchQuery.trim() !== '' && !searching}
+          {:else if searchedQuery && searchQuery.trim() === searchedQuery && !searching}
              <div class="p-12 text-center text-gray-400 font-serif text-lg italic bg-white/50 dark:bg-transparent border border-gray-200 dark:border-[#2a2a2a] border-dashed">
                No relevant documents found.
                {#if isFilterActive}
@@ -713,7 +703,6 @@
   .home-root [role="option"] h3 { color: var(--f-text) !important; font: 600 15px/1.35 Inter, "Segoe UI", sans-serif !important; }
   .home-root [role="option"] p { color: var(--f-text-3) !important; font-size: 11px !important; }
   .home-root [role="option"] [class*="uppercase"] { color: var(--f-text-2) !important; }
-  .home-root [role="option"] > div:last-child > div:first-child { color: var(--f-accent) !important; font-size: 19px !important; }
   .home-root [role="option"] > div:last-child { padding-right: 0 !important; }
   .home-root aside { background: var(--f-bg) !important; border-color: var(--f-border) !important; box-shadow: -8px 0 28px rgb(21 42 32 / 7%) !important; }
   .home-root aside > div { padding: 27px !important; }
@@ -736,7 +725,6 @@
     .home-root > main > div:first-child { padding: 19px 16px !important; }
     .home-root > main > div:first-child > div { padding-right: 0; }
     .home-root [role="option"] { min-height: 82px; }
-    .home-root [role="option"] > div:last-child > div:first-child { font-size: 16px !important; }
     .home-root aside { position: absolute !important; inset: 0 !important; width: 100% !important; min-width: 0 !important; }
     .home-root aside > div { padding: 19px !important; }
     .home-root aside h2 { font-size: 20px !important; }

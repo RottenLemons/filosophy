@@ -201,22 +201,28 @@
   .folder-checkbox {
     appearance: none;
     -webkit-appearance: none;
-    width: 14px;
-    height: 14px;
-    border: 1.5px solid #cbd5e1;
+    width: 15px;
+    height: 15px;
+    border: 1.5px solid var(--f-border-strong, #cbd5e1);
     border-radius: 3px;
-    background: transparent;
+    background: var(--f-surface, #ffffff);
     cursor: pointer;
     flex-shrink: 0;
     position: relative;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s;
+    box-sizing: border-box;
   }
   .folder-checkbox:disabled {
     cursor: not-allowed;
     opacity: 0.5;
   }
   :global(.dark) .folder-checkbox {
-    border-color: #334155;
+    border-color: var(--f-border-strong, #46564c);
+    background: var(--f-surface, #1e2823);
   }
 
   .folder-checkbox:active:not(:disabled) {
@@ -224,20 +230,20 @@
   }
 
   .folder-checkbox:checked {
-    background: #3b82f6;
-    border-color: #3b82f6;
+    background: var(--f-accent, #287d66) !important;
+    border-color: var(--f-accent, #287d66) !important;
   }
   .folder-checkbox:checked::after {
     content: '';
     position: absolute;
     left: 4px;
     top: 1px;
-    width: 4px;
-    height: 7px;
-    border: 1.5px solid white;
-    border-top: none;
-    border-left: none;
+    width: 5px;
+    height: 9px;
+    border: solid #ffffff !important;
+    border-width: 0 2px 2px 0 !important;
     transform: rotate(45deg);
+    display: block !important;
   }
 
   .folder-name {

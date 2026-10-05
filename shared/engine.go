@@ -10,6 +10,7 @@ package shared
 import "C"
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"database/sql"
@@ -24,6 +25,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -32,11 +34,14 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"net/url"
 
 	"github.com/daulet/tokenizers"
 	"github.com/liliang-cn/sqvect/v2/pkg/core"
+	"github.com/liliang-cn/sqvect/v2/pkg/index"
+	"github.com/liliang-cn/sqvect/v2/pkg/quantization"
 	ort "github.com/yalue/onnxruntime_go"
 	_ "golang.org/x/image/webp"
 	_ "modernc.org/sqlite"
@@ -105,7 +110,8 @@ var (
 type Engine struct {
 	db                *core.SQLiteStore
 	sqlDB             *sql.DB                     // separate connection for the files table
-	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx)
+	textStatic        *StaticEmbedder             // fast static embedder (e.g. text/dd)
+	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx) fallback
 	textTok           *tokenizers.Tokenizer       // tokenizer for the BERT text encoder
 	clipTok           *tokenizers.Tokenizer
 	clipTextSession   *ort.DynamicAdvancedSession
@@ -126,6 +132,7 @@ type Engine struct {
 
 	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
 	Hardware HardwareConfig
+	closeOnce sync.Once
 }
 
 type WriteOpType int
@@ -225,6 +232,9 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		dbConn.SetMaxIdleConns(4)
 	}
 
+	// Speed up all path-based lookups and joins in vectors.db
+	vDB.Exec("CREATE INDEX IF NOT EXISTS idx_embeddings_path ON embeddings(json_extract(metadata, '$.path'))")
+
 	log.Println("[Engine 2] Opening sqvect database at", vectorsDBPath)
 	hnswCfg := core.DefaultHNSWConfig()
 	hnswCfg.Enabled = true
@@ -277,61 +287,91 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		return nil, fmt.Errorf("failed to initialize onnxruntime (dll=%s): %w", ortPath, err)
 	}
 
-	// Load the BERT text encoder tokenizer (text/tokenizer.json).
-	log.Println("[Engine 5] Loading text encoder tokenizer from", textModelPath)
-	textTok, err := tokenizers.FromFile(filepath.Join(textModelPath, "tokenizer.json"))
-	if err != nil {
-		ort.DestroyEnvironment()
-		sqlDB.Close()
-		db.Close()
-		return nil, fmt.Errorf("failed to load text tokenizer: %w", err)
+	// Prefer text/dd static embedder if present (much faster zero-copy mmap)
+	actualTextModelPath := textModelPath
+	if _, err := os.Stat(filepath.Join(actualTextModelPath, "model.safetensors")); err != nil {
+		if _, err := os.Stat(filepath.Join(textModelPath, "dd", "model.safetensors")); err == nil {
+			actualTextModelPath = filepath.Join(textModelPath, "dd")
+		}
+	}
+
+	var textStatic *StaticEmbedder
+	var textSession *ort.DynamicAdvancedSession
+	var textTok *tokenizers.Tokenizer
+
+	safetensorsPath := filepath.Join(actualTextModelPath, "model.safetensors")
+	tokPath := filepath.Join(actualTextModelPath, "tokenizer.json")
+	if _, err := os.Stat(safetensorsPath); err == nil {
+		log.Println("[Engine 5] Loading fast text/dd static embedder from", actualTextModelPath)
+		var err error
+		textStatic, err = LoadStaticEmbedder(safetensorsPath, tokPath)
+		if err != nil {
+			log.Printf("[Engine 5] Warning: failed to load static embedder (%v), falling back to ONNX", err)
+		} else {
+			log.Printf("[Engine 5] Fast text/dd static embedder loaded successfully (%d dimensions)", textStatic.Dim())
+		}
 	}
 
 	log.Println("[Engine 6] Loading CLIP tokenizer from", imageModelPath)
 	clipTok, err := tokenizers.FromFile(filepath.Join(imageModelPath, "tokenizer.json"))
 	if err != nil {
-		textTok.Close()
-
+		if textStatic != nil {
+			textStatic.Close()
+		}
 		ort.DestroyEnvironment()
 		sqlDB.Close()
 		db.Close()
 		return nil, fmt.Errorf("failed to load CLIP tokenizer: %w", err)
 	}
 
-	// Create session options for the BERT text encoder.
-	textOpts, err := ort.NewSessionOptions()
-	if err != nil {
-		ort.DestroyEnvironment()
-		sqlDB.Close()
-		db.Close()
-		return nil, fmt.Errorf("failed to create text session options: %w", err)
-	}
-	defer textOpts.Destroy()
+	if textStatic == nil {
+		// Load the BERT text encoder tokenizer (text/tokenizer.json).
+		log.Println("[Engine 5] Loading text encoder tokenizer from", actualTextModelPath)
+		textTok, err = tokenizers.FromFile(filepath.Join(actualTextModelPath, "tokenizer.json"))
+		if err != nil {
+			clipTok.Close()
+			ort.DestroyEnvironment()
+			sqlDB.Close()
+			db.Close()
+			return nil, fmt.Errorf("failed to load text tokenizer: %w", err)
+		}
 
-	if hw.DirectMLKneecap {
-		textOpts.SetMemPattern(false)
-		textOpts.SetCpuMemArena(false)
-	}
+		// Create session options for the BERT text encoder.
+		textOpts, err := ort.NewSessionOptions()
+		if err != nil {
+			textTok.Close()
+			clipTok.Close()
+			ort.DestroyEnvironment()
+			sqlDB.Close()
+			db.Close()
+			return nil, fmt.Errorf("failed to create text session options: %w", err)
+		}
+		defer textOpts.Destroy()
 
-	if useGPU && tryAppendDirectML(textOpts) {
-		log.Printf("BERT text session: DirectML GPU enabled")
-	}
+		if hw.DirectMLKneecap {
+			textOpts.SetMemPattern(false)
+			textOpts.SetCpuMemArena(false)
+		}
 
-	log.Println("[Engine 5c] Initializing BERT text session...")
-	textSession, err := ort.NewDynamicAdvancedSession(
-		filepath.Join(textModelPath, "model.onnx"),
-		[]string{"input_ids", "attention_mask", "token_type_ids"},
-		[]string{"last_hidden_state"},
-		textOpts,
-	)
-	if err != nil {
-		textTok.Close()
+		if useGPU && tryAppendDirectML(textOpts) {
+			log.Printf("BERT text session: DirectML GPU enabled")
+		}
 
-		clipTok.Close()
-		ort.DestroyEnvironment()
-		sqlDB.Close()
-		db.Close()
-		return nil, fmt.Errorf("failed to create BERT text session: %w", err)
+		log.Println("[Engine 5c] Initializing BERT text session...")
+		textSession, err = ort.NewDynamicAdvancedSession(
+			filepath.Join(actualTextModelPath, "model.onnx"),
+			[]string{"input_ids", "attention_mask", "token_type_ids"},
+			[]string{"last_hidden_state"},
+			textOpts,
+		)
+		if err != nil {
+			textTok.Close()
+			clipTok.Close()
+			ort.DestroyEnvironment()
+			sqlDB.Close()
+			db.Close()
+			return nil, fmt.Errorf("failed to create BERT text session: %w", err)
+		}
 	}
 
 	// Create session options for CLIP text encoder.
@@ -477,6 +517,7 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		db:                db,
 		sqlDB:             sqlDB,
 		vDB:               vDB,
+		textStatic:        textStatic,
 		textSession:       textSession,
 		textTok:           textTok,
 		clipTok:           clipTok,
@@ -546,6 +587,7 @@ func (s *Engine) runWriter() {
 	var batch []WriteOperation
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	opsSinceCheckpoint := 0
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -712,6 +754,13 @@ func (s *Engine) runWriter() {
 			if err := s.db.UpsertBatch(ctx, sqEmbsBatch); err != nil {
 				vectorWriteErr = err
 				log.Printf("writer sqvect upsert error: %v", err)
+			} else {
+				opsSinceCheckpoint += len(sqEmbsBatch)
+				if opsSinceCheckpoint >= 2000 {
+					s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
+					s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
+					opsSinceCheckpoint = 0
+				}
 			}
 		}
 		if vectorWriteErr == nil && len(completePaths) > 0 {
@@ -811,87 +860,173 @@ func (s *Engine) GetSQLDB() *sql.DB {
 	return s.sqlDB
 }
 
-func (s *Engine) Close() error {
-	if s.writeChan != nil {
-		close(s.writeChan)
-		s.writerWg.Wait()
+// SaveVectorSnapshot serializes the in-memory HNSW index and quantizer directly
+// into the index_snapshots table in vectors.db so subsequent startups load instantly
+// instead of rebuilding the graph from raw vectors (~30+ minutes for large datasets).
+func (s *Engine) SaveVectorSnapshot(ctx context.Context) error {
+	if s.db == nil || s.vDB == nil {
+		return nil
 	}
 
-	ctx := context.Background()
-	if s.sqlDB != nil {
-		s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	val := reflect.ValueOf(s.db)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
 	}
-	if s.vDB != nil {
-		s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	hnswField := val.FieldByName("hnswIndex")
+	quantField := val.FieldByName("quantizer")
+
+	if !hnswField.IsValid() {
+		return fmt.Errorf("hnswIndex field not found on SQLiteStore")
 	}
 
-	var errs []error
-	if s.clipVisionSession != nil {
-		if err := s.clipVisionSession.Destroy(); err != nil {
-			errs = append(errs, err)
+	hnswPtr := *(**index.HNSW)(unsafe.Pointer(hnswField.UnsafeAddr()))
+	if hnswPtr == nil {
+		return nil
+	}
+
+	var hBuf bytes.Buffer
+	if err := hnswPtr.Save(&hBuf); err != nil {
+		return fmt.Errorf("saving hnsw index: %w", err)
+	}
+
+	if _, err := s.vDB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS index_snapshots (type TEXT PRIMARY KEY, data BLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"); err != nil {
+		return fmt.Errorf("ensuring index_snapshots table: %w", err)
+	}
+
+	if _, err := s.vDB.ExecContext(ctx, "INSERT OR REPLACE INTO index_snapshots (type, data, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)", "HNSW", hBuf.Bytes()); err != nil {
+		return fmt.Errorf("storing hnsw snapshot: %w", err)
+	}
+
+	if quantField.IsValid() && !quantField.IsNil() {
+		quantInterface := reflect.NewAt(quantField.Type(), unsafe.Pointer(quantField.UnsafeAddr())).Elem().Interface()
+		if sq, ok := quantInterface.(*quantization.ScalarQuantizer); ok && sq != nil {
+			var qBuf bytes.Buffer
+			if err := sq.Save(&qBuf); err == nil {
+				if _, err := s.vDB.ExecContext(ctx, "INSERT OR REPLACE INTO index_snapshots (type, data, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)", "QUANTIZER", qBuf.Bytes()); err != nil {
+					log.Printf("[Engine] storing quantizer snapshot error: %v", err)
+				}
+			}
 		}
 	}
-	if s.clipTextSession != nil {
-		if err := s.clipTextSession.Destroy(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.textSession != nil {
-		if err := s.textSession.Destroy(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.textTok != nil {
-		s.textTok.Close()
-	}
-	if s.clipTok != nil {
-		s.clipTok.Close()
-	}
-	if s.rerankerSession != nil {
-		if err := s.rerankerSession.Destroy(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.rerankerTok != nil {
-		s.rerankerTok.Close()
-	}
-	if err := ort.DestroyEnvironment(); err != nil {
-		errs = append(errs, err)
-	}
-	if s.vDB != nil {
-		if err := s.vDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.sqlDB != nil {
-		if err := s.sqlDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.db != nil {
-		if err := s.db.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("close errors: %v", errs)
-	}
+	log.Printf("[Engine] Successfully saved vector index snapshot (%d bytes)", hBuf.Len())
 	return nil
 }
 
-// TruncateWAL executes a checkpoint TRUNCATE to clear out the massive -wal file
+func (s *Engine) Close() error {
+	var closeErr error
+	s.closeOnce.Do(func() {
+		if s.writeChan != nil {
+			close(s.writeChan)
+			s.writerWg.Wait()
+		}
+
+		ctx := context.Background()
+
+		// 1. Explicitly save HNSW index and quantizer snapshot to index_snapshots table
+		if saveErr := s.SaveVectorSnapshot(ctx); saveErr != nil {
+			log.Printf("[Engine] SaveVectorSnapshot error on close: %v", saveErr)
+		}
+
+		var errs []error
+		if s.textStatic != nil {
+			if err := s.textStatic.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if s.clipVisionSession != nil {
+			if err := s.clipVisionSession.Destroy(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if s.clipTextSession != nil {
+			if err := s.clipTextSession.Destroy(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if s.textSession != nil {
+			if err := s.textSession.Destroy(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if s.textTok != nil {
+			s.textTok.Close()
+		}
+		if s.clipTok != nil {
+			s.clipTok.Close()
+		}
+		if s.rerankerSession != nil {
+			if err := s.rerankerSession.Destroy(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if s.rerankerTok != nil {
+			s.rerankerTok.Close()
+		}
+		if ortErr := ort.DestroyEnvironment(); ortErr != nil {
+			errs = append(errs, ortErr)
+		}
+
+		// 2. Close sqvect store (s.db) so its connection pool releases all locks
+		if s.db != nil {
+			if dbErr := s.db.Close(); dbErr != nil {
+				errs = append(errs, dbErr)
+			}
+			s.db = nil
+		}
+
+		// 3. With s.db closed, run PRAGMA wal_checkpoint(TRUNCATE) on both DBs to collapse WAL files
+		if s.sqlDB != nil {
+			if _, chkErr := s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);"); chkErr != nil {
+				log.Printf("[Engine] wal_checkpoint TRUNCATE sqlDB error: %v", chkErr)
+			}
+		}
+		if s.vDB != nil {
+			if _, chkErr := s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);"); chkErr != nil {
+				log.Printf("[Engine] wal_checkpoint TRUNCATE vDB error: %v", chkErr)
+			}
+		}
+
+		// 4. Finally close s.vDB and s.sqlDB
+		if s.vDB != nil {
+			if vErr := s.vDB.Close(); vErr != nil {
+				errs = append(errs, vErr)
+			}
+			s.vDB = nil
+		}
+		if s.sqlDB != nil {
+			if sqlErr := s.sqlDB.Close(); sqlErr != nil {
+				errs = append(errs, sqlErr)
+			}
+			s.sqlDB = nil
+		}
+
+		if len(errs) > 0 {
+			closeErr = fmt.Errorf("close errors: %v", errs)
+		}
+	})
+	return closeErr
+}
+
+// TruncateWAL executes a checkpoint TRUNCATE to clear out the -wal file
 // generated by batched inserts.
 func (s *Engine) TruncateWAL() error {
 	ctx := context.Background()
-	_, err := s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
-	if err != nil {
-		log.Printf("WAL truncate error: %v", err)
+	var firstErr error
+	if s.sqlDB != nil {
+		if _, err := s.sqlDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+			log.Printf("WAL truncate sqlDB error: %v", err)
+			firstErr = err
+		}
 	}
-	_, errV := s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
-	if errV != nil && err == nil {
-		err = errV
+	if s.vDB != nil {
+		if _, err := s.vDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+			log.Printf("WAL truncate vDB error: %v", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	return err
+	return firstErr
 }
 
 // idPrefix is a session-unique 8-byte random hex string set once at startup.
@@ -926,6 +1061,9 @@ func generateID() string {
 func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
+	}
+	if s.textStatic != nil {
+		return s.textStatic.EmbedBatch(texts, textEmbedDim), nil
 	}
 
 	const batchSize = 16
@@ -1490,6 +1628,10 @@ func (s *Engine) InitIndexTables() error {
 	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ext TEXT NOT NULL DEFAULT ''")
 	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0")
 	s.sqlDB.ExecContext(ctx, "ALTER TABLE files ADD COLUMN atime INTEGER NOT NULL DEFAULT 0")
+	s.sqlDB.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_files_content_indexed ON files(content_indexed)")
+	if s.vDB != nil {
+		s.vDB.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_embeddings_path ON embeddings(json_extract(metadata, '$.path'))")
+	}
 
 	// search_config: key/value store for tunable ranking weights.
 	// All weights are loaded at startup and hot-reloaded every 30s.
@@ -2010,38 +2152,6 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 	pq := ParseQuery(query)
 	query = pq.Text
 
-	// Encode query vectors outside the lock — pure computation, no shared mutable state.
-	textEmbs, err := s.embedText([]string{query})
-	if err != nil {
-		return nil, fmt.Errorf("text query encoding failed: %w", err)
-	}
-	textQueryVec := textEmbs[0]
-
-	clipEmbs, err := s.embedClipText([]string{query})
-	if err != nil {
-		log.Printf("image text encoding unavailable, text-only search: %v", err)
-		return s.TextSearch(query)
-	}
-	imageQueryVec := clipEmbs[0]
-
-	// Vector search both collections. Images are capped lower than text: they add
-	// semantic coverage but shouldn't flood rankings for text-heavy queries.
-	textResults, err := s.db.Search(ctx, textQueryVec, core.SearchOptions{
-		Collection: textCollection,
-		TopK:       200,
-	})
-	if err != nil {
-		log.Printf("text search error: %v", err)
-	}
-
-	imageResults, err := s.db.Search(ctx, imageQueryVec, core.SearchOptions{
-		Collection: imageCollection,
-		TopK:       50,
-	})
-	if err != nil {
-		log.Printf("image search error: %v", err)
-	}
-
 	// Load ranking weights. Falls back to hardcoded defaults if WeightStore is nil
 	// (e.g., during unit tests before InitIndexTables has run).
 	var w SearchWeights
@@ -2051,16 +2161,25 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		w = defaultWeights
 	}
 
-	// Phase 1: run independent scoring signals in parallel, each writing to its own map.
-	// Path FTS, content FTS, and vector results have no inter-dependencies.
-	const numSigGroups = 3
+	k := rrfK
+	if w.UseNewPipeline {
+		k = w.RRFK
+	}
+
+	// Phase 1: run all 4 independent scoring channels concurrently:
+	//   1. Path FTS signals
+	//   2. Content FTS signals
+	//   3. Text Vector Search (fast embedText + sqvect search)
+	//   4. Image Vector Search (embedClipText + sqvect search)
+	const numSigGroups = 4
 	sigCh := make(chan map[string]float64, numSigGroups)
 	var sigWg sync.WaitGroup
 
-	// Group A: path FTS signals (4 queries on paths_fts).
-	// When the new pipeline is active, path weights come from search_config.
-	// The old pipeline uses the original hardcoded literals so behaviour is
-	// 100% identical when the flag is off.
+	contentScores := make(map[string]float64)
+	codePhraseMatches := make(map[string]bool)
+	var contentMu sync.Mutex
+
+	// Channel 1: Path FTS signals
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
@@ -2070,28 +2189,29 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 			s.addPathFTSAllWords(ctx, query, m, w.WPathFTS*4.0/3.0) // all-word gets 33% more than exact
 			s.addPathFTSPrefixScores(ctx, query, m, w.WPathPrefix)
 			s.addPathFTSShortPrefixScores(ctx, query, m, w.WPathPrefix*2.0/3.0)
-			s.addPathSubstringScores(ctx, query, m, w.WPathPrefix*0.5)
+			if len(m) < 20 {
+				s.addPathSubstringScores(ctx, query, m, w.WPathPrefix*0.5)
+			}
 		} else {
 			s.addPathFTSScores(ctx, query, m, 3.0)
 			s.addPathFTSAllWords(ctx, query, m, 4.0)
 			s.addPathFTSPrefixScores(ctx, query, m, 1.5)
 			s.addPathFTSShortPrefixScores(ctx, query, m, 1.0)
-			s.addPathSubstringScores(ctx, query, m, 0.75)
+			if len(m) < 20 {
+				s.addPathSubstringScores(ctx, query, m, 0.75)
+			}
 		}
 		sigCh <- m
 	}()
 
-	// Group B: content FTS signals; fuzzy only runs when exact search finds few docs.
-	contentScores := make(map[string]float64)
-	codePhraseMatches := make(map[string]bool)
-	var contentMu sync.Mutex
+	// Channel 2: Content FTS signals
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
 		phraseMatches := s.addContentFTSPhraseRRF(ctx, query, m)
 		s.addContentFTSRRF(ctx, query, m)
-		if len(m) < 5 {
+		if len(m) < 5 && len(query) >= 3 {
 			phraseMatches = mergePathMatches(phraseMatches, s.addContentFTSFuzzyRRF(ctx, query, m))
 		}
 		// Scale content FTS signal by w_content_fts when new pipeline is active.
@@ -2109,26 +2229,26 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		sigCh <- m
 	}()
 
-	// Group C: vector result iteration (in-memory, no I/O).
+	// Channel 3: Text Vector Search (embed + HNSW search in parallel)
 	sigWg.Add(1)
 	go func() {
 		defer sigWg.Done()
 		m := make(map[string]float64)
-		k := rrfK
-		if w.UseNewPipeline {
-			k = w.RRFK
-		}
 		wText := 1.0
-		wImg := 1.0
 		if w.UseNewPipeline {
 			wText = w.WSemanticText
-			wImg = w.WSemanticImg
 		}
-		for i, res := range textResults {
-			m[res.Metadata["path"]] += wText / (k + float64(i+1))
-		}
-		for i, res := range imageResults {
-			m[res.Metadata["path"]] += wImg / (k + float64(i+1))
+		textEmbs, err := s.embedText([]string{query})
+		if err == nil && len(textEmbs) > 0 && textEmbs[0] != nil {
+			textResults, err := s.db.Search(ctx, textEmbs[0], core.SearchOptions{
+				Collection: textCollection,
+				TopK:       200,
+			})
+			if err == nil {
+				for i, res := range textResults {
+					m[res.Metadata["path"]] += wText / (k + float64(i+1))
+				}
+			}
 		}
 		contentMu.Lock()
 		for p, v := range m {
@@ -2138,7 +2258,39 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		sigCh <- m
 	}()
 
-	go func() { sigWg.Wait(); close(sigCh) }()
+	// Channel 4: Image Vector Search (CLIP text embed + HNSW search in parallel)
+	sigWg.Add(1)
+	go func() {
+		defer sigWg.Done()
+		m := make(map[string]float64)
+		wImg := 1.0
+		if w.UseNewPipeline {
+			wImg = w.WSemanticImg
+		}
+		clipEmbs, err := s.embedClipText([]string{query})
+		if err == nil && len(clipEmbs) > 0 && clipEmbs[0] != nil {
+			imageResults, err := s.db.Search(ctx, clipEmbs[0], core.SearchOptions{
+				Collection: imageCollection,
+				TopK:       50,
+			})
+			if err == nil {
+				for i, res := range imageResults {
+					m[res.Metadata["path"]] += wImg / (k + float64(i+1))
+				}
+			}
+		}
+		contentMu.Lock()
+		for p, v := range m {
+			contentScores[p] += v
+		}
+		contentMu.Unlock()
+		sigCh <- m
+	}()
+
+	go func() {
+		sigWg.Wait()
+		close(sigCh)
+	}()
 
 	scores := make(map[string]float64)
 	for m := range sigCh {
@@ -2277,21 +2429,6 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	pq := ParseQuery(query)
 	query = pq.Text
 
-	// Encode query outside the lock — pure computation.
-	embs, err := s.embedText([]string{query})
-	if err != nil {
-		return nil, fmt.Errorf("text query encoding failed: %w", err)
-	}
-	queryVec := embs[0]
-
-	results, err := s.db.Search(ctx, queryVec, core.SearchOptions{
-		Collection: textCollection,
-		TopK:       200,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("text search failed: %w", err)
-	}
-
 	// Phase 1: parallel scoring signals.
 	tsSigCh := make(chan map[string]float64, 3)
 	var tsSigWg sync.WaitGroup
@@ -2314,7 +2451,7 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 		m := make(map[string]float64)
 		phraseMatches := s.addContentFTSPhraseRRF(ctx, query, m)
 		s.addContentFTSRRF(ctx, query, m)
-		if len(m) < 5 {
+		if len(m) < 5 && len(query) >= 3 {
 			phraseMatches = mergePathMatches(phraseMatches, s.addContentFTSFuzzyRRF(ctx, query, m))
 		}
 		codePhraseMatches = phraseMatches
@@ -2325,8 +2462,17 @@ func (s *Engine) TextSearch(query string) ([]SearchResult, error) {
 	go func() {
 		defer tsSigWg.Done()
 		m := make(map[string]float64)
-		for i, res := range results {
-			m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+		embs, err := s.embedText([]string{query})
+		if err == nil && len(embs) > 0 && embs[0] != nil {
+			results, err := s.db.Search(ctx, embs[0], core.SearchOptions{
+				Collection: textCollection,
+				TopK:       200,
+			})
+			if err == nil {
+				for i, res := range results {
+					m[res.Metadata["path"]] += 1.0 / (rrfK + float64(i+1))
+				}
+			}
 		}
 		tsSigCh <- m
 	}()
@@ -2705,7 +2851,11 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 		if len(w) < 3 {
 			continue
 		}
-		escaped := strings.ReplaceAll(w[:3], `"`, `""`)
+		prefixLen := 3
+		if len(w) >= 4 {
+			prefixLen = 4
+		}
+		escaped := strings.ReplaceAll(w[:prefixLen], `"`, `""`)
 		anchors = append(anchors, `"`+escaped+`"*`)
 	}
 	if len(anchors) == 0 {
@@ -2719,7 +2869,7 @@ func (s *Engine) addContentFTSFuzzyRRF(ctx context.Context, query string, scores
 		JOIN embeddings e ON chunks_fts.rowid = e.rowid
 		WHERE chunks_fts MATCH ?
 		ORDER BY bm25(chunks_fts)
-		LIMIT 100
+		LIMIT 50
 	`, ftsQuery)
 	if err != nil {
 		log.Printf("chunks_fts fuzzy search warning: %v", err)
@@ -3283,12 +3433,10 @@ func (s *Engine) rerank(query string, results []SearchResult, rerankTopN int, re
 	top := results[:n]
 	rest := results[n:]
 
-	// Fetch up to 2 BM25-ranked snippets per document across all top-N paths in one query.
+	// Fetch the best BM25-ranked snippet per document across all top-N paths in one query.
 	// snippet() extracts a ~64-token window around the actual match inside each chunk,
 	// so the reranker sees the relevant excerpt rather than an arbitrary prefix.
-	// Multiple snippets per doc cover spread-out occurrences; we take the max reranker
-	// score across snippets as the document score.
-	const maxSnippetsPerDoc = 2
+	const maxSnippetsPerDoc = 1
 	docSnippets := make(map[string][]string, n) // path → ordered snippets
 	basenames := make(map[string]string, n)
 

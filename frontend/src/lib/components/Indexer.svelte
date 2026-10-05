@@ -115,7 +115,7 @@
       <div class="search-bar">
         <div class="search-row">
           <div class="search-input-wrap">
-            <SearchIcon class="w-3.5 h-3.5 text-gray-400" />
+            <SearchIcon class="w-3.5 h-3.5" />
             <input 
               type="text" 
               bind:value={searchTerm} 
@@ -258,66 +258,73 @@
   }
 
   .search-bar {
-    padding: 0 0 1rem 0;
-    border-bottom: 1px solid rgba(71, 72, 72, 0.1);
+    padding: 0 0 14px;
   }
 
   .search-input-wrap {
     display: flex;
+    min-width: 0;
+    min-height: 40px;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.75rem 1rem;
-    background: #252626;
-    border: none;
-    border-bottom: 2px solid transparent;
-    border-radius: 0.125rem;
-    transition: border-color 0.2s, background 0.2s;
+    flex: 1;
+    gap: 9px;
+    padding: 0 11px;
+    background: var(--f-surface);
+    border: 1px solid var(--f-border-strong);
+    border-radius: 4px;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
   }
   .search-input-wrap:focus-within {
-    border-bottom-color: #b1babc;
-    background: #2b2c2c;
+    border-color: var(--f-accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--f-accent) 16%, transparent);
+  }
+  .search-input-wrap :global(svg) {
+    flex: 0 0 auto;
+    color: var(--f-text-3);
   }
 
   .folder-search-input {
     flex: 1;
+    min-width: 0;
+    height: 38px;
     background: transparent;
     border: none;
     outline: none;
-    font-size: 0.75rem;
-    font-family: 'Inter', sans-serif;
-    color: #e7e5e5;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--f-text);
   }
   .folder-search-input::placeholder {
-    color: #acabab;
-    opacity: 0.5;
+    color: var(--f-text-3);
+    opacity: 1;
   }
 
   .search-row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 8px;
   }
 
   .btn-add-folder {
     display: flex;
+    min-height: 40px;
     align-items: center;
-    gap: 0.35rem;
-    padding: 0.5rem 0.75rem;
-    background: #252626;
-    border: 1px solid rgba(71, 72, 72, 0.2);
-    border-radius: 0.125rem;
-    color: #acabab;
-    font-family: 'Inter', sans-serif;
-    font-size: 0.7rem;
+    gap: 7px;
+    padding: 0 12px;
+    background: var(--f-surface);
+    border: 1px solid var(--f-border);
+    border-radius: 4px;
+    color: var(--f-text);
+    font-family: inherit;
+    font-size: 12px;
     font-weight: 600;
     cursor: pointer;
     white-space: nowrap;
-    transition: all 0.2s ease;
+    transition: background 120ms ease, border-color 120ms ease;
   }
   .btn-add-folder:hover {
-    background: #2b2c2c;
-    border-color: #bfc8ca;
-    color: #e7e5e5;
+    background: var(--f-surface-2);
+    border-color: var(--f-border-strong);
   }
 
   .flat-view .folder-tree {
@@ -341,7 +348,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: #acabab;
-    white-space: nowrap;
+    white-space: pre-line;
     flex-shrink: 0;
   }
 

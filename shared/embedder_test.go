@@ -61,3 +61,32 @@ func TestDecode16BitWeightsRejectsInvalidInput(t *testing.T) {
 		t.Fatal("expected unsupported dtype to fail")
 	}
 }
+
+func TestStaticEmbedderDD(t *testing.T) {
+	modelPath := "../text/dd/model.safetensors"
+	tokPath := "../text/dd/tokenizer.json"
+	emb, err := LoadStaticEmbedder(modelPath, tokPath)
+	if err != nil {
+		t.Fatalf("LoadStaticEmbedder failed: %v", err)
+	}
+	defer emb.Close()
+
+	if emb.Dim() != 1024 {
+		t.Fatalf("expected dim 1024, got %d", emb.Dim())
+	}
+
+	vec, err := emb.EmbedString("hello world")
+	if err != nil {
+		t.Fatalf("EmbedString failed: %v", err)
+	}
+	if len(vec) != 1024 {
+		t.Fatalf("expected vector length 1024, got %d", len(vec))
+	}
+
+	vec256 := emb.EmbedTruncated("hello world", 256)
+	if len(vec256) != 256 {
+		t.Fatalf("expected truncated vector length 256, got %d", len(vec256))
+	}
+	t.Logf("Successfully loaded text/dd static embedder and embedded 'hello world'")
+}
+

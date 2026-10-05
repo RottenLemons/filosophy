@@ -8,6 +8,7 @@
   import { Search, OpenFileNative } from '$lib/wailsjs/go/main/App';
 
   let searchValue = '';
+  let searchedValue = '';
   let files: any[] = [];
   let searching = false;
   let error = '';
@@ -153,9 +154,7 @@
           <small>{file.Path}</small>
           <span class="details">{getFileType(file.Path)} · {formatSize(file.Size)} · Modified {formatDate(file.Modified)}</span>
         </span>
-        {#if typeof file.Score === 'number'}
-          <span class="score">{Math.round(file.Score * 100)}%</span>
-        {/if}
+
       </button>
     {/each}
 
@@ -260,15 +259,11 @@
     font-size: 13px;
   }
 
-  .details,
-  .score {
+  .details {
     color: var(--f-text-3);
     font-size: 12px;
   }
 
-  .score {
-    flex: 0 0 auto;
-  }
 
   .error,
   .empty {

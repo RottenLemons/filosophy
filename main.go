@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -65,6 +66,14 @@ func resolveModelAssetDir(exeDir, cwd string) string {
 		}
 	}
 	return exeDir
+}
+
+func resolveTextModelDir(assetDir string) string {
+	dd := filepath.Join(assetDir, "text", "dd")
+	if info, err := os.Stat(filepath.Join(dd, "model.safetensors")); err == nil && !info.IsDir() {
+		return dd
+	}
+	return filepath.Join(assetDir, "text")
 }
 
 // FolderState describes a directory and whether it is content-indexed.
@@ -200,6 +209,8 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 	var ctimes []int64
 	var atimes []int64
 	var whatsappDatabasePaths []string
+	var scannedEntries int
+	lastScanStatus := time.Now()
 
 	// Single walk: collect file metadata AND queue directories simultaneously.
 	// Previously two separate walks were made over the same tree, doubling syscall count.
@@ -214,6 +225,11 @@ func (a *App) runPass1(ctx context.Context, sc *shared.Engine, dirs []string, co
 			}
 			if err != nil {
 				return nil
+			}
+			scannedEntries++
+			if ctx != nil && (scannedEntries%1000 == 0 || time.Since(lastScanStatus) >= 2*time.Second) {
+				a.setStatus(true, fmt.Sprintf("Scanning fast keyword index...\n%d entries", scannedEntries), 0)
+				lastScanStatus = time.Now()
 			}
 			if d.IsDir() {
 				if path != dir {
@@ -439,6 +455,12 @@ func (a *App) runPass2(ctx context.Context, sc *shared.Engine) {
 	cfg.Flush() // Execute any lingering batch images
 	shared.DrainRemaining(cfg.Chunks, "text", sc)
 	shared.DrainRemaining(cfg.Images, "image", sc)
+	if err := sc.Flush(); err != nil {
+		log.Printf("[Indexer] error flushing write channel: %v", err)
+	}
+	if err := sc.SaveVectorSnapshot(context.Background()); err != nil {
+		log.Printf("[Indexer] error saving vector snapshot: %v", err)
+	}
 	sc.TruncateWAL()
 	log.Printf("[Indexer] Phase 2/2: Indexing complete (%v)", time.Since(start))
 
@@ -744,6 +766,7 @@ type App struct {
 	sessionID string
 
 	Hardware shared.HardwareConfig
+	shutdownOnce sync.Once
 }
 
 func NewApp() *App {
@@ -812,7 +835,7 @@ func (a *App) startup(ctx context.Context) {
 	if exe, err := os.Executable(); err == nil {
 		assetDir = resolveModelAssetDir(filepath.Dir(exe), cwd)
 	}
-	textModelPath := filepath.Join(assetDir, "text")
+	textModelPath := resolveTextModelDir(assetDir)
 	imageModelPath := filepath.Join(assetDir, "image")
 
 	if lf, err := os.OpenFile(filepath.Join(cwd, "filosophy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
@@ -993,7 +1016,7 @@ func (a *App) RetryEngineInit() error {
 	if exe, err := os.Executable(); err == nil {
 		assetDir = resolveModelAssetDir(filepath.Dir(exe), cwd)
 	}
-	textModelPath := filepath.Join(assetDir, "text")
+	textModelPath := resolveTextModelDir(assetDir)
 	imageModelPath := filepath.Join(assetDir, "image")
 
 	a.engineInitializing.Store(true)
@@ -1072,20 +1095,22 @@ func (a *App) watchHomeFolders() {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	os.Remove(filepath.Join(a.cwd, appPidFile))
-	if a.homeWatchStop != nil {
-		close(a.homeWatchStop)
-	}
-	if a.indexerCancel != nil {
-		a.indexerCancel()
-	}
-	if a.daemon != nil {
-		a.daemon.Stop()
-	}
-	a.apiServer.stop()
-	if a.engine != nil {
-		a.engine.Close()
-	}
+	a.shutdownOnce.Do(func() {
+		os.Remove(filepath.Join(a.cwd, appPidFile))
+		if a.homeWatchStop != nil {
+			close(a.homeWatchStop)
+		}
+		if a.indexerCancel != nil {
+			a.indexerCancel()
+		}
+		if a.daemon != nil {
+			a.daemon.Stop()
+		}
+		a.apiServer.stop()
+		if a.engine != nil {
+			a.engine.Close()
+		}
+	})
 }
 
 // GetIndexingStatus allows the frontend to fetch the exact state on mount
@@ -1559,6 +1584,15 @@ func (a *App) RegenerateAPIKey() (string, error) {
 
 func main() {
 	app := NewApp()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("[Main] OS interrupt received, shutting down gracefully...")
+		app.shutdown(context.Background())
+		os.Exit(0)
+	}()
 
 	// Run the system tray on a dedicated goroutine locked to its own OS thread.
 	// The custom Windows implementation (tray_windows.go) fixes:

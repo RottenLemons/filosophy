@@ -7,7 +7,10 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -258,37 +261,77 @@ func (e *StaticEmbedder) Dim() int { return e.dim }
 // EmbedString returns the L2-normalised mean embedding for text.
 // Now extremely fast as adding rows uses the zero-copy mmap'd matrix.
 func (e *StaticEmbedder) EmbedString(text string) ([]float32, error) {
+	return e.EmbedTruncated(text, e.dim), nil
+}
+
+// EmbedTruncated returns the L2-normalised mean embedding of text using only
+// the first outDim dimensions (Matryoshka truncation). Truncating before the
+// mean is mathematically identical to truncating after it, but only touches
+// outDim columns per token, which makes it several times cheaper.
+func (e *StaticEmbedder) EmbedTruncated(text string, outDim int) []float32 {
+	if outDim <= 0 || outDim > e.dim {
+		outDim = e.dim
+	}
+	acc := make([]float32, outDim)
 	ids, _ := e.tok.Encode(text, false)
 	if len(ids) == 0 {
-		return make([]float32, e.dim), nil
+		return acc
 	}
 
-	acc := make([]float32, e.dim)
+	vocab := len(e.matrix) / e.dim
 	found := 0
-
 	for _, id := range ids {
 		idx := int(id)
-		if idx < 0 || idx >= len(e.matrix)/e.dim {
+		if idx < 0 || idx >= vocab {
 			continue
 		}
 		// Direct memory access via the mmap'd view
-		vec := e.matrix[idx*e.dim : (idx+1)*e.dim]
+		vec := e.matrix[idx*e.dim : idx*e.dim+outDim]
 		for i, v := range vec {
 			acc[i] += v
 		}
 		found++
 	}
-
 	if found == 0 {
-		return make([]float32, e.dim), nil
+		return acc
 	}
+	// The mean's 1/found factor cancels out under L2 normalisation.
+	return staticNormalize(acc)
+}
 
-	inv := float32(1.0 / float64(found))
-	for i := range acc {
-		acc[i] *= inv
+// EmbedBatch embeds texts concurrently using EmbedTruncated.
+func (e *StaticEmbedder) EmbedBatch(texts []string, outDim int) [][]float32 {
+	out := make([][]float32, len(texts))
+	if len(texts) == 0 {
+		return out
 	}
-
-	return staticNormalize(acc), nil
+	workers := runtime.NumCPU()
+	if workers > len(texts) {
+		workers = len(texts)
+	}
+	if workers <= 1 {
+		for i, t := range texts {
+			out[i] = e.EmbedTruncated(t, outDim)
+		}
+		return out
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(texts) {
+					return
+				}
+				out[i] = e.EmbedTruncated(texts[i], outDim)
+			}
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 func staticNormalize(vec []float32) []float32 {
@@ -300,9 +343,9 @@ func staticNormalize(vec []float32) []float32 {
 		return vec
 	}
 	norm := float32(math.Sqrt(sumSq))
-	out := make([]float32, len(vec))
-	for i, v := range vec {
-		out[i] = v / norm
+	for i := range vec {
+		vec[i] /= norm
 	}
-	return out
+	return vec
 }
+

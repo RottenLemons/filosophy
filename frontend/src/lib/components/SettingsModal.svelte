@@ -9,6 +9,7 @@
 
   const dispatch = createEventDispatcher();
   export let show = false;
+  export let embedded = false;
 
   let activeTab = 'folders'; // 'folders' | 'hardware' | 'connections' | 'access'
   let hasGPU = false;
@@ -364,7 +365,8 @@
 {#if show}
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <!-- svelte-ignore a11y-no-static-element-interactions -->
-  <div 
+  <div
+    class:settings-page-mode={embedded}
     class="settings-overlay fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
     transition:fade={{ duration: 200 }}
     on:click|self={close}
@@ -384,12 +386,10 @@
         </div>
 
         <nav class="flex-1 px-3 space-y-1">
-          <button 
+          <button
             on:click={() => activeTab = 'folders'}
-            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'folders' 
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner' 
-                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+            class="settings-nav-item"
+            class:active={activeTab === 'folders'}
           >
             <Folder class="w-4 h-4" />
             <span class="uppercase tracking-widest text-[10px]">Indexed Folders</span>
@@ -397,10 +397,8 @@
 
           <button
             on:click={() => activeTab = 'hardware'}
-            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'hardware' 
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner' 
-                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+            class="settings-nav-item"
+            class:active={activeTab === 'hardware'}
           >
             <Cpu class="w-4 h-4" />
             <span class="uppercase tracking-widest text-[10px]">Hardware</span>
@@ -408,10 +406,8 @@
 
           <button
             on:click={() => activeTab = 'ranking'}
-            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'ranking'
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
-                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+            class="settings-nav-item"
+            class:active={activeTab === 'ranking'}
           >
             <BarChart3 class="w-4 h-4" />
             <span class="uppercase tracking-widest text-[10px]">Ranking</span>
@@ -419,10 +415,8 @@
 
           <button
             on:click={() => activeTab = 'connections'}
-            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'connections'
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
-                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+            class="settings-nav-item"
+            class:active={activeTab === 'connections'}
           >
             <Network class="w-4 h-4" />
             <span class="uppercase tracking-widest text-[10px]">Connections</span>
@@ -430,10 +424,8 @@
 
           <button
             on:click={() => activeTab = 'access'}
-            class="w-full flex items-center gap-3 px-4 py-3 text-xs font-sans tracking-wide transition-all rounded-sm
-                   {activeTab === 'access'
-                     ? 'bg-[#252626] text-[#e7e5e5] shadow-inner'
-                     : 'text-[#acabab] hover:text-[#e7e5e5] hover:bg-[#1a1a1a]'}"
+            class="settings-nav-item"
+            class:active={activeTab === 'access'}
           >
             <Key class="w-4 h-4" />
             <span class="uppercase tracking-widest text-[10px]">Access</span>
@@ -450,16 +442,19 @@
                   <Activity class="w-3 h-3 animate-pulse text-[#bfc8ca]" />
                   <span>Indexing</span>
                 </div>
-                <span class="text-[#e7e5e5]">{Math.round($indexingStatus.progress)}%</span>
+                {#if $indexingStatus.searchReady}
+                  <span class="text-[#e7e5e5]">{Math.round($indexingStatus.progress)}%</span>
+                {/if}
               </div>
               <!-- TASK 2: Loading Bar -->
               <div class="h-1.5 w-full bg-[#252626] rounded-sm overflow-hidden">
                 <div 
                   class="h-full bg-gradient-to-br from-[#bfc8ca] to-[#3f484a] transition-all duration-300 ease-out" 
-                  style="width: {$indexingStatus.progress}%"
+                  class:animate-pulse={!$indexingStatus.searchReady}
+                  style="width: {$indexingStatus.searchReady ? $indexingStatus.progress : 30}%"
                 ></div>
               </div>
-              <div class="text-[9px] text-[#acabab] font-sans tracking-tight truncate opacity-60">
+              <div class="text-[10px] text-[#acabab] font-sans tracking-tight whitespace-pre-line leading-snug">
                 {$indexingStatus.statusMessage}
               </div>
             </div>
@@ -503,7 +498,7 @@
           </h3>
           <button 
             on:click={close}
-            class="p-2 text-[#acabab] hover:text-[#e7e5e5] transition-colors"
+            class="settings-close p-2 text-[#acabab] hover:text-[#e7e5e5] transition-colors"
             aria-label="Close Settings"
           >
             <X class="w-5 h-5" />
@@ -928,7 +923,7 @@
                     </div>
                   </div>
 
-                  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
                     <div class="bg-[#131313] border border-[#474848]/10 rounded-sm p-4">
                       <div class="text-[9px] font-sans font-bold uppercase tracking-widest text-[#acabab] opacity-50 mb-2">NDCG@10</div>
                       <div class="text-lg font-mono text-[#e7e5e5]">{formatMetric(optimizerStatus.ndcg10)}</div>
@@ -1198,18 +1193,53 @@
 {/if}
 
 <style>
-  :global(.settings-dialog) { height: min(760px, calc(100dvh - 40px)); color: var(--f-text) !important; background: var(--f-surface) !important; border-color: var(--f-border) !important; border-radius: 7px !important; box-shadow: 0 20px 70px rgb(9 24 17 / 26%) !important; }
-  :global(.settings-dialog aside) { background: var(--f-surface-2) !important; border-color: var(--f-border) !important; }
-  :global(.settings-dialog main), :global(.settings-dialog header) { background: var(--f-surface) !important; }
-  :global(.settings-dialog [class*="bg-[#0e0e0e]"], .settings-dialog [class*="bg-[#131313]"], .settings-dialog [class*="bg-[#252626]"], .settings-dialog [class*="bg-[#1a1a1a]"]) { background: var(--f-surface-2) !important; }
+  .settings-nav-item { width: 100%; min-height: 40px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border: 0; border-radius: 4px; color: #bdcbc4; background: transparent; text-align: left; cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+  .settings-nav-item:hover { color: #fff; background: #243a34; }
+  .settings-nav-item.active { color: #fff; background: #2b443a; box-shadow: inset 2px 0 #79b899; }
+  .settings-nav-item :global(svg) { width: 16px; height: 16px; flex: 0 0 auto; color: #9db0a6; }
+  .settings-nav-item.active :global(svg) { color: #91c9aa; }
+  .settings-nav-item :global(span) { font-size: 11px; letter-spacing: 0; text-transform: none; }
+  :global(.settings-dialog) { width: 100%; height: min(760px, calc(100dvh - 40px)); max-width: 980px; color: var(--f-text) !important; background: var(--f-surface) !important; border: 1px solid var(--f-border) !important; border-radius: 6px !important; box-shadow: 0 24px 80px rgb(9 24 17 / 30%) !important; }
+  :global(.settings-dialog > aside) { width: 216px !important; flex: 0 0 216px !important; padding: 24px 12px 14px !important; color: var(--f-sidebar-text) !important; background: var(--f-sidebar) !important; border-color: #30413a !important; }
+  :global(.settings-dialog > aside > div:first-child) { margin: 0 8px 22px !important; padding: 0 !important; }
+  :global(.settings-dialog > aside > div:first-child h2) { color: #e1eae5 !important; font-size: 13px !important; letter-spacing: 0 !important; text-transform: none !important; }
+  :global(.settings-dialog > aside nav) { padding: 0 !important; }
+  :global(.settings-dialog > aside > div:last-child) { padding: 16px 8px 4px !important; background: var(--f-sidebar) !important; border-top: 1px solid #30413a; }
+  :global(.settings-dialog main), :global(.settings-dialog main > header) { background: var(--f-surface) !important; }
+  :global(.settings-dialog main > header) { height: 60px !important; padding: 0 30px !important; border-bottom: 1px solid var(--f-border); }
+  :global(.settings-dialog main > header h3) { color: var(--f-text-2) !important; font-size: 11px !important; letter-spacing: 0 !important; text-transform: none !important; }
+  :global(.settings-dialog main > div) { padding: 25px 30px 28px !important; }
+  :global(.settings-dialog main [class*="bg-[#0e0e0e]"], .settings-dialog main [class*="bg-[#131313]"], .settings-dialog main [class*="bg-[#252626]"], .settings-dialog main [class*="bg-[#1a1a1a]"]) { background: var(--f-surface-2) !important; }
+  :global(.settings-dialog main input:not(.folder-search-input):not(.folder-checkbox):not([type="checkbox"]):not([type="radio"])), :global(.settings-dialog main select), :global(.settings-dialog main textarea) { border: 1px solid var(--f-border-strong) !important; border-radius: 4px !important; background: var(--f-surface) !important; }
   :global(.settings-dialog [class*="text-[#e7e5e5]"]) { color: var(--f-text) !important; }
   :global(.settings-dialog [class*="text-[#acabab]"]) { color: var(--f-text-2) !important; }
   :global(.settings-dialog [class*="text-[#bfc8ca]"]) { color: var(--f-accent) !important; }
   :global(.settings-dialog [class*="border-[#474848]"]) { border-color: var(--f-border) !important; }
-  :global(.settings-dialog h4) { font-family: Inter, "Segoe UI", sans-serif !important; font-size: 22px !important; line-height: 1.3 !important; letter-spacing: 0 !important; }
+  :global(.settings-dialog h4) { font-family: Inter, "Segoe UI", sans-serif !important; font-size: 20px !important; line-height: 1.3 !important; letter-spacing: 0 !important; }
   :global(.settings-dialog .font-serif) { font-family: Inter, "Segoe UI", sans-serif !important; color: var(--f-text) !important; }
+  :global(.settings-dialog main p[class*="opacity-"]) { opacity: 1 !important; }
   :global(.settings-dialog button) { border-radius: 4px; }
-  :global(.settings-dialog input), :global(.settings-dialog select), :global(.settings-dialog textarea) { color: var(--f-text) !important; }
+  :global(.settings-dialog input:not(.folder-search-input):not(.folder-checkbox):not([type="checkbox"]):not([type="radio"])), :global(.settings-dialog select), :global(.settings-dialog textarea) { color: var(--f-text) !important; }
+  :global(.settings-dialog .folder-checkbox) { background: var(--f-surface) !important; border: 1.5px solid var(--f-border-strong) !important; }
+  :global(.settings-dialog .folder-checkbox:checked) { background: var(--f-accent) !important; border-color: var(--f-accent) !important; }
+  :global(.settings-dialog .folder-checkbox:checked::after) { content: '' !important; position: absolute !important; left: 4px !important; top: 1px !important; width: 5px !important; height: 9px !important; border: solid #ffffff !important; border-width: 0 2px 2px 0 !important; transform: rotate(45deg) !important; display: block !important; }
+  :global(.settings-page-mode.settings-overlay) { position: static !important; z-index: auto !important; display: block !important; min-height: 0; padding: 0 !important; background: transparent !important; backdrop-filter: none !important; }
+  :global(.settings-page-mode .settings-dialog) { height: auto !important; min-height: 0; max-width: none; flex-direction: column; overflow: visible; margin: 0 auto; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; }
+  :global(.settings-page-mode .settings-dialog > aside) { width: 100% !important; flex: 0 0 auto !important; padding: 0 !important; background: transparent !important; border: 0 !important; border-bottom: 1px solid var(--f-border) !important; }
+  :global(.settings-page-mode .settings-dialog > aside > div:first-child), :global(.settings-page-mode .settings-dialog > aside > div:last-child) { display: none !important; }
+  :global(.settings-page-mode .settings-dialog > aside nav) { display: flex; gap: 4px; overflow-x: auto; padding: 0 0 8px !important; scrollbar-width: none; }
+  :global(.settings-page-mode .settings-dialog > aside nav::-webkit-scrollbar) { display: none; }
+  :global(.settings-page-mode .settings-nav-item) { width: auto; min-width: max-content; min-height: 38px; padding: 0 12px; color: var(--f-text-2); }
+  :global(.settings-page-mode .settings-nav-item:hover) { color: var(--f-text); background: var(--f-surface-2); }
+  :global(.settings-page-mode .settings-nav-item.active) { color: var(--f-accent); background: var(--f-accent-soft); box-shadow: inset 0 -2px var(--f-accent); }
+  :global(.settings-page-mode .settings-nav-item svg), :global(.settings-page-mode .settings-nav-item.active svg) { color: currentColor; }
+  :global(.settings-page-mode .settings-dialog main), :global(.settings-page-mode .settings-dialog main > header) { background: transparent !important; }
+  :global(.settings-page-mode .settings-dialog main > header) { height: auto !important; min-height: 50px; padding: 18px 0 10px !important; border: 0; }
+  :global(.settings-page-mode .settings-dialog main > div) { overflow: visible !important; padding: 8px 0 28px !important; }
+  :global(.settings-page-mode .settings-dialog main > div > div > div.bg-\[\#131313\]) { padding: 0 !important; border: 0 !important; background: transparent !important; box-shadow: none !important; }
+  :global(.settings-page-mode .settings-close) { display: none !important; }
+  :global(.settings-page-mode .settings-dialog main button) { letter-spacing: 0 !important; text-transform: none !important; }
+  :global(.settings-page-mode .settings-dialog main label) { letter-spacing: 0 !important; text-transform: none !important; opacity: 1 !important; }
   @media (max-width: 640px) {
     :global(.settings-overlay) { padding: 0 !important; }
     :global(.settings-dialog) { width: 100% !important; height: 100dvh !important; max-width: none !important; border-radius: 0 !important; flex-direction: column !important; }
@@ -1223,6 +1253,7 @@
     :global(.settings-dialog > aside > div:last-child) { display: none; }
     :global(.settings-dialog main > header) { height: 47px !important; padding: 0 16px !important; }
     :global(.settings-dialog main > div) { padding: 0 16px 22px !important; }
+    :global(.settings-page-mode .settings-dialog) { height: auto !important; min-height: 0; }
   }
   :global(.scrollbar-custom::-webkit-scrollbar) { width: 4px; }
   :global(.scrollbar-custom::-webkit-scrollbar-track) { background: transparent; }

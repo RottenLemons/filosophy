@@ -77,7 +77,8 @@ h1, h2, h3, h4 { font-family: Inter, "Segoe UI", sans-serif; }
 
 .app-frame { display: flex; min-height: 100vh; background: var(--f-bg); }
 .app-sidebar {
-  width: 232px; flex: 0 0 232px; display: flex; flex-direction: column; min-height: 100vh;
+  position: sticky; top: 0; align-self: flex-start;
+  width: 232px; height: 100dvh; flex: 0 0 232px; display: flex; flex-direction: column; min-height: 100vh;
   padding: 21px 13px 15px; background: var(--f-sidebar); color: var(--f-sidebar-text);
 }
 .brand { display: inline-flex; align-items: center; gap: 10px; width: fit-content; font-size: 16px; font-weight: 700; color: #f1f5f2; }
@@ -89,20 +90,18 @@ h1, h2, h3, h4 { font-family: Inter, "Segoe UI", sans-serif; }
 .primary-nav a.active, .settings-link.active { color: #fff; background: #2b443a; box-shadow: inset 2px 0 #79b899; }
 .sidebar-spacer { flex: 1; min-height: 20px; }
 .index-state { display: flex; align-items: center; gap: 9px; padding: 12px 7px 10px; border-top: 1px solid #33433c; }
-.state-dot, .privacy-note span, .mobile-status i { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #70b593; }
+.state-dot, .mobile-status i { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #70b593; }
 .state-dot.busy { background: #dda06e; animation: pulse 1.5s infinite; }
 .state-dot.offline, .mobile-status.offline i { background: var(--f-danger); }
 .state-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
 .state-copy strong { color: #e0e8e3; font-size: 12px; font-weight: 600; }
-.state-copy small { overflow: hidden; color: #94a59c; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.state-copy small { overflow: hidden; color: #94a59c; font-size: 10px; line-height: 1.35; text-overflow: ellipsis; white-space: pre-line; }
 .state-progress { color: #b8c7bf; font-size: 10px; font-variant-numeric: tabular-nums; }
 .progress-track { height: 3px; margin: 0 8px 8px; overflow: hidden; border-radius: 2px; background: #32423a; }
 .progress-track span { display: block; height: 100%; background: #79b899; transition: width 180ms ease; }
 .progress-track span.indeterminate { animation: scan-progress 1.8s ease-in-out infinite alternate; }
 .settings-link { margin-top: 3px; }
 .theme-button { cursor: pointer; }
-.privacy-note { display: flex; align-items: center; gap: 7px; padding: 14px 10px 2px; color: #95a69e; font-size: 10px; }
-.privacy-note span { width: 6px; height: 6px; flex-basis: 6px; background: #79b899; }
 .app-content { min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .app-main { min-width: 0; flex: 1; padding: 30px clamp(22px, 3.4vw, 54px) 38px; }
 .mobile-brand, .mobile-nav { display: none; }

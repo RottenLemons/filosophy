@@ -65,7 +65,7 @@
         <strong>{readinessTitle}</strong>
         <small>{statusDetail}</small>
       </span>
-      {#if $indexingStatus.isIndexing}
+      {#if $indexingStatus.isIndexing && $indexingStatus.searchReady}
         <span class="state-progress">{Math.round($indexingStatus.progress)}%</span>
       {/if}
     </div>
@@ -80,7 +80,6 @@
       {#if $themeStore === 'dark'}<Sun size={16} />{:else}<Moon size={16} />{/if}
       <span>{$themeStore === 'dark' ? 'Light appearance' : 'Dark appearance'}</span>
     </button>
-    <div class="privacy-note"><span></span> Private by default</div>
   </aside>
 
   <div class="app-content">

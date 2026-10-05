@@ -2,6 +2,8 @@
 
 Filosophy is a Windows desktop app for searching files stored on your computer. It combines filename and document-text search with locally computed text and image embeddings. Indexing and search do not require a hosted AI service. The optional Assistant can connect to a local or remote OpenAI-compatible provider when configured.
 
+![demo gif](demo.gif)
+
 ## Search and retrieval
 
 Filosophy uses a staged, local hybrid retriever. The first indexing pass records eligible paths and metadata in SQLite, making filename and path keyword search available quickly. A background enhanced pass then extracts document text, chunks it, indexes it for full-text search, and writes text and image embeddings. Semantic matches become available as vectors are added; after the initial enhanced pass completes, the full hybrid index is ready. Search continues to combine keyword and semantic evidence rather than switching to semantic-only results.

@@ -26,7 +26,6 @@
       </article>
     {/each}
   </section>
-  <aside class="privacy-note"><span class="privacy-dot"></span><div><strong>Private by default</strong><p>Search and indexing run locally. Assistant requests follow the provider and endpoint configured in Settings.</p></div></aside>
 </div>
 
 <style>
@@ -49,9 +48,5 @@
   .connection-copy p { margin: 4px 0 0; color: var(--f-text-2); font-size: 12px; }
   .row-action { display: grid; width: 32px; height: 32px; flex: 0 0 auto; place-items: center; border: 0; border-radius: 4px; background: transparent; color: var(--f-text-3); cursor: pointer; }
   .row-action:hover { background: var(--f-surface-2); color: var(--f-text); }
-  .privacy-note { display: flex; max-width: 920px; gap: 10px; padding: 14px 0; border-top: 1px solid var(--f-border); }
-  .privacy-dot { width: 7px; height: 7px; flex: 0 0 auto; margin-top: 5px; border-radius: 50%; background: var(--f-success); }
-  .privacy-note strong { font-size: 12px; font-weight: 650; }
-  .privacy-note p { margin: 3px 0 0; color: var(--f-text-2); font-size: 11px; }
   @media (max-width: 560px) { .page-head { align-items: start; flex-direction: column; } .connection-row { gap: 10px; } }
 </style>
