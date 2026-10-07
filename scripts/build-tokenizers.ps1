@@ -21,3 +21,10 @@ if (-not (Test-Path $archive)) {
 
 Copy-Item -LiteralPath $archive -Destination $destination -Force
 Write-Output "Created $destination"
+
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$dlDestination = Join-Path $repoRoot "libdl.a"
+if (-not (Test-Path $dlDestination)) {
+    ar cr $dlDestination
+    Write-Output "Created $dlDestination"
+}

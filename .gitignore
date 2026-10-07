@@ -47,6 +47,7 @@ vendor/
 *.so
 *.dylib
 libtokenizers.a
+libdl.a
 filosophy       # binary name
 
 # Wails

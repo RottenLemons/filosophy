@@ -34,9 +34,22 @@ jobs:
             exit 1
           }
 
+      - name: Build Tokenizers Library
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\mingw64\bin") {
+            $env:PATH = "C:\mingw64\bin;$env:PATH"
+          }
+          rustup target add x86_64-pc-windows-gnu
+          go mod download
+          ./scripts/build-tokenizers.ps1
+
       - name: Go Test
         shell: pwsh
         run: |
+          if (Test-Path "C:\mingw64\bin") {
+            $env:PATH = "C:\mingw64\bin;$env:PATH"
+          }
           go test -v ./shared/...
 
       - name: Set up Node.js
