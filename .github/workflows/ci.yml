@@ -11,6 +11,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      - name: Disable git autocrlf
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout code
         uses: actions/checkout@v4
 
