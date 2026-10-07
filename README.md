@@ -38,7 +38,7 @@ Model and runtime bundles are not stored in this repository. Keep the downloaded
 
 - **Models:** [Download the model bundle](https://drive.google.com/file/d/1bBVwQ-Q1WAg5EuUUwlqAiXi5w3MaMUBg/view?usp=sharing). It should provide the `text/` and `image/` directories, including their ONNX models and tokenizer files. The optional reranker files belong in the repository root.
 - **libvips:** [Windows x64 releases](https://github.com/libvips/build-win64-mxe/releases/tag/v8.18.2). Download `vips-dev-x64-all-8.18.2.zip` and extract its `vips-dev-8.18/` directory into the repository root.
-- **ONNX Runtime:** [Windows x64 release v1.24.0](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0). Download the CPU package `onnxruntime-win-x64-1.24.0.zip` and place its `onnxruntime.dll` beside the application executable (or in the repository root for development).
+- **ONNX Runtime:** [Windows x64 release v1.24.4]([https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4)). Download the GPU package `onnxruntime-win-x64-gpu-1.24.4.zip` and place its `onnxruntime_providers_cuda.dll`, `onnxruntime.dll` (already in repo) and `onnxruntime_providers_shared.dll` (already in repo) beside the application executable (or in the repository root for development). You need to install cuda drivers as well if you want to use GPU
 
 ## Build and run from source
 
