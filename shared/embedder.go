@@ -348,4 +348,3 @@ func staticNormalize(vec []float32) []float32 {
 	}
 	return vec
 }
-

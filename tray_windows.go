@@ -20,8 +20,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/windows"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows"
 )
 
 // ── Win32 API procs ───────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ const (
 	wmNull    uint32 = 0x0000
 
 	// TrackPopupMenu flags
-	tpmReturnCmd  uint32 = 0x0100
+	tpmReturnCmd   uint32 = 0x0100
 	tpmBottomAlign uint32 = 0x0020
 
 	// AppendMenu flags
@@ -101,12 +101,12 @@ const (
 
 type notifyIconDataW struct {
 	cbSize           uint32
-	_pad0            [4]byte   // align hWnd to 8 bytes
+	_pad0            [4]byte // align hWnd to 8 bytes
 	hWnd             uintptr
 	uID              uint32
 	uFlags           uint32
 	uCallbackMessage uint32
-	_pad1            [4]byte   // align hIcon to 8 bytes
+	_pad1            [4]byte // align hIcon to 8 bytes
 	hIcon            uintptr
 	szTip            [128]uint16
 	dwState          uint32
@@ -148,11 +148,11 @@ type pointW struct{ x, y int32 }
 // ── Package-level tray state ──────────────────────────────────────────────────
 
 var (
-	trayHwnd    uintptr       // set once the message window is created
-	trayNID     notifyIconDataW
-	trayTip     atomic.Value  // stores string; read in wmUpdateTip handler
-	trayAppRef  *App          // set in runTray; used inside wndProc
-	wndProcCB   uintptr       // NewCallback result; kept alive to prevent GC
+	trayHwnd   uintptr // set once the message window is created
+	trayNID    notifyIconDataW
+	trayTip    atomic.Value // stores string; read in wmUpdateTip handler
+	trayAppRef *App         // set in runTray; used inside wndProc
+	wndProcCB  uintptr      // NewCallback result; kept alive to prevent GC
 )
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -207,8 +207,8 @@ func setTrayTip(tip string) {
 // showContextMenu is called on WM_RBUTTONUP. The two critical Win32 rules that
 // getlantern/systray misses — causing right-click to stop working after the
 // first use — are:
-//   1. SetForegroundWindow BEFORE TrackPopupMenu
-//   2. PostMessage WM_NULL AFTER TrackPopupMenu
+//  1. SetForegroundWindow BEFORE TrackPopupMenu
+//  2. PostMessage WM_NULL AFTER TrackPopupMenu
 func showContextMenu(hwnd uintptr) {
 	var pt pointW
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))

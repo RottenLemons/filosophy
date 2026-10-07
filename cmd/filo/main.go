@@ -29,10 +29,10 @@ const defaultHost = "127.0.0.1"
 const defaultPort = 7700
 
 var (
-	host  string
-	port  int
-	key   string
-	limit int
+	host    string
+	port    int
+	key     string
+	limit   int
 	jsonOut bool
 )
 

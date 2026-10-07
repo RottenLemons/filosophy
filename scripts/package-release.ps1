@@ -41,6 +41,10 @@ New-Item -ItemType Directory -Path (Join-Path $runtime "text") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $runtime "image") -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination $runtime -Force
 Copy-Item -LiteralPath (Join-Path $root "onnxruntime.dll") -Destination $runtime -Force
+$directMLDll = Join-Path $root "DirectML.dll"
+if (Test-Path -LiteralPath $directMLDll -PathType Leaf) {
+    Copy-Item -LiteralPath $directMLDll -Destination $runtime -Force
+}
 foreach ($file in @("tokenizer.json", "model.onnx")) {
     Copy-Item -LiteralPath (Join-Path $root "text/$file") -Destination (Join-Path $runtime "text") -Force
 }

@@ -37,6 +37,6 @@ func IsOfflineFile(fi os.FileInfo) bool {
 	// 0x400000 = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (OneDrive / Cloud files)
 	const fileAttributeOffline = 0x1000
 	const fileAttributeRecallOnDataAccess = 0x400000
-	
+
 	return (sys.FileAttributes&fileAttributeOffline != 0) || (sys.FileAttributes&fileAttributeRecallOnDataAccess != 0)
 }

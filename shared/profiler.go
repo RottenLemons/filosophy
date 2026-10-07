@@ -7,13 +7,13 @@ import (
 
 // HardwareConfig holds the adaptive resource limits for different hardware tiers.
 type HardwareConfig struct {
-	Tier               int    // 1: Low, 2: Mid, 3: High
-	TierName           string
-	VIPSCap            int    // Number of concurrent VIPS processes
-	VIPSThreads        int    // Internal VIPS concurrency per process
-	VIPSCache          int    // VIPS cache size in MB (0 to disable)
-	GCInterval         int    // Number of files between explicit FreeOSMemory() calls
-	DirectMLKneecap    bool   // Disable ORT memory pattern and arena for stability
+	Tier            int // 1: Low, 2: Mid, 3: High
+	TierName        string
+	VIPSCap         int  // Number of concurrent VIPS processes
+	VIPSThreads     int  // Internal VIPS concurrency per process
+	VIPSCache       int  // VIPS cache size in MB (0 to disable)
+	GCInterval      int  // Number of files between explicit FreeOSMemory() calls
+	DirectMLKneecap bool // Disable ORT memory pattern and arena for stability
 }
 
 // DetermineHardwareProfile calculates the hardware tier and associated limits.
@@ -67,7 +67,7 @@ func DetermineHardwareProfile() HardwareConfig {
 		}
 	}
 
-	log.Printf("[Profiler] Detected %d GB RAM / %d CPUs -> Tier %d (%s)", 
+	log.Printf("[Profiler] Detected %d GB RAM / %d CPUs -> Tier %d (%s)",
 		totalGB, numCPU, cfg.Tier, cfg.TierName)
 	log.Printf("[Profiler] Config: VIPS_Cap=%d, VIPS_Threads=%d, VIPS_Cache=%dMB, GC_Interval=%d, DirectML_Kneecap=%v",
 		cfg.VIPSCap, cfg.VIPSThreads, cfg.VIPSCache, cfg.GCInterval, cfg.DirectMLKneecap)

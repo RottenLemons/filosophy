@@ -130,8 +130,8 @@ type Engine struct {
 	optimizerMu sync.RWMutex
 	optimizer   *TelemetryOptimizer
 
-	gpuMutex sync.Mutex // surgically wraps session.Run for DirectML stability
-	Hardware HardwareConfig
+	gpuMutex  sync.Mutex // surgically wraps session.Run for DirectML stability
+	Hardware  HardwareConfig
 	closeOnce sync.Once
 }
 

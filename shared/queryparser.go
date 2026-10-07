@@ -88,7 +88,7 @@ type ParsedQuery struct {
 	ModBefore    int64    // mtime nanoseconds since epoch; 0 = no bound
 	CrtAfter     int64    // ctime
 	CrtBefore    int64
-	AccAfter     int64    // atime
+	AccAfter     int64 // atime
 	AccBefore    int64
 	NameGlob     string   // glob applied to filepath.Base(path), e.g. "invoice*"
 	ExcludeTerms []string // tokens prefixed with '-'

@@ -4,6 +4,18 @@ Filosophy is a Windows desktop app for searching files stored on your computer. 
 
 ![demo gif](demo.gif)
 
+### Retrieval benchmark (Lexical vs Semantic vs Hybrid)
+
+Filosophy's hybrid pipeline was benchmarked against lexical with fuzzy matching (SQLite FTS5 + BM25 + Levenshtein fuzzy) and pure semantic (dense vector similarity) baselines across 30 queries spanning exact names, keyword extraction, conceptual synonyms, typos, infix substrings, and noise suppression:
+
+| Pipeline | NDCG@10 | Recall@10 | MRR@10 | End-to-End Latency | Index-Only Latency |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Lexical (+ Fuzzy)** (FTS5 + BM25 + Fuzzy) | 0.8027 | 83.33% | 0.7917 | **0.48 ms** | 0.48 ms |
+| **Pure Semantic** (Dense Vectors) | 0.6117 | 71.67% | 0.5867 | 3.55 ms | 0.49 ms |
+| **Filosophy Hybrid** | **0.8507** | **93.33%** | **0.8242** | 3.08 ms | 1.76 ms |
+
+Hybrid retrieval achieves a **+10.0% recall gain over lexical (+ fuzzy)** and **+21.7% over semantic** while keeping search latency ~3.0ms via concurrent multi-channel execution. The hybrid pipeline particularly excels in real-world weak cases: **+33.3% on infix substrings** and **+58.5% on noise suppression**. Full query logs and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
+
 ## Search and retrieval
 
 Filosophy uses a staged, local hybrid retriever. The first indexing pass records eligible paths and metadata in SQLite, making filename and path keyword search available quickly. A background enhanced pass then extracts document text, chunks it, indexes it for full-text search, and writes text and image embeddings. Semantic matches become available as vectors are added; after the initial enhanced pass completes, the full hybrid index is ready. Search continues to combine keyword and semantic evidence rather than switching to semantic-only results.
@@ -22,23 +34,15 @@ Post-fusion adjustments keep results useful for real file discovery: strong file
 
 If the optional local cross-encoder is installed, it reranks the top eight fused candidates using up to two matching text excerpts per file. The reranker score is blended with the fused rank; candidates outside that reranking window retain their fused ordering. Embedding and reranking inference run locally.
 
-### Feedback-driven weight tuning
-
-Thumbs-up and thumbs-down feedback lets the ranking optimizer tune the balance between path, content, text-semantic, image-semantic, and reranker signals. After initial indexing, it waits two minutes before its first run, then evaluates feedback every ten minutes. It requires at least ten votes before tuning and gives recent feedback more influence, with its weight halving about every seven days.
-
-For each distinct feedback query, the optimizer computes retrieval signals once, then runs a bounded in-memory grid search over nearby channel-weight combinations and reranker blends. It scores candidate rankings using NDCG@10, MRR@10, recall within the rerank window, and a penalty for highly ranked downvoted results. New weights are saved only when the measured preference objective improves, then hot-reloaded into search without restarting the app. This is feedback-based ranking calibration, not model fine-tuning: the encoders and reranker do not change.
-
-### RAG boundary
-
-The hybrid retriever provides a RAG-oriented retrieval layer: lexical retrieval handles exact names and terms, dense retrieval adds semantic recall, and fusion plus reranking improves the candidate order. The optional Assistant can invoke file search as a tool, but the current confirmation flow gives it the selected result paths, not automatically extracted passages. The Assistant's provider and credentials are configured separately in Settings; prompts sent to that provider leave the machine.
-
 ## External downloads
 
 Model and runtime bundles are not stored in this repository. Keep the downloaded directory structure intact when extracting into the repository root; the release packaging script validates required local assets but does not download them.
 
 - **Models:** [Download the model bundle](https://drive.google.com/file/d/1bBVwQ-Q1WAg5EuUUwlqAiXi5w3MaMUBg/view?usp=sharing). It should provide the `text/` and `image/` directories, including their ONNX models and tokenizer files. The optional reranker files belong in the repository root.
 - **libvips:** [Windows x64 releases](https://github.com/libvips/build-win64-mxe/releases/tag/v8.18.2). Download `vips-dev-x64-all-8.18.2.zip` and extract its `vips-dev-8.18/` directory into the repository root.
-- **ONNX Runtime:** [Windows x64 release v1.24.4]([https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4)). Download the GPU package `onnxruntime-win-x64-gpu-1.24.4.zip` and place its `onnxruntime_providers_cuda.dll`, `onnxruntime.dll` (already in repo) and `onnxruntime_providers_shared.dll` (already in repo) beside the application executable (or in the repository root for development). You need to install cuda drivers as well if you want to use GPU
+- **ONNX Runtime & DirectML:** Filosophy uses the DirectML execution provider for local GPU acceleration on any DirectX 12-compatible GPU (AMD, Intel, NVIDIA) without needing CUDA or cuDNN installations.
+  - **GPU acceleration (recommended):** Download the [`Microsoft.ML.OnnxRuntime.DirectML`](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML) package from NuGet (or direct [package download](https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML)). Open the `.nupkg` archive as a zip, extract `onnxruntime.dll` and `DirectML.dll` from `runtimes/win-x64/native/`, and place them beside the application executable (or in the repository root for development). When `DirectML.dll` is present, GPU acceleration is enabled automatically.
+  - **CPU-only fallback:** Download the standard Windows x64 CPU release from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and place `onnxruntime.dll` beside the executable. If `DirectML.dll` is not present, the app automatically falls back to CPU execution.
 
 ## Build and run from source
 

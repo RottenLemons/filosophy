@@ -765,7 +765,7 @@ type App struct {
 	// Used as the session key in search_feedback telemetry rows.
 	sessionID string
 
-	Hardware shared.HardwareConfig
+	Hardware     shared.HardwareConfig
 	shutdownOnce sync.Once
 }
 
