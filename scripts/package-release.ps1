@@ -45,6 +45,10 @@ $directMLDll = Join-Path $root "DirectML.dll"
 if (Test-Path -LiteralPath $directMLDll -PathType Leaf) {
     Copy-Item -LiteralPath $directMLDll -Destination $runtime -Force
 }
+$kreuzbergDll = Join-Path $root "kreuzberg-ffi/lib/kreuzberg_ffi.dll"
+if (Test-Path -LiteralPath $kreuzbergDll -PathType Leaf) {
+    Copy-Item -LiteralPath $kreuzbergDll -Destination $runtime -Force
+}
 foreach ($file in @("tokenizer.json", "model.onnx")) {
     Copy-Item -LiteralPath (Join-Path $root "text/$file") -Destination (Join-Path $runtime "text") -Force
 }
