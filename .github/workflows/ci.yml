@@ -34,28 +34,6 @@ jobs:
             exit 1
           }
 
-      - name: Cache Kreuzberg FFI
-        id: cache-kreuzberg
-        uses: actions/cache@v4
-        with:
-          path: kreuzberg-ffi
-          key: kreuzberg-ffi-v4.10.4-windows-x86_64
-
-      - name: Download Kreuzberg FFI
-        if: steps.cache-kreuzberg.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          curl.exe -L -o "$env:TEMP/go-ffi-windows.tar.gz" "https://github.com/kreuzberg-dev/kreuzberg-lts/releases/download/v4.10.4/go-ffi-windows-x86_64.tar.gz"
-          tar -xzf "$env:TEMP/go-ffi-windows.tar.gz" -C .
-
-      - name: Set up Kreuzberg runtime
-        shell: pwsh
-        run: |
-          Copy-Item "kreuzberg-ffi/lib/kreuzberg_ffi.dll" -Destination "." -Force
-          Copy-Item "kreuzberg-ffi/lib/kreuzberg_ffi.dll" -Destination "shared" -Force
-          $absLib = (Resolve-Path "kreuzberg-ffi/lib").Path
-          "$absLib" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       - name: Build Tokenizers Library
         shell: pwsh
         run: |
@@ -72,7 +50,7 @@ jobs:
           if (Test-Path "C:\mingw64\bin") {
             $env:PATH = "C:\mingw64\bin;$env:PATH"
           }
-          go test -v ./shared/...
+          go test -v -tags no_kreuzberg ./shared/...
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

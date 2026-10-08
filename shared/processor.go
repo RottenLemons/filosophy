@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/cespare/xxhash"
-	kreuzberg "github.com/kreuzberg-dev/kreuzberg/packages/go/v4"
 	"github.com/tmc/langchaingo/textsplitter"
 )
 
@@ -320,12 +319,12 @@ func ProcessText(path string, mtime, size, ctime, atime int64, cfg *ProcessorCon
 		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
-	result, err := kreuzberg.ExtractFileSync(path, nil)
-	if err != nil || result == nil || result.Content == "" {
+	content, err := extractFileContent(path)
+	if err != nil || content == "" {
 		HandleChunk(cfg.Chunks, cfg.Engine, "text", "", path, hash, mtime, size, ctime, atime)
 		return
 	}
-	splits, err := cfg.Splitter.SplitText(result.Content)
+	splits, err := cfg.Splitter.SplitText(content)
 	if err != nil {
 		log.Println("Failed to split text:", err)
 		return

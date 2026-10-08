@@ -5,7 +5,7 @@
 package shared
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/.. -ltokenizers -lkreuzberg_ffi -lws2_32 -lntdll -luserenv -lbcrypt -ladvapi32
+#cgo LDFLAGS: -L${SRCDIR}/.. -ltokenizers -lws2_32 -lntdll -luserenv -lbcrypt -ladvapi32
 */
 import "C"
 
