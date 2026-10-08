@@ -16,6 +16,14 @@ Filosophy's hybrid pipeline was benchmarked against lexical with fuzzy matching 
 
 Hybrid retrieval achieves **93.33% Recall@10** (a **+6.7 percentage point (pp)** gain over lexical (+ fuzzy) at 86.67%), matching dense semantic recall while delivering higher overall ranking quality (**0.8880 NDCG@10**, **0.8722 MRR@10**) and robust resistance against typos and adversarial noise. Full query logs and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
 
+Run the benchmark locally:
+
+```powershell
+go test -v -run TestRetrievalEvaluation ./shared/...
+# or via CLI:
+go run ./cmd/eval
+```
+
 ## Search and retrieval
 
 Filosophy uses a staged, local hybrid retriever. The first indexing pass records eligible paths and metadata in SQLite, making filename and path keyword search available quickly. A background enhanced pass then extracts document text, chunks it, indexes it for full-text search, and writes text and image embeddings. Semantic matches become available as vectors are added; after the initial enhanced pass completes, the full hybrid index is ready. Search continues to combine keyword and semantic evidence rather than switching to semantic-only results.
