@@ -460,8 +460,7 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 	if err != nil {
 		return nil, fmt.Errorf("text coll: %w", err)
 	}
-	imgColl, err := store.CreateCollection(ctx, imageCollection, dim)
-	if err != nil {
+	if _, err := store.CreateCollection(ctx, imageCollection, dim); err != nil {
 		return nil, fmt.Errorf("img coll: %w", err)
 	}
 
@@ -518,13 +517,11 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 		}
 
 		vec := embedder.EmbedTruncated(content, dim)
-		targetColl := coll.ID
-		if IsImageFile(path) {
-			targetColl = imgColl.ID
-		}
+		// All 22 corpus documents and image descriptions are indexed into textCollection (coll.ID)
+		// so that the candidate universe is identical and fair across both Pure Semantic and Hybrid vector channels.
 		if err := store.Upsert(ctx, &core.Embedding{
 			ID:           fmt.Sprintf("doc-%d", docIdx),
-			CollectionID: targetColl,
+			CollectionID: coll.ID,
 			Vector:       vec,
 			Content:      content,
 			Metadata:     map[string]string{"path": path},
@@ -579,23 +576,25 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 	}
 
 	for _, m := range modes {
-		var latencies []float64
-		var indexLatencies []float64
+		var latencies []float64      // 300 individual per-invocation end-to-end durations
+		var indexLatencies []float64 // 300 individual per-invocation index-only durations
 		totalNDCG, totalRecall, totalMRR := 0.0, 0.0, 0.0
 
 		for qIdx, q := range queries {
 			const iters = 10
 			var rankedPaths []string
-			var dur time.Duration
-			var indexDur time.Duration
 
 			if m.name == "Lexical Ablation (Semantics Off)" {
-				start := time.Now()
 				for it := 0; it < iters; it++ {
+					t0 := hiresNow()
 					res, err := lexEngine.Search(q.Query)
+					t1 := hiresNow()
 					if err != nil {
 						return nil, fmt.Errorf("lexical search %q: %w", q.Query, err)
 					}
+					latMs := hiresElapsedMs(t0, t1)
+					latencies = append(latencies, latMs)
+					indexLatencies = append(indexLatencies, latMs) // No embedding in lexical search; index-only == end-to-end
 					if it == 0 {
 						rankedPaths = make([]string, len(res))
 						for i, item := range res {
@@ -603,36 +602,37 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 						}
 					}
 				}
-				dur = time.Since(start) / iters
-				indexDur = dur
 
 			} else if m.name == "Pure Semantic" {
-				// Disentangled query embedding latency
-				embedStart := time.Now()
 				for it := 0; it < iters; it++ {
-					_ = embedder.EmbedTruncated(q.Query, dim)
-				}
-				embedDur := time.Since(embedStart) / iters
+					// Time end-to-end invocation directly: embed + vector search
+					e2eStart := hiresNow()
+					qVec := embedder.EmbedTruncated(q.Query, dim)
 
-				// Disentangled index traversal latency
-				qVec := embedder.EmbedTruncated(q.Query, dim)
-				idxStart := time.Now()
-				for it := 0; it < iters; it++ {
+					idxStart := hiresNow()
 					scores := make(map[string]float64)
 					tRes, err := hybridEngine.db.Search(ctx, qVec, core.SearchOptions{
 						Collection: textCollection,
 						TopK:       10,
 					})
-					if err == nil {
-						for _, res := range tRes {
-							p := res.Metadata["path"]
-							sim := float64(res.Score)
-							if sim > scores[p] {
-								scores[p] = sim
+					idxEnd := hiresNow()
+					e2eEnd := hiresNow()
+
+					latMs := hiresElapsedMs(e2eStart, e2eEnd)
+					idxLatMs := hiresElapsedMs(idxStart, idxEnd)
+					latencies = append(latencies, latMs)
+					indexLatencies = append(indexLatencies, idxLatMs)
+
+					if it == 0 {
+						if err == nil {
+							for _, res := range tRes {
+								p := res.Metadata["path"]
+								sim := float64(res.Score)
+								if sim > scores[p] {
+									scores[p] = sim
+								}
 							}
 						}
-					}
-					if it == 0 {
 						type scoredDoc struct {
 							path  string
 							score float64
@@ -650,17 +650,30 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 						}
 					}
 				}
-				idxDur := time.Since(idxStart) / iters
-				dur = embedDur + idxDur
-				indexDur = idxDur
 
 			} else { // Filosophy Hybrid
-				start := time.Now()
+				// Precompute query vector so index-only hybrid search can be measured cleanly without embedding
+				qVec := embedder.EmbedTruncated(q.Query, dim)
+
 				for it := 0; it < iters; it++ {
+					// End-to-end: query embedding + parallel FTS/vector channels + RRF fusion + heuristic adjustments
+					e2eStart := hiresNow()
 					res, err := hybridEngine.Search(q.Query)
+					e2eEnd := hiresNow()
 					if err != nil {
 						return nil, fmt.Errorf("hybrid search %q: %w", q.Query, err)
 					}
+
+					// Index-only: multi-channel index traversal + RRF fusion with precomputed vector (no embedding)
+					idxStart := hiresNow()
+					_, _ = hybridEngine.SearchWithVector(q.Query, qVec)
+					idxEnd := hiresNow()
+
+					latMs := hiresElapsedMs(e2eStart, e2eEnd)
+					idxLatMs := hiresElapsedMs(idxStart, idxEnd)
+					latencies = append(latencies, latMs)
+					indexLatencies = append(indexLatencies, idxLatMs)
+
 					if it == 0 {
 						rankedPaths = make([]string, len(res))
 						for i, item := range res {
@@ -668,15 +681,7 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 						}
 					}
 				}
-				dur = time.Since(start) / iters
-				indexDur = dur
 			}
-
-			latMs := float64(dur.Microseconds()) / 1000.0
-			latencies = append(latencies, latMs)
-
-			idxLatMs := float64(indexDur.Microseconds()) / 1000.0
-			indexLatencies = append(indexLatencies, idxLatMs)
 
 			ndcg, recall, mrr := ComputeMetrics(rankedPaths, q.Relevance, 10)
 			totalNDCG += ndcg
@@ -703,7 +708,7 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 			}
 		}
 
-		n := float64(len(queries))
+		nQueries := float64(len(queries))
 		sort.Float64s(latencies)
 		p50 := latencies[len(latencies)*50/100]
 		p95 := latencies[len(latencies)*95/100]
@@ -717,13 +722,13 @@ func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInf
 		}
 
 		res := results[m.name]
-		res.NDCG10 = totalNDCG / n
-		res.Recall10 = totalRecall / n
-		res.MRR10 = totalMRR / n
-		res.MeanLatMs = sumLat / n
+		res.NDCG10 = totalNDCG / nQueries
+		res.Recall10 = totalRecall / nQueries
+		res.MRR10 = totalMRR / nQueries
+		res.MeanLatMs = sumLat / float64(len(latencies))
 		res.P50LatMs = p50
 		res.P95LatMs = p95
-		res.IndexOnlyLatMs = sumIndexLat / n
+		res.IndexOnlyLatMs = sumIndexLat / float64(len(indexLatencies))
 	}
 
 	for _, cat := range sortedCategories {

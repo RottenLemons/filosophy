@@ -10,11 +10,11 @@ Filosophy's hybrid pipeline was benchmarked against the exact lexical ablation (
 
 | Pipeline | NDCG@10 | Mean Recall@10 | MRR@10 | End-to-End Mean | p50 Latency | p95 Latency | Index-Only Latency |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Lexical Ablation** (Semantics Off) | 0.8380 | 86.67% | 0.8278 | 1.38 ms | 1.42 ms | 1.90 ms | 1.38 ms |
-| **Pure Semantic** (Dense Vectors via StaticEmbedder) | 0.7436 | 83.33% | 0.7297 | **0.47 ms** | **0.45 ms** | **0.70 ms** | **0.43 ms** |
-| **Filosophy Hybrid** (Production Engine.Search) | **0.8880** | **93.33%** | **0.8722** | 1.71 ms | 1.75 ms | 2.25 ms | 1.71 ms |
+| **Lexical Ablation** (Semantics Off) | 0.8380 | 86.67% | 0.8278 | 1.26 ms | 1.25 ms | 1.94 ms | 1.26 ms |
+| **Pure Semantic** (Dense Vectors via StaticEmbedder) | 0.8202 | 93.33% | 0.8098 | **0.53 ms** | **0.42 ms** | **1.02 ms** | **0.48 ms** |
+| **Filosophy Hybrid** (Production Engine.Search) | **0.9071** | **96.67%** | **0.8861** | 1.90 ms | 1.67 ms | 3.44 ms | 1.90 ms |
 
-Hybrid retrieval achieves **93.33% Mean Recall@10** (a **+6.7 percentage point (pp)** gain over lexical ablation at 86.67%), outperforming pure semantic recall (83.33%) while delivering higher overall ranking quality (**0.8880 NDCG@10**, **0.8722 MRR@10**), particularly on conceptual synonyms (+0.0833 NDCG) and typo tolerance (+0.2000 NDCG). Verified against model weights SHA-256 `164fc63ee9...`. Full query logs, cryptographic verification, and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
+Hybrid retrieval achieves **96.67% Mean Recall@10** (a **+10.0 percentage point (pp)** gain over lexical ablation at 86.67% and exceeding pure semantic recall at 93.33%), while delivering higher overall ranking quality (**0.9071 NDCG@10**, **0.8861 MRR@10**), particularly on typo tolerance (**0.9262 NDCG** vs 0.6000 lexical, +0.3262 gain). Verified against model weights SHA-256 `164fc63ee9...`. Full query logs, cryptographic verification, and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
 
 Run the benchmark locally:
 

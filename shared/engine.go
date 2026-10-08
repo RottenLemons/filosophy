@@ -2163,7 +2163,15 @@ func (s *Engine) GetRawSignals(query string) RawSearchSignals {
 	return signals
 }
 
+// Search performs hybrid search across path FTS, content FTS, text embeddings, and image embeddings.
 func (s *Engine) Search(query string) ([]SearchResult, error) {
+	return s.SearchWithVector(query, nil)
+}
+
+// SearchWithVector executes the hybrid search pipeline. If precomputedTextEmb is non-nil,
+// it uses the provided vector instead of running s.embedText, allowing isolated measurement
+// of multi-channel index traversal, fusion, and heuristic ranking without neural embedding overhead.
+func (s *Engine) SearchWithVector(query string, precomputedTextEmb []float32) ([]SearchResult, error) {
 	ctx := context.Background()
 
 	pq := ParseQuery(query)
@@ -2255,9 +2263,17 @@ func (s *Engine) Search(query string) ([]SearchResult, error) {
 		if w.UseNewPipeline {
 			wText = w.WSemanticText
 		}
-		textEmbs, err := s.embedText([]string{query})
-		if err == nil && len(textEmbs) > 0 && textEmbs[0] != nil {
-			textResults, err := s.db.Search(ctx, textEmbs[0], core.SearchOptions{
+		var textEmb []float32
+		if len(precomputedTextEmb) > 0 {
+			textEmb = precomputedTextEmb
+		} else {
+			textEmbs, err := s.embedText([]string{query})
+			if err == nil && len(textEmbs) > 0 && textEmbs[0] != nil {
+				textEmb = textEmbs[0]
+			}
+		}
+		if textEmb != nil {
+			textResults, err := s.db.Search(ctx, textEmb, core.SearchOptions{
 				Collection: textCollection,
 				TopK:       200,
 			})
