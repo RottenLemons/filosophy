@@ -63,8 +63,8 @@ func TestDecode16BitWeightsRejectsInvalidInput(t *testing.T) {
 }
 
 func TestStaticEmbedderDD(t *testing.T) {
-	modelPath := "../text/dd/model.safetensors"
-	tokPath := "../text/dd/tokenizer.json"
+	modelPath := "../text/model.safetensors"
+	tokPath := "../text/tokenizer.json"
 	emb, err := LoadStaticEmbedder(modelPath, tokPath)
 	if err != nil {
 		t.Skipf("LoadStaticEmbedder skipped (model file not present): %v", err)
@@ -88,11 +88,11 @@ func TestStaticEmbedderDD(t *testing.T) {
 	if len(vec256) != 256 {
 		t.Fatalf("expected truncated vector length 256, got %d", len(vec256))
 	}
-	t.Logf("Successfully loaded text/dd static embedder and embedded 'hello world'")
+	t.Logf("Successfully loaded text static embedder and embedded 'hello world'")
 }
 
 func BenchmarkEmbedTruncated(b *testing.B) {
-	emb, err := LoadStaticEmbedder("../text/dd/model.safetensors", "../text/dd/tokenizer.json")
+	emb, err := LoadStaticEmbedder("../text/model.safetensors", "../text/tokenizer.json")
 	if err != nil {
 		b.Skip(err)
 	}

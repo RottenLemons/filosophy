@@ -2,8 +2,11 @@ package shared
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,20 +30,43 @@ type EvalQuery struct {
 type EvalResult struct {
 	Name           string
 	NDCG10         float64
-	Recall10       float64
+	Recall10       float64 // Mean Recall@10
 	MRR10          float64
-	MeanLatMs      float64 // End-to-end latency including query embedding forward pass
-	P50LatMs       float64
-	P95LatMs       float64
-	IndexOnlyLatMs float64 // Raw index traversal latency excluding neural query embedding
+	MeanLatMs      float64 // End-to-end latency including query embedding
+	P50LatMs       float64 // Per-query median latency
+	P95LatMs       float64 // Per-query tail latency (95th percentile)
+	IndexOnlyLatMs float64 // Raw index traversal latency excluding embedding
+}
+
+// BenchmarkModelInfo contains provenance and cryptographic verification for evaluated weights.
+type BenchmarkModelInfo struct {
+	Name     string
+	Backend  string
+	Path     string
+	FileSize int64
+	SHA256   string
+	Dim      int
+}
+
+// QueryEvalLog records per-query scoring and top-1 retrieved result.
+type QueryEvalLog struct {
+	ID       int
+	Query    string
+	Category string
+	LexNDCG  float64
+	SemNDCG  float64
+	HybNDCG  float64
+	Top1Hit  string
 }
 
 // BenchmarkReport contains the complete summary and per-category breakdown of a benchmark run.
 type BenchmarkReport struct {
+	ModelInfo        BenchmarkModelInfo
 	Results          map[string]*EvalResult
 	CategoryMetrics  map[string]map[string][3]float64 // category -> mode -> [ndcg, recall, mrr]
 	SortedCategories []string
 	Queries          []EvalQuery
+	QueryLogs        []QueryEvalLog
 }
 
 // BuildEvalCorpus creates a realistic test corpus with 22 documents across diverse categories.
@@ -322,25 +348,91 @@ func (d *DeterministicSubwordEmbedder) EmbedBatch(texts []string, outDim int) []
 	return res
 }
 
-// tryLoadStaticEmbedder attempts to load local static embedder weights if present on disk.
-func tryLoadStaticEmbedder() *StaticEmbedder {
+// findModelFile searches candidate relative directories for real model weights.
+func findModelFile() (string, string, error) {
 	candidates := []string{
+		"text/model.safetensors",
+		"../text/model.safetensors",
+		"../../text/model.safetensors",
 		"text/dd/model.safetensors",
 		"../text/dd/model.safetensors",
-		"../../text/dd/model.safetensors",
 	}
 	for _, p := range candidates {
-		dir := filepath.Dir(p)
-		tokP := filepath.Join(dir, "tokenizer.json")
-		if emb, err := LoadStaticEmbedder(p, tokP); err == nil {
-			return emb
+		if _, err := os.Stat(p); err == nil {
+			tokP := filepath.Join(filepath.Dir(p), "tokenizer.json")
+			if _, err := os.Stat(tokP); err == nil {
+				return p, tokP, nil
+			}
 		}
 	}
-	return nil
+	return "", "", fmt.Errorf("model weights file text/model.safetensors not found in search paths")
 }
 
-// RunBenchmark executes the complete 30-query evaluation suite across Pure Lexical, Pure Semantic, and Filosophy Hybrid.
+// computeFileSHA256 returns the hex-encoded SHA-256 hash and byte size of a file.
+func computeFileSHA256(filePath string) (string, int64, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), info.Size(), nil
+}
+
+// RunBenchmark executes the 30-query retrieval benchmark using verified local model weights.
+// The benchmark FAILS if real model weights cannot be loaded.
 func RunBenchmark() (*BenchmarkReport, error) {
+	modelPath, tokPath, err := findModelFile()
+	if err != nil {
+		return nil, fmt.Errorf("RunBenchmark requires real model weights on disk: %w\nDownload the model bundle into text/ or run RunMockRegressionBenchmark for synthetic tests", err)
+	}
+
+	staticEmb, err := LoadStaticEmbedder(modelPath, tokPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load StaticEmbedder from %s: %w", modelPath, err)
+	}
+	defer staticEmb.Close()
+
+	hash, size, err := computeFileSHA256(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("compute model hash: %w", err)
+	}
+
+	modelInfo := BenchmarkModelInfo{
+		Name:     "static-retrieval-256d",
+		Backend:  "StaticEmbedder (zero-copy mmap, 256-d Matryoshka truncation)",
+		Path:     modelPath,
+		FileSize: size,
+		SHA256:   hash,
+		Dim:      textEmbedDim,
+	}
+
+	return runBenchmarkWithEmbedder(staticEmb, modelInfo)
+}
+
+// RunMockRegressionBenchmark executes an explicitly labeled regression benchmark using synthetic
+// subword hashing. This test runs in headless CI environments without model assets to verify pipeline integrity.
+func RunMockRegressionBenchmark() (*BenchmarkReport, error) {
+	mockEmb := NewDeterministicSubwordEmbedder(textEmbedDim)
+	modelInfo := BenchmarkModelInfo{
+		Name:     "[MOCK / SYNTHETIC REGRESSION TEST]",
+		Backend:  "DeterministicSubwordEmbedder (xxhash subwords/trigrams, non-learned mock)",
+		Path:     "(none - synthetic hash generator)",
+		FileSize: 0,
+		SHA256:   "(synthetic)",
+		Dim:      textEmbedDim,
+	}
+	return runBenchmarkWithEmbedder(mockEmb, modelInfo)
+}
+
+func runBenchmarkWithEmbedder(embedder TextEmbedder, modelInfo BenchmarkModelInfo) (*BenchmarkReport, error) {
 	corpus := BuildEvalCorpus()
 	queries := Build30EvalQueries()
 
@@ -353,15 +445,6 @@ func RunBenchmark() (*BenchmarkReport, error) {
 
 	dbPath := filepath.Join(dir, "eval_main.db")
 	vectorPath := filepath.Join(dir, "eval_vectors.db")
-
-	var embedder TextEmbedder
-	staticEmb := tryLoadStaticEmbedder()
-	if staticEmb != nil {
-		defer staticEmb.Close()
-		embedder = staticEmb
-	} else {
-		embedder = NewDeterministicSubwordEmbedder(textEmbedDim)
-	}
 	dim := textEmbedDim
 
 	store, err := core.New(vectorPath, dim)
@@ -395,7 +478,6 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		return nil, fmt.Errorf("open sqlDB: %w", err)
 	}
 	defer sqlDB.Close()
-
 	sqlDB.Exec("PRAGMA journal_mode=WAL")
 	sqlDB.Exec("PRAGMA busy_timeout=10000")
 
@@ -403,14 +485,22 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		return nil, fmt.Errorf("create paths_fts: %w", err)
 	}
 
-	engine := &Engine{
+	hybridEngine := &Engine{
 		sqlDB:        sqlDB,
 		vDB:          vDB,
 		db:           store,
 		textEmbedder: embedder,
 	}
-	if err := engine.InitIndexTables(); err != nil {
+	if err := hybridEngine.InitIndexTables(); err != nil {
 		return nil, fmt.Errorf("init index tables: %w", err)
+	}
+
+	// Exact ablation: same database and tables, but textEmbedder is nil so semantics is completely disabled.
+	lexEngine := &Engine{
+		sqlDB:        sqlDB,
+		vDB:          vDB,
+		db:           store,
+		textEmbedder: nil,
 	}
 
 	docIdx := 1
@@ -445,15 +535,18 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		docIdx++
 	}
 
+	// Warmup passes: prime SQLite page cache and memory mappings
+	for _, q := range queries {
+		_, _ = lexEngine.Search(q.Query)
+		_, _ = hybridEngine.Search(q.Query)
+	}
+
 	modes := []struct {
-		name        string
-		useLexical  bool
-		useSemantic bool
-		useHybrid   bool
+		name string
 	}{
-		{"Lexical (+ Fuzzy)", true, false, false},
-		{"Pure Semantic", false, true, false},
-		{"Filosophy Hybrid", true, true, true},
+		{"Lexical Ablation (Semantics Off)"},
+		{"Pure Semantic"},
+		{"Filosophy Hybrid"},
 	}
 
 	results := make(map[string]*EvalResult)
@@ -476,55 +569,37 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		catMetrics[cat] = make(map[string][3]float64)
 	}
 
+	queryLogs := make([]QueryEvalLog, len(queries))
+	for i, q := range queries {
+		queryLogs[i] = QueryEvalLog{
+			ID:       q.ID,
+			Query:    q.Query,
+			Category: q.Category,
+		}
+	}
+
 	for _, m := range modes {
 		var latencies []float64
 		var indexLatencies []float64
 		totalNDCG, totalRecall, totalMRR := 0.0, 0.0, 0.0
 
-		for _, q := range queries {
+		for qIdx, q := range queries {
 			const iters = 10
 			var rankedPaths []string
 			var dur time.Duration
 			var indexDur time.Duration
 
-			if m.name == "Lexical (+ Fuzzy)" {
+			if m.name == "Lexical Ablation (Semantics Off)" {
 				start := time.Now()
 				for it := 0; it < iters; it++ {
-					scores := make(map[string]float64)
-					engine.addPathFTSScores(ctx, q.Query, scores, 3.0)
-					engine.addPathFTSAllWords(ctx, q.Query, scores, 4.0)
-					engine.addPathFTSPrefixScores(ctx, q.Query, scores, 1.5)
-					engine.addPathFTSShortPrefixScores(ctx, q.Query, scores, 1.0)
-					if len(scores) < 20 {
-						engine.addPathSubstringScores(ctx, q.Query, scores, 0.75)
+					res, err := lexEngine.Search(q.Query)
+					if err != nil {
+						return nil, fmt.Errorf("lexical search %q: %w", q.Query, err)
 					}
-					cScores := make(map[string]float64)
-					engine.addContentFTSRRF(ctx, q.Query, cScores)
-					phraseMatches := engine.addContentFTSPhraseRRF(ctx, q.Query, cScores)
-					if len(cScores) < 5 && len(q.Query) >= 3 {
-						phraseMatches = mergePathMatches(phraseMatches, engine.addContentFTSFuzzyRRF(ctx, q.Query, cScores))
-					}
-					for p, v := range cScores {
-						scores[p] += v
-					}
-					addFuzzyPathBoosts(q.Query, scores)
-
-					type scoredDoc struct {
-						path  string
-						score float64
-					}
-					var ranked []scoredDoc
-					for p, s := range scores {
-						s *= codeFileMultiplier(p, q.Query, phraseMatches)
-						ranked = append(ranked, scoredDoc{p, s})
-					}
-					sort.Slice(ranked, func(i, j int) bool {
-						return ranked[i].score > ranked[j].score
-					})
 					if it == 0 {
-						rankedPaths = make([]string, len(ranked))
-						for i, rd := range ranked {
-							rankedPaths[i] = rd.path
+						rankedPaths = make([]string, len(res))
+						for i, item := range res {
+							rankedPaths[i] = item.Path
 						}
 					}
 				}
@@ -532,11 +607,19 @@ func RunBenchmark() (*BenchmarkReport, error) {
 				indexDur = dur
 
 			} else if m.name == "Pure Semantic" {
-				start := time.Now()
+				// Disentangled query embedding latency
+				embedStart := time.Now()
 				for it := 0; it < iters; it++ {
-					qVec := embedder.EmbedTruncated(q.Query, dim)
+					_ = embedder.EmbedTruncated(q.Query, dim)
+				}
+				embedDur := time.Since(embedStart) / iters
+
+				// Disentangled index traversal latency
+				qVec := embedder.EmbedTruncated(q.Query, dim)
+				idxStart := time.Now()
+				for it := 0; it < iters; it++ {
 					scores := make(map[string]float64)
-					tRes, err := engine.db.Search(ctx, qVec, core.SearchOptions{
+					tRes, err := hybridEngine.db.Search(ctx, qVec, core.SearchOptions{
 						Collection: textCollection,
 						TopK:       10,
 					})
@@ -549,51 +632,39 @@ func RunBenchmark() (*BenchmarkReport, error) {
 							}
 						}
 					}
-					iRes, err := engine.db.Search(ctx, qVec, core.SearchOptions{
-						Collection: imageCollection,
-						TopK:       10,
-					})
-					if err == nil {
-						for _, res := range iRes {
-							p := res.Metadata["path"]
-							sim := float64(res.Score)
-							if sim > scores[p] {
-								scores[p] = sim
-							}
-						}
-					}
-					type scoredDoc struct {
-						path  string
-						score float64
-					}
-					var ranked []scoredDoc
-					for p, s := range scores {
-						ranked = append(ranked, scoredDoc{p, s})
-					}
-					sort.Slice(ranked, func(i, j int) bool {
-						return ranked[i].score > ranked[j].score
-					})
 					if it == 0 {
+						type scoredDoc struct {
+							path  string
+							score float64
+						}
+						var ranked []scoredDoc
+						for p, s := range scores {
+							ranked = append(ranked, scoredDoc{p, s})
+						}
+						sort.Slice(ranked, func(i, j int) bool {
+							return ranked[i].score > ranked[j].score
+						})
 						rankedPaths = make([]string, len(ranked))
-						for i, rd := range ranked {
-							rankedPaths[i] = rd.path
+						for i, item := range ranked {
+							rankedPaths[i] = item.path
 						}
 					}
 				}
-				dur = time.Since(start) / iters
-				indexDur = dur
+				idxDur := time.Since(idxStart) / iters
+				dur = embedDur + idxDur
+				indexDur = idxDur
 
-			} else { // Filosophy Hybrid (direct production Engine.Search call)
+			} else { // Filosophy Hybrid
 				start := time.Now()
 				for it := 0; it < iters; it++ {
-					res, err := engine.Search(q.Query)
+					res, err := hybridEngine.Search(q.Query)
 					if err != nil {
-						return nil, fmt.Errorf("engine search failed for query %q: %w", q.Query, err)
+						return nil, fmt.Errorf("hybrid search %q: %w", q.Query, err)
 					}
 					if it == 0 {
 						rankedPaths = make([]string, len(res))
-						for i, r := range res {
-							rankedPaths[i] = r.Path
+						for i, item := range res {
+							rankedPaths[i] = item.Path
 						}
 					}
 				}
@@ -617,6 +688,19 @@ func RunBenchmark() (*BenchmarkReport, error) {
 			cm[1] += recall
 			cm[2] += mrr
 			catMetrics[q.Category][m.name] = cm
+
+			top1 := "(none)"
+			if len(rankedPaths) > 0 {
+				top1 = rankedPaths[0]
+			}
+			if m.name == "Lexical Ablation (Semantics Off)" {
+				queryLogs[qIdx].LexNDCG = ndcg
+			} else if m.name == "Pure Semantic" {
+				queryLogs[qIdx].SemNDCG = ndcg
+			} else {
+				queryLogs[qIdx].HybNDCG = ndcg
+				queryLogs[qIdx].Top1Hit = top1
+			}
 		}
 
 		n := float64(len(queries))
@@ -654,9 +738,70 @@ func RunBenchmark() (*BenchmarkReport, error) {
 	}
 
 	return &BenchmarkReport{
+		ModelInfo:        modelInfo,
 		Results:          results,
 		CategoryMetrics:  catMetrics,
 		SortedCategories: sortedCategories,
 		Queries:          queries,
+		QueryLogs:        queryLogs,
 	}, nil
+}
+
+// PrintBenchmarkReport outputs the complete benchmark report including cryptographic provenance,
+// pipeline results, category breakdown, and detailed per-query ranked logs.
+func PrintBenchmarkReport(logFn func(format string, args ...any), report *BenchmarkReport) {
+	logFn("\n=========================================================================================")
+	logFn("                    FILOSOPHY RETRIEVAL BENCHMARK & ABLATION REPORT                      ")
+	logFn("=========================================================================================")
+	logFn("MODEL PROVENANCE & WEIGHT VERIFICATION:")
+	logFn("  Model Name   : %s", report.ModelInfo.Name)
+	logFn("  Backend      : %s", report.ModelInfo.Backend)
+	logFn("  Weight Path  : %s", report.ModelInfo.Path)
+	if report.ModelInfo.FileSize > 0 {
+		logFn("  File Size    : %d bytes (%.2f MB)", report.ModelInfo.FileSize, float64(report.ModelInfo.FileSize)/(1024*1024))
+	}
+	logFn("  SHA-256 Hash : %s", report.ModelInfo.SHA256)
+	logFn("  Dimension    : %d (Matryoshka truncation)", report.ModelInfo.Dim)
+	logFn("  Corpus Scope : Text & Document Retrieval (22 files: reports, specs, code, notes)")
+	logFn("=========================================================================================")
+
+	modes := []string{"Lexical Ablation (Semantics Off)", "Pure Semantic", "Filosophy Hybrid"}
+	logFn("%-32s | %-10s | %-10s | %-10s | %-10s | %-10s | %-10s | %-10s",
+		"Pipeline", "NDCG@10", "MeanRecall", "MRR@10", "Mean (ms)", "p50 (ms)", "p95 (ms)", "IndexOnly")
+	logFn("-----------------------------------------------------------------------------------------------------------------")
+	for _, modeName := range modes {
+		res := report.Results[modeName]
+		logFn("%-32s | %-10.4f | %-10.4f | %-10.4f | %-10.2f | %-10.2f | %-10.2f | %-10.2f",
+			res.Name, res.NDCG10, res.Recall10, res.MRR10, res.MeanLatMs, res.P50LatMs, res.P95LatMs, res.IndexOnlyLatMs)
+	}
+
+	logFn("=========================================================================================")
+	logFn("                               CATEGORY BREAKDOWN (NDCG@10)                              ")
+	logFn("-----------------------------------------------------------------------------------------")
+	logFn("%-35s | %-18s | %-15s | %-15s", "Category", "Lexical Ablation", "Pure Semantic", "Filosophy Hybrid")
+	logFn("-----------------------------------------------------------------------------------------")
+	for _, cat := range report.SortedCategories {
+		lex := report.CategoryMetrics[cat]["Lexical Ablation (Semantics Off)"][0]
+		sem := report.CategoryMetrics[cat]["Pure Semantic"][0]
+		hyb := report.CategoryMetrics[cat]["Filosophy Hybrid"][0]
+		logFn("%-35s | %-18.4f | %-15.4f | %-15.4f", cat, lex, sem, hyb)
+	}
+
+	logFn("=========================================================================================")
+	logFn("                               PER-QUERY DETAILED EVALUATION LOG                         ")
+	logFn("-----------------------------------------------------------------------------------------")
+	logFn("%-3s | %-32s | %-8s | %-8s | %-8s | %-30s", "ID", "Query", "LexNDCG", "SemNDCG", "HybNDCG", "Hybrid Top-1 Match")
+	logFn("-----------------------------------------------------------------------------------------")
+	for _, ql := range report.QueryLogs {
+		qStr := ql.Query
+		if len(qStr) > 32 {
+			qStr = qStr[:29] + "..."
+		}
+		top1 := ql.Top1Hit
+		if len(top1) > 30 {
+			top1 = "..." + top1[len(top1)-27:]
+		}
+		logFn("%-3d | %-32s | %-8.4f | %-8.4f | %-8.4f | %-30s", ql.ID, qStr, ql.LexNDCG, ql.SemNDCG, ql.HybNDCG, top1)
+	}
+	logFn("=========================================================================================\n")
 }

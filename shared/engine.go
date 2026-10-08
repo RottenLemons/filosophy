@@ -118,7 +118,7 @@ type Engine struct {
 	db                *core.SQLiteStore
 	sqlDB             *sql.DB                     // separate connection for the files table
 	textEmbedder      TextEmbedder                // text embedding interface
-	textStatic        *StaticEmbedder             // fast static embedder (e.g. text/dd)
+	textStatic        *StaticEmbedder             // fast static embedder (e.g. text)
 	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx) fallback
 	textTok           *tokenizers.Tokenizer       // tokenizer for the BERT text encoder
 	clipTok           *tokenizers.Tokenizer
@@ -295,7 +295,7 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 		return nil, fmt.Errorf("failed to initialize onnxruntime (dll=%s): %w", ortPath, err)
 	}
 
-	// Prefer text/dd static embedder if present (much faster zero-copy mmap)
+	// Prefer text static embedder if present (much faster zero-copy mmap)
 	actualTextModelPath := textModelPath
 	if _, err := os.Stat(filepath.Join(actualTextModelPath, "model.safetensors")); err != nil {
 		if _, err := os.Stat(filepath.Join(textModelPath, "dd", "model.safetensors")); err == nil {
@@ -310,13 +310,13 @@ func New(dbPath, textModelPath, imageModelPath string, hw HardwareConfig) (*Engi
 	safetensorsPath := filepath.Join(actualTextModelPath, "model.safetensors")
 	tokPath := filepath.Join(actualTextModelPath, "tokenizer.json")
 	if _, err := os.Stat(safetensorsPath); err == nil {
-		log.Println("[Engine 5] Loading fast text/dd static embedder from", actualTextModelPath)
+		log.Println("[Engine 5] Loading fast text static embedder from", actualTextModelPath)
 		var err error
 		textStatic, err = LoadStaticEmbedder(safetensorsPath, tokPath)
 		if err != nil {
 			log.Printf("[Engine 5] Warning: failed to load static embedder (%v), falling back to ONNX", err)
 		} else {
-			log.Printf("[Engine 5] Fast text/dd static embedder loaded successfully (%d dimensions)", textStatic.Dim())
+			log.Printf("[Engine 5] Fast text static embedder loaded successfully (%d dimensions)", textStatic.Dim())
 		}
 	}
 

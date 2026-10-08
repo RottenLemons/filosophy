@@ -13,6 +13,8 @@ text/**
 native/**
 vips-dev-8.18/
 kreuzberg-ffi/**
+models.zip
+*.zip
 
 # Python
 __pycache__/
