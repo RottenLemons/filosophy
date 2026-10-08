@@ -10,11 +10,11 @@ Filosophy's hybrid pipeline was benchmarked against lexical with fuzzy matching 
 
 | Pipeline | NDCG@10 | Recall@10 | MRR@10 | End-to-End Latency | Index-Only Latency |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Lexical (+ Fuzzy)** (FTS5 + BM25 + Fuzzy) | 0.8027 | 83.33% | 0.7917 | **0.48 ms** | 0.48 ms |
-| **Pure Semantic** (Dense Vectors) | 0.6117 | 71.67% | 0.5867 | 3.55 ms | 0.49 ms |
-| **Filosophy Hybrid** | **0.8507** | **93.33%** | **0.8242** | 3.08 ms | 1.76 ms |
+| **Lexical (+ Fuzzy)** (FTS5 + BM25 + Fuzzy) | 0.8360 | 86.67% | 0.8250 | 1.35 ms | 1.35 ms |
+| **Pure Semantic** (Dense Vectors via StaticEmbedder) | 0.8202 | 93.33% | 0.8098 | **0.61 ms** | **0.61 ms** |
+| **Filosophy Hybrid** (Production Engine.Search) | **0.8880** | **93.33%** | **0.8722** | 1.86 ms | 1.86 ms |
 
-Hybrid retrieval achieves a **+10.0% recall gain over lexical (+ fuzzy)** and **+21.7% over semantic** while keeping search latency ~3.0ms via concurrent multi-channel execution. The hybrid pipeline particularly excels in real-world weak cases: **+33.3% on infix substrings** and **+58.5% on noise suppression**. Full query logs and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
+Hybrid retrieval achieves **93.33% Recall@10** (a **+6.7 percentage point (pp)** gain over lexical (+ fuzzy) at 86.67%), matching dense semantic recall while delivering higher overall ranking quality (**0.8880 NDCG@10**, **0.8722 MRR@10**) and robust resistance against typos and adversarial noise. Full query logs and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
 
 ## Search and retrieval
 

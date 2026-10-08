@@ -8,14 +8,14 @@ Comprehensive evaluation of Filosophy's hybrid retrieval engine against lexical 
 
 | Retrieval Pipeline | NDCG@10 | Recall@10 | MRR@10 | End-to-End Mean | p50 Latency | p95 Latency | Index-Only Latency |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Lexical (+ Fuzzy)** (FTS5 + BM25 + Fuzzy) | 0.8027 | 83.33% | 0.7917 | **0.48 ms** | < 0.01 ms | 2.16 ms | 0.48 ms |
-| **Pure Semantic** (Dense Vectors) | 0.6117 | 71.67% | 0.5867 | 3.55 ms | 3.65 ms | 3.89 ms | 0.49 ms |
-| **Filosophy Hybrid** (Weighted RRF + Boosts) | **0.8507** | **93.33%** | **0.8242** | 3.08 ms | 3.10 ms | 3.50 ms | 1.76 ms |
+| **Lexical (+ Fuzzy)** (FTS5 + BM25 + Fuzzy) | 0.8360 | 86.67% | 0.8250 | 1.35 ms | 1.30 ms | 2.10 ms | 1.35 ms |
+| **Pure Semantic** (Dense Vectors via StaticEmbedder) | 0.8202 | 93.33% | 0.8098 | **0.61 ms** | **0.60 ms** | **0.80 ms** | **0.61 ms** |
+| **Filosophy Hybrid** (Production Engine.Search) | **0.8880** | **93.33%** | **0.8722** | 1.86 ms | 1.85 ms | 2.46 ms | 1.86 ms |
 
 ### Key Findings
-1. **+10.0% Recall Gain Over Lexical (+ Fuzzy), +21.7% Over Semantic:** Filosophy Hybrid retrieves relevant documents for **93.33%** of queries in the top 10, combining lexical precision and fuzzy tolerance on exact matches with semantic recall on synonyms.
-2. **Honest Latency Modeling:** Lexical inverted index lookup is ~7x faster than pure semantic search (**0.48 ms** vs **3.55 ms**). In real-world retrieval, semantic search cannot skip the query embedding forward pass (which takes ~2.5–3.0 ms on DirectML GPU or ~8.5 ms on CPU).
-3. **Concurrent Multi-Channel Architecture:** Because Filosophy executes lexical FTS and neural embedding concurrently across parallel goroutines (`sigWg.Add(4)` in `Engine.Search`), lexical lookup finishes while the neural model evaluates, bounding hybrid search latency to ~3.08 ms.
+1. **Recall & Ranking Precision:** Filosophy Hybrid achieves **93.33% Recall@10** (retrieving 93.33% of all annotated ground-truth relevant documents in the top 10), representing a **+6.7 percentage point (pp)** gain over Lexical (+ Fuzzy) (86.67%) while matching Pure Semantic recall and delivering higher overall ranking quality (**0.8880 NDCG@10**, **0.8722 MRR@10**).
+2. **Direct Production Pipeline:** The evaluation executes through the real [`Engine.Search`](shared/engine.go) implementation, using 256-dimensional embeddings from [`StaticEmbedder`](shared/embedder.go) (`text/dd`), with all four concurrent retrieval channels, Reciprocal Rank Fusion (RRF), filename boosts, noise penalties, and code multipliers active.
+3. **Measured Wall-Clock Latencies:** With Filosophy's zero-copy mmap static embedder, semantic query embedding occurs in microseconds, yielding sub-millisecond pure vector search (**0.61 ms**). End-to-end hybrid search completes in **~1.86 ms** by running FTS and vector search concurrently across parallel goroutines (`sigWg.Add(4)`). When heavy ONNX transformer models (e.g. BERT or CLIP) are loaded instead of the static embedder, neural inference takes ~2.5–3.0 ms on DirectML GPU (~8.5 ms on CPU) concurrently masked by lexical retrieval.
 
 ---
 
@@ -23,13 +23,13 @@ Comprehensive evaluation of Filosophy's hybrid retrieval engine against lexical 
 
 | Category (Queries) | Lexical (+ Fuzzy) | Pure Semantic | Filosophy Hybrid | Delta (vs Best Baseline) |
 | :--- | :---: | :---: | :---: | :---: |
-| **1. Exact Filename / Path** (5) | **1.0000** | 0.7174 | **1.0000** | parity |
-| **2. Content Keyword Phrase** (5) | **1.0000** | 0.9912 | **1.0000** | parity |
-| **3. Conceptual / Semantic** (6) | 0.7416 | 0.6214 | **0.7932** | **+7.0%** |
-| **4. Typo / Fuzzy Misspelling** (5) | 0.6000 | 0.2524 | **0.6262** | **+4.4%** |
-| **5. Infix / Substring Acronym** (4) | 0.7500 | 0.7390 | **1.0000** | **+33.3%** |
-| **6. Semantic Query Test** (3) | **1.0000** | 0.4769 | 0.8770 | -0.1230 |
-| **7. Noise / Distractor Suppression** (2) | 0.3155 | 0.2153 | **0.5000** | **+58.5%** |
+| **1. Exact Filename / Path** (5) | **1.0000** | 0.7865 | **1.0000** | parity |
+| **2. Content Keyword Phrase** (5) | **1.0000** | 0.9668 | **1.0000** | parity |
+| **3. Conceptual / Semantic** (6) | 0.7416 | **0.9926** | 0.8346 | -0.1580 (balanced) |
+| **4. Typo / Fuzzy Misspelling** (5) | 0.6000 | 0.6578 | **0.8000** | **+0.1422** |
+| **5. Infix / Substring Acronym** (4) | **1.0000** | 0.7904 | **1.0000** | parity |
+| **6. Semantic Query Test** (3) | **1.0000** | 0.8770 | 0.8770 | -0.1230 |
+| **7. Noise / Distractor Suppression** (2) | 0.3155 | 0.4005 | **0.5000** | **+0.0995** |
 
 ---
 
@@ -37,46 +37,36 @@ Comprehensive evaluation of Filosophy's hybrid retrieval engine against lexical 
 
 ### Weak Case 1: Typos and Misspellings (`albret camuls sisifus`, `finacial repot q3`)
 - **Pure Lexical (0.6000):** FTS5 word boundary matching drops severely when user input contains token misspellings (e.g. `albret` instead of `albert`, `finacial` instead of `financial`). Queries with misspelled tokens fail to match standard FTS5 indices.
-- **Pure Semantic (0.2524):** Character-level typos drastically distort dense embedding projections unless high-subword tokenization explicitly preserves semantic direction.
-- **Filosophy Hybrid (0.7262):** Solves this via two distinct mechanisms:
+- **Pure Semantic (0.6578):** Dense embeddings handle partial subwords better than exact keyword indices, but severe typos still degrade semantic projection direction.
+- **Filosophy Hybrid (0.8000):** Combines prefix anchors and fuzzy matching with vector search:
   1. `addPathFTSShortPrefixScores` generates 3-character prefix anchors (`alb* AND cam*`).
   2. `addFuzzyPathBoosts` computes Levenshtein edit distance and 3-gram Jaccard similarity across candidate filenames, restoring top ranking for the target files.
 
 ### Weak Case 2: Infix Substrings and Acronyms (`cv` inside `resume_mahircv.pdf`)
-- **Pure Lexical (0.7500):** SQLite FTS tokenizers break words on punctuation and whitespace. Searching `cv` cannot match `mahircv` because FTS tokenization does not index arbitrary interior substrings.
-- **Pure Semantic (0.7390):** Acronyms and partial stems often yield broad or ambiguous vector activations.
-- **Filosophy Hybrid (1.0000):** `addPathSubstringScores` automatically issues an escaped SQL `LIKE '%word%'` query when candidate pools are sparse, discovering non-boundary infix tokens.
+- **Pure Lexical (1.0000) & Filosophy Hybrid (1.0000):** SQLite FTS tokenizers break words on punctuation and whitespace, but Filosophy's `addPathSubstringScores` automatically issues an escaped SQL `LIKE '%word%'` query when candidate pools are sparse, discovering non-boundary infix tokens.
+- **Pure Semantic (0.7904):** Acronyms and partial stems often yield broad or ambiguous vector activations that rank slightly lower without exact lexical reinforcement.
 
 ### Weak Case 3: Opaque Identifiers and Camera Prefixes (`DSC_0942`, `auth_service.go`)
-- **Pure Semantic (0.7174):** Dense embedding models do not memorize camera filenames, hash prefixes, or source file extensions. Pure semantic search regularly ranks semantic neighbors (e.g., photo nature descriptions) above the exact file requested.
+- **Pure Semantic (0.7865):** Dense embedding models do not memorize camera filenames, hash prefixes, or source file extensions. Pure semantic search regularly ranks semantic neighbors (e.g., photo nature descriptions) above the exact file requested.
 - **Filosophy Hybrid (1.0000):** Weighted RRF channel weights favor path exact matches (`3.0`) and path prefixes (`1.5`), locking exact identifier matches to rank #1.
 
 ### Weak Case 4: System Binaries & Adversarial Noise (`system driver`, `temporary cache backup`)
-- **Pure Lexical (0.3155) & Semantic (0.2153):** A search for `system driver` would naturally score `C:\Windows\System32\drivers\windows_system_driver.sys` high on BM25 keyword frequency, cluttering search results with useless OS binaries.
+- **Pure Lexical (0.3155) & Semantic (0.4005):** A search for `system driver` scores `C:\Windows\System32\drivers\windows_system_driver.sys` high on BM25 keyword frequency and topic proximity, cluttering search results with useless OS binaries.
 - **Filosophy Hybrid (0.5000):** `applyNoisePenalties` applies a 0.1x score multiplier to compiled binaries (`.sys`, `.dll`, `.exe`, `.dat`, `.obj`) and a 0.05x multiplier to OS paths (`C:\Windows\`, `/usr/lib/`), ensuring user documents always rank ahead of background clutter.
 
 ---
 
-## Understanding Search Latency: The "Fast Semantic" Fallacy
+## Latency Profile and Architecture
 
-Why is Lexical search ~7x faster than Pure Semantic search, and why do some benchmarks report the opposite?
-
-1. **The Index-Only Pitfall:**
-   In naive vector store micro-benchmarks, queries are pre-converted to float32 vectors in RAM prior to measurement. Traversing an in-memory HNSW graph or computing dot products over small vector spaces takes only **~0.10–0.49 ms**. If a benchmark measures only this vector-distance step, it creates the illusion that semantic search is faster than SQLite FTS5 B-Tree scanning (**0.48 ms**).
-
-2. **The Reality of End-to-End Search:**
-   In a production search engine, a user types a raw text string (`"business sales profitability forecast"`). Semantic search **cannot execute** until that text is tokenized and passed through a neural transformer model (such as MiniLM or CLIP) to produce a 256/512-dimensional vector:
-   - **Neural Forward Pass:** ~2.5–3.0 ms with DirectML GPU acceleration (~8.5 ms on CPU).
-   - **Vector Store Traversal:** ~0.49 ms.
-   - **Total Pure Semantic Latency:** **~3.55 ms**.
-   - **Total Lexical Latency:** **~0.48 ms** (pure inverted index B-Tree lookup + Levenshtein distance, zero tensor operations).
-
-3. **Filosophy's Concurrent Multi-Branch Design:**
-   Rather than executing lexical and semantic pipelines sequentially, Filosophy's [`Engine.Search`](file:///c:/Users/Mahir/filosophy/shared/engine.go) fans out across independent goroutines (`sigWg.Add(4)`):
-   - Path FTS & Content FTS execute in **~0.48 ms**.
-   - Neural query embedding and vector search execute concurrently in **~3.00 ms**.
-   - Reciprocal Rank Fusion (RRF) and heuristic adjustments blend the resulting rank lists in **~0.10 ms**.
-   - **Total Hybrid Latency:** **~3.08 ms** (the lexical pass completes well before the neural forward pass finishes, completely masking FTS overhead).
+1. **Static Zero-Copy Mmap Embedder vs. Heavy ONNX Models:**
+   - **Static Embedder (`text/dd`):** Filosophy includes a fast static embedding engine that memory-maps token embedding weights from `model.safetensors`. Query embedding requires no tensor matrix multiplications—only token lookup, mean pooling, and 256-d Matryoshka truncation. This executes in under **0.1 ms**, bringing pure semantic search down to **~0.61 ms** total.
+   - **Full ONNX Transformer / DirectML:** For full transformer models (BERT, CLIP), the neural forward pass requires ~2.5–3.0 ms on DirectML GPU (~8.5 ms on CPU).
+2. **Concurrent Multi-Branch Execution:**
+   Rather than executing lexical and semantic pipelines sequentially, Filosophy's [`Engine.Search`](shared/engine.go) fans out across independent goroutines (`sigWg.Add(4)`):
+   - Path FTS & Content FTS execute in **~1.35 ms**.
+   - Text vector embedding and HNSW search execute concurrently in **~0.61 ms** (or masked under ~2.5 ms with ONNX models).
+   - Reciprocal Rank Fusion (RRF) and heuristic adjustments blend the resulting candidate pools in **~0.10 ms**.
+   - **Total Hybrid Latency:** **~1.86 ms** end-to-end.
 
 ---
 
@@ -119,7 +109,7 @@ Why is Lexical search ~7x faster than Pure Semantic search, and why do some benc
 
 ## Reproducing the Benchmark
 
-The benchmark is 100% self-contained, reproducible, and runnable without external model files or proprietary corpora:
+The benchmark is self-contained and runnable via the test suite or CLI:
 
 ```powershell
 # Run via Go test suite:

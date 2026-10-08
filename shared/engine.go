@@ -106,10 +106,18 @@ var (
 	clipStd  = [3]float64{0.26862954, 0.26130258, 0.27577711}
 )
 
+// TextEmbedder defines the interface for text embedding models (e.g. *StaticEmbedder).
+type TextEmbedder interface {
+	EmbedBatch(texts []string, outDim int) [][]float32
+	EmbedTruncated(text string, outDim int) []float32
+	Dim() int
+}
+
 // Engine holds the models and database connection for embedding operations.
 type Engine struct {
 	db                *core.SQLiteStore
 	sqlDB             *sql.DB                     // separate connection for the files table
+	textEmbedder      TextEmbedder                // text embedding interface
 	textStatic        *StaticEmbedder             // fast static embedder (e.g. text/dd)
 	textSession       *ort.DynamicAdvancedSession // BERT text encoder (text/model.onnx) fallback
 	textTok           *tokenizers.Tokenizer       // tokenizer for the BERT text encoder
@@ -1062,8 +1070,14 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	if s.textEmbedder != nil {
+		return s.textEmbedder.EmbedBatch(texts, textEmbedDim), nil
+	}
 	if s.textStatic != nil {
 		return s.textStatic.EmbedBatch(texts, textEmbedDim), nil
+	}
+	if s.textTok == nil || s.textSession == nil {
+		return nil, nil
 	}
 
 	const batchSize = 16
@@ -1205,6 +1219,9 @@ func (s *Engine) embedText(texts []string) ([][]float32, error) {
 // Processed one-by-one as queries are typically single search terms.
 func (s *Engine) embedClipText(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
+		return nil, nil
+	}
+	if s.clipTok == nil || s.clipTextSession == nil {
 		return nil, nil
 	}
 

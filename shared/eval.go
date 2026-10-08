@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/cespare/xxhash"
 	"github.com/liliang-cn/sqvect/v2/pkg/core"
 )
 
@@ -272,62 +272,54 @@ func ComputeMetrics(rankedPaths []string, relMap map[string]float64, k int) (ndc
 	return ndcg, recall, mrr
 }
 
-// GenerateTopicVector constructs a normalized 16-d semantic embedding reflecting document content.
-func GenerateTopicVector(path, content string, dim int) []float32 {
-	v := make([]float32, dim)
-	text := strings.ToLower(path + " " + content)
-
-	topics := []string{
-		"finance revenue quarterly earnings margin expense invoice",
-		"stripe billing payment fee account charge invoice",
-		"uber ride taxi airport travel trip transportation expense",
-		"contract legal agreement service nda terms indemnity policy",
-		"tax return w2 deductions schedule income refund",
-		"onboarding employee hr hiring setup checklist guide vpn",
-		"architecture system design spec distributed storage fts",
-		"meeting notes planning sprint action items alice bob charlie",
-		"camus sisyphus philosophy absurdism meaning revolt essay",
-		"auth authentication jwt token claims signature validate user",
-		"database migration schema sql foreign key alter table",
-		"pipeline ingestion chunking batch parquet stream extract",
-		"logger logging structured formatting rotation panic recovery",
-		"nature sunset mountain lake scenery landscape photo",
-		"whiteboard diagram er drawing database schema entities",
-		"resume cv curriculum vitae career experience mahir engineer",
-	}
-
-	for i, kwStr := range topics {
-		if i >= dim {
-			break
-		}
-		kws := strings.Fields(kwStr)
-		weight := 0.0
-		for _, kw := range kws {
-			if strings.Contains(text, kw) {
-				weight += 1.0
-			}
-		}
-		v[i] = float32(weight)
-	}
-
-	norm := float32(0)
-	for _, x := range v {
-		norm += x * x
-	}
-	if norm > 0 {
-		norm = float32(math.Sqrt(float64(norm)))
-		for i := range v {
-			v[i] /= norm
-		}
-	} else {
-		v[0] = 1.0
-	}
-	return v
+// DeterministicSubwordEmbedder provides a deterministic 256-d subword hashing embedder
+// for environments (such as headless CI test runners) where local model weights are absent.
+type DeterministicSubwordEmbedder struct {
+	dim int
 }
 
-// GenerateQueryVector maps query text to the corresponding 16-d semantic vector space.
-func GenerateQueryVector(query string, dim int) []float32 {
-	return GenerateTopicVector("", query, dim)
+func NewDeterministicSubwordEmbedder(dim int) *DeterministicSubwordEmbedder {
+	return &DeterministicSubwordEmbedder{dim: dim}
+}
+
+func (d *DeterministicSubwordEmbedder) Dim() int { return d.dim }
+
+func (d *DeterministicSubwordEmbedder) EmbedTruncated(text string, outDim int) []float32 {
+	if outDim <= 0 || outDim > d.dim {
+		outDim = d.dim
+	}
+	vec := make([]float32, outDim)
+	lower := strings.ToLower(text)
+	words := strings.Fields(lower)
+	for _, w := range words {
+		h := xxhash.Sum64String(w)
+		idx := int(h % uint64(outDim))
+		sign := float32(1.0)
+		if (h>>32)&1 == 1 {
+			sign = -1.0
+		}
+		vec[idx] += sign
+		if len(w) >= 3 {
+			for i := 0; i <= len(w)-3; i++ {
+				gh := xxhash.Sum64String(w[i : i+3])
+				gIdx := int(gh % uint64(outDim))
+				gSign := float32(0.5)
+				if (gh>>32)&1 == 1 {
+					gSign = -0.5
+				}
+				vec[gIdx] += gSign
+			}
+		}
+	}
+	return staticNormalize(vec)
+}
+
+func (d *DeterministicSubwordEmbedder) EmbedBatch(texts []string, outDim int) [][]float32 {
+	res := make([][]float32, len(texts))
+	for i, t := range texts {
+		res[i] = d.EmbedTruncated(t, outDim)
+	}
+	return res
 }
 
 // tryLoadStaticEmbedder attempts to load local static embedder weights if present on disk.
@@ -362,7 +354,16 @@ func RunBenchmark() (*BenchmarkReport, error) {
 	dbPath := filepath.Join(dir, "eval_main.db")
 	vectorPath := filepath.Join(dir, "eval_vectors.db")
 
-	const dim = 16
+	var embedder TextEmbedder
+	staticEmb := tryLoadStaticEmbedder()
+	if staticEmb != nil {
+		defer staticEmb.Close()
+		embedder = staticEmb
+	} else {
+		embedder = NewDeterministicSubwordEmbedder(textEmbedDim)
+	}
+	dim := textEmbedDim
+
 	store, err := core.New(vectorPath, dim)
 	if err != nil {
 		return nil, fmt.Errorf("create sqvect: %w", err)
@@ -386,6 +387,8 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		return nil, fmt.Errorf("open vDB: %w", err)
 	}
 	defer vDB.Close()
+	vDB.Exec("PRAGMA journal_mode=WAL")
+	vDB.Exec("PRAGMA busy_timeout=10000")
 
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -393,15 +396,21 @@ func RunBenchmark() (*BenchmarkReport, error) {
 	}
 	defer sqlDB.Close()
 
-	if _, err := sqlDB.Exec(`CREATE TABLE files (
-		path TEXT PRIMARY KEY, hash INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0,
-		size INTEGER NOT NULL DEFAULT 0, content_indexed INTEGER NOT NULL DEFAULT 1,
-		ext TEXT NOT NULL DEFAULT '', ctime INTEGER NOT NULL DEFAULT 0, atime INTEGER NOT NULL DEFAULT 0
-	)`); err != nil {
-		return nil, fmt.Errorf("create files table: %w", err)
-	}
-	if _, err := sqlDB.Exec(`CREATE VIRTUAL TABLE paths_fts USING fts5(searchable, path UNINDEXED)`); err != nil {
+	sqlDB.Exec("PRAGMA journal_mode=WAL")
+	sqlDB.Exec("PRAGMA busy_timeout=10000")
+
+	if _, err := sqlDB.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS paths_fts USING fts5(searchable, path UNINDEXED)`); err != nil {
 		return nil, fmt.Errorf("create paths_fts: %w", err)
+	}
+
+	engine := &Engine{
+		sqlDB:        sqlDB,
+		vDB:          vDB,
+		db:           store,
+		textEmbedder: embedder,
+	}
+	if err := engine.InitIndexTables(); err != nil {
+		return nil, fmt.Errorf("init index tables: %w", err)
 	}
 
 	docIdx := 1
@@ -418,7 +427,7 @@ func RunBenchmark() (*BenchmarkReport, error) {
 			return nil, fmt.Errorf("insert paths_fts: %w", err)
 		}
 
-		vec := GenerateTopicVector(path, content, dim)
+		vec := embedder.EmbedTruncated(content, dim)
 		targetColl := coll.ID
 		if IsImageFile(path) {
 			targetColl = imgColl.ID
@@ -434,12 +443,6 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		}
 
 		docIdx++
-	}
-
-	engine := &Engine{
-		sqlDB: sqlDB,
-		vDB:   vDB,
-		db:    store,
 	}
 
 	modes := []struct {
@@ -473,34 +476,28 @@ func RunBenchmark() (*BenchmarkReport, error) {
 		catMetrics[cat] = make(map[string][3]float64)
 	}
 
-	staticEmb := tryLoadStaticEmbedder()
-	if staticEmb != nil {
-		defer staticEmb.Close()
-	}
-
 	for _, m := range modes {
 		var latencies []float64
 		var indexLatencies []float64
 		totalNDCG, totalRecall, totalMRR := 0.0, 0.0, 0.0
 
 		for _, q := range queries {
-			const runs = 5
+			const iters = 10
 			var rankedPaths []string
-			var bestDuration time.Duration
-			var bestIndexDuration time.Duration
+			var dur time.Duration
+			var indexDur time.Duration
 
-			for r := 0; r < runs; r++ {
-				var dur time.Duration
-				var indexDur time.Duration
-
-				if m.name == "Lexical (+ Fuzzy)" {
-					start := time.Now()
+			if m.name == "Lexical (+ Fuzzy)" {
+				start := time.Now()
+				for it := 0; it < iters; it++ {
 					scores := make(map[string]float64)
-					contentScores := make(map[string]float64)
 					engine.addPathFTSScores(ctx, q.Query, scores, 3.0)
 					engine.addPathFTSAllWords(ctx, q.Query, scores, 4.0)
 					engine.addPathFTSPrefixScores(ctx, q.Query, scores, 1.5)
 					engine.addPathFTSShortPrefixScores(ctx, q.Query, scores, 1.0)
+					if len(scores) < 20 {
+						engine.addPathSubstringScores(ctx, q.Query, scores, 0.75)
+					}
 					cScores := make(map[string]float64)
 					engine.addContentFTSRRF(ctx, q.Query, cScores)
 					phraseMatches := engine.addContentFTSPhraseRRF(ctx, q.Query, cScores)
@@ -509,7 +506,6 @@ func RunBenchmark() (*BenchmarkReport, error) {
 					}
 					for p, v := range cScores {
 						scores[p] += v
-						contentScores[p] += v
 					}
 					addFuzzyPathBoosts(q.Query, scores)
 
@@ -525,26 +521,21 @@ func RunBenchmark() (*BenchmarkReport, error) {
 					sort.Slice(ranked, func(i, j int) bool {
 						return ranked[i].score > ranked[j].score
 					})
-					rankedPaths = make([]string, len(ranked))
-					for i, rd := range ranked {
-						rankedPaths[i] = rd.path
+					if it == 0 {
+						rankedPaths = make([]string, len(ranked))
+						for i, rd := range ranked {
+							rankedPaths[i] = rd.path
+						}
 					}
-					dur = time.Since(start)
-					indexDur = dur
+				}
+				dur = time.Since(start) / iters
+				indexDur = dur
 
-				} else if m.name == "Pure Semantic" {
-					start := time.Now()
-					if staticEmb != nil {
-						_ = staticEmb.EmbedTruncated(q.Query, 256)
-					}
-					// Calibrated neural transformer forward pass (DirectML GPU baseline: ~2.5ms)
-					// In production, s.embedText and s.embedClipText execute ONNX models.
-					time.Sleep(2500 * time.Microsecond)
-					embedDur := time.Since(start)
-
-					idxStart := time.Now()
+			} else if m.name == "Pure Semantic" {
+				start := time.Now()
+				for it := 0; it < iters; it++ {
+					qVec := embedder.EmbedTruncated(q.Query, dim)
 					scores := make(map[string]float64)
-					qVec := GenerateQueryVector(q.Query, dim)
 					tRes, err := engine.db.Search(ctx, qVec, core.SearchOptions{
 						Collection: textCollection,
 						TopK:       10,
@@ -582,155 +573,38 @@ func RunBenchmark() (*BenchmarkReport, error) {
 					sort.Slice(ranked, func(i, j int) bool {
 						return ranked[i].score > ranked[j].score
 					})
-					rankedPaths = make([]string, len(ranked))
-					for i, rd := range ranked {
-						rankedPaths[i] = rd.path
-					}
-					idxDur := time.Since(idxStart)
-					dur = embedDur + idxDur
-					indexDur = idxDur
-
-				} else { // Filosophy Hybrid
-					start := time.Now()
-					var wg sync.WaitGroup
-					wg.Add(2)
-
-					var lexScores map[string]float64
-					var lexContentScores map[string]float64
-					var pm map[string]bool
-					var lexDur time.Duration
-
-					// Concurrent Channel Group 1: Lexical Path & Content FTS + Fuzzy
-					go func() {
-						defer wg.Done()
-						lStart := time.Now()
-						lexScores = make(map[string]float64)
-						lexContentScores = make(map[string]float64)
-						engine.addPathFTSScores(ctx, q.Query, lexScores, 3.0)
-						engine.addPathFTSAllWords(ctx, q.Query, lexScores, 4.0)
-						engine.addPathFTSPrefixScores(ctx, q.Query, lexScores, 1.5)
-						engine.addPathFTSShortPrefixScores(ctx, q.Query, lexScores, 1.0)
-						if len(lexScores) < 20 {
-							engine.addPathSubstringScores(ctx, q.Query, lexScores, 0.75)
-						}
-						cScores := make(map[string]float64)
-						engine.addContentFTSRRF(ctx, q.Query, cScores)
-						pm = engine.addContentFTSPhraseRRF(ctx, q.Query, cScores)
-						if len(cScores) < 5 && len(q.Query) >= 3 {
-							pm = mergePathMatches(pm, engine.addContentFTSFuzzyRRF(ctx, q.Query, cScores))
-						}
-						for p, v := range cScores {
-							lexScores[p] += v
-							lexContentScores[p] += v
-						}
-						addFuzzyPathBoosts(q.Query, lexScores)
-						lexDur = time.Since(lStart)
-					}()
-
-					// Concurrent Channel Group 2: Neural Query Embedding + HNSW Vector Search
-					var semScores map[string]float64
-					var semContentScores map[string]float64
-					var semIdxDur time.Duration
-
-					go func() {
-						defer wg.Done()
-						if staticEmb != nil {
-							_ = staticEmb.EmbedTruncated(q.Query, 256)
-						}
-						time.Sleep(2500 * time.Microsecond)
-						sIdxStart := time.Now()
-						semScores = make(map[string]float64)
-						semContentScores = make(map[string]float64)
-						qVec := GenerateQueryVector(q.Query, dim)
-						tRes, err := engine.db.Search(ctx, qVec, core.SearchOptions{
-							Collection: textCollection,
-							TopK:       10,
-						})
-						if err == nil {
-							for i, res := range tRes {
-								p := res.Metadata["path"]
-								s := 1.0 / (rrfK + float64(i+1))
-								semScores[p] += s
-								semContentScores[p] += s
-							}
-						}
-						iRes, err := engine.db.Search(ctx, qVec, core.SearchOptions{
-							Collection: imageCollection,
-							TopK:       10,
-						})
-						if err == nil {
-							for i, res := range iRes {
-								p := res.Metadata["path"]
-								s := 1.1 / (rrfK + float64(i+1))
-								semScores[p] += s
-								semContentScores[p] += s
-							}
-						}
-						semIdxDur = time.Since(sIdxStart)
-					}()
-
-					wg.Wait()
-
-					fusionStart := time.Now()
-					scores := make(map[string]float64)
-					contentScores := make(map[string]float64)
-					for p, v := range lexScores {
-						scores[p] += v
-					}
-					for p, v := range lexContentScores {
-						contentScores[p] += v
-					}
-					for p, v := range semScores {
-						scores[p] += v
-					}
-					for p, v := range semContentScores {
-						contentScores[p] += v
-					}
-
-					addFilenameBoosts(q.Query, scores)
-					for path, score := range scores {
-						if _, hasContent := contentScores[path]; !hasContent && score > 0.12 {
-							scores[path] = 0.12
+					if it == 0 {
+						rankedPaths = make([]string, len(ranked))
+						for i, rd := range ranked {
+							rankedPaths[i] = rd.path
 						}
 					}
-					applyNoisePenalties(scores)
-
-					type scoredDoc struct {
-						path  string
-						score float64
-					}
-					var ranked []scoredDoc
-					for p, s := range scores {
-						s *= codeFileMultiplier(p, q.Query, pm)
-						ranked = append(ranked, scoredDoc{p, s})
-					}
-					sort.Slice(ranked, func(i, j int) bool {
-						return ranked[i].score > ranked[j].score
-					})
-
-					rankedPaths = make([]string, len(ranked))
-					for i, rd := range ranked {
-						rankedPaths[i] = rd.path
-					}
-
-					dur = time.Since(start)
-					maxIdx := lexDur
-					if semIdxDur > maxIdx {
-						maxIdx = semIdxDur
-					}
-					indexDur = maxIdx + time.Since(fusionStart)
 				}
+				dur = time.Since(start) / iters
+				indexDur = dur
 
-				if r == 0 || dur < bestDuration {
-					bestDuration = dur
-					bestIndexDuration = indexDur
+			} else { // Filosophy Hybrid (direct production Engine.Search call)
+				start := time.Now()
+				for it := 0; it < iters; it++ {
+					res, err := engine.Search(q.Query)
+					if err != nil {
+						return nil, fmt.Errorf("engine search failed for query %q: %w", q.Query, err)
+					}
+					if it == 0 {
+						rankedPaths = make([]string, len(res))
+						for i, r := range res {
+							rankedPaths[i] = r.Path
+						}
+					}
 				}
+				dur = time.Since(start) / iters
+				indexDur = dur
 			}
 
-			latMs := float64(bestDuration.Microseconds()) / 1000.0
+			latMs := float64(dur.Microseconds()) / 1000.0
 			latencies = append(latencies, latMs)
 
-			idxLatMs := float64(bestIndexDuration.Microseconds()) / 1000.0
+			idxLatMs := float64(indexDur.Microseconds()) / 1000.0
 			indexLatencies = append(indexLatencies, idxLatMs)
 
 			ndcg, recall, mrr := ComputeMetrics(rankedPaths, q.Relevance, 10)
