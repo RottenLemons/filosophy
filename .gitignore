@@ -52,7 +52,7 @@ filosophy       # binary name
 
 # Wails
 build/bin/
-wailsjs/
+/wailsjs/
 
 # OS
 .DS_Store

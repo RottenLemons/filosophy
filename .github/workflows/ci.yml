@@ -64,5 +64,6 @@ jobs:
         run: |
           Push-Location frontend
           npm ci
+          npx svelte-kit sync
           npm run build
           Pop-Location
