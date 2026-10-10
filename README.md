@@ -1,69 +1,52 @@
 # Filosophy
 
-Filosophy is a Windows desktop app for searching files stored on your computer. It combines filename and document-text search with locally computed text and image embeddings. Indexing and search do not require a hosted AI service. The optional Assistant can connect to a local or remote OpenAI-compatible provider when configured.
+Filosophy is a local search engine for the files on your computer. It reads PDFs, code, Office documents, Markdown and images, pulls out the text, splits it into chunks, embeds the chunks locally with ONNX Runtime, and indexes everything in SQLite FTS5 and a vector store. Search uses both, so you can find a file by its name or by what it is about.
+
+The desktop app is Go and React (Wails). Text extraction runs through a Rust library over FFI. Indexing and search run on your machine and need no hosted AI service.
+
+I wrote a benchmark comparing lexical, semantic and hybrid retrieval. The results are in [EVALUATION.md](EVALUATION.md).
 
 ![demo gif](demo.gif)
 
-### Retrieval benchmark (Lexical vs Semantic vs Hybrid)
+## How it works
 
-Filosophy's hybrid pipeline was benchmarked against the exact lexical ablation (production `Engine.Search` with semantics disabled) and pure semantic (dense vector similarity) baselines across 30 queries spanning exact names, keyword extraction, conceptual synonyms, typos, infix substrings, and noise suppression:
-
-| Pipeline | NDCG@10 | Mean Recall@10 | MRR@10 | End-to-End Mean | p50 Latency | p95 Latency | Index-Only Latency |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Lexical Ablation** (Semantics Off) | 0.8380 | 86.67% | 0.8278 | 1.26 ms | 1.25 ms | 1.94 ms | 1.26 ms |
-| **Pure Semantic** (Dense Vectors via StaticEmbedder) | 0.8202 | 93.33% | 0.8098 | **0.53 ms** | **0.42 ms** | **1.02 ms** | **0.48 ms** |
-| **Filosophy Hybrid** (Production Engine.Search) | **0.9071** | **96.67%** | **0.8861** | 1.90 ms | 1.67 ms | 3.44 ms | 1.90 ms |
-
-Hybrid retrieval achieves **96.67% Mean Recall@10** (a **+10.0 percentage point (pp)** gain over lexical ablation at 86.67% and exceeding pure semantic recall at 93.33%), while delivering higher overall ranking quality (**0.9071 NDCG@10**, **0.8861 MRR@10**), particularly on typo tolerance (**0.9262 NDCG** vs 0.6000 lexical, +0.3262 gain). Verified against model weights SHA-256 `164fc63ee9...`. Full query logs, cryptographic verification, and failure mode analyses are documented in [EVALUATION.md](EVALUATION.md).
-
-Run the benchmark locally:
-
-```powershell
-go test -v -run TestRetrievalEvaluation ./shared/...
-# or via CLI:
-go run ./cmd/eval
+```
+[ Files ]  PDF, code, Office, images, Markdown
+    |
+    v
+[ 1. Ingest and extract ]  Rust library over FFI (kreuzberg-ffi), libvips for images
+    |
+    v
+[ 2. Chunk ]  sliding window sized by tokens, plus file metadata
+    |
+    v
+[ 3. Embed ]  local text and image encoders (static retrieval model, ONNX Runtime)
+    |
+    +--------------------------+
+    v                          v
+[ 4a. SQLite FTS5 ]      [ 4b. Vector store ]
+    |                          |
+    +------------+-------------+
+                 v
+        [ 5. Fuse and rank ]  weighted RRF
 ```
 
-## Search and retrieval
+Indexing happens in two passes. The first pass records paths and metadata in SQLite, so filename search works almost right away. A background pass then extracts text, chunks it, and writes the full-text index and the embeddings. Semantic results show up as vectors get added.
 
-Filosophy uses a staged, local hybrid retriever. The first indexing pass records eligible paths and metadata in SQLite, making filename and path keyword search available quickly. A background enhanced pass then extracts document text, chunks it, indexes it for full-text search, and writes text and image embeddings. Semantic matches become available as vectors are added; after the initial enhanced pass completes, the full hybrid index is ready. Search continues to combine keyword and semantic evidence rather than switching to semantic-only results.
+## Quickstart
 
+Filosophy builds on Windows x64 only. The model files and native libraries are not in this repo (see [Downloads](#downloads)), and the build does not fetch them. Download them first and extract them into the repository root.
 
-Search gathers candidates from independent retrieval channels, then fuses their ranked lists:
-
-- **Path and filename retrieval:** SQLite FTS matches exact terms, all query terms, prefixes, and substrings. Filename boosts and trigram similarity improve exact-name and typo-tolerant discovery.
-- **Document-text retrieval:** Extracted chunks are searched with SQLite FTS5, including phrase and keyword signals; fuzzy content matching is used when exact retrieval returns few candidates.
-- **Semantic retrieval:** A local text encoder retrieves related document chunks from the vector store, including conceptually similar passages that do not share query keywords. A text-to-image encoder retrieves relevant images through a separate, smaller candidate pool.
-
-The ranked lists are combined with weighted Reciprocal Rank Fusion (RRF). RRF combines rank positions instead of adding raw BM25 and vector-similarity values, which have different score scales. Its smoothing constant limits how sharply a single rank position changes a channel's contribution. The default channel weights favor path matches (`3.0`) and path prefixes (`1.5`), with text semantics (`1.0`), image semantics (`1.1`), and content full-text (`1.0`) contributing complementary evidence.
-
-Post-fusion adjustments keep results useful for real file discovery: strong filename matches and typo tolerance are boosted; path-only matches are capped so they do not outrank meaningful content matches; noisy system/binary files and generic code files are penalized; recency and query filters are applied; and results are sorted again. Code-file penalties are relaxed when the query closely matches extracted code content, so relevant source files can still rank well.
-
-If the optional local cross-encoder is installed, it reranks the top eight fused candidates using up to two matching text excerpts per file. The reranker score is blended with the fused rank; candidates outside that reranking window retain their fused ordering. Embedding and reranking inference run locally.
-### Candidate retrieval and ranking
-
-## External downloads
-
-Model and runtime bundles are not stored in this repository. Keep the downloaded directory structure intact when extracting into the repository root; the release packaging script validates required local assets but does not download them.
-
-- **Models:** [Download the model bundle](https://drive.google.com/file/d/1-0Ctf13L4wO93oPXhkF2osZwN6ppDTJu/view?usp=sharing). It should provide the `text/` and `image/` directories, including their ONNX models and tokenizer files. The optional reranker files belong in the repository root.
-- **libvips:** [Windows x64 releases](https://github.com/libvips/build-win64-mxe/releases/tag/v8.18.2). Download `vips-dev-x64-all-8.18.2.zip` and extract its `vips-dev-8.18/` directory into the repository root.
-- **ONNX Runtime & DirectML:** Filosophy uses the DirectML execution provider for local GPU acceleration on any DirectX 12-compatible GPU (AMD, Intel, NVIDIA) without needing CUDA or cuDNN installations.
-  - **GPU acceleration (recommended):** Download the [`Microsoft.ML.OnnxRuntime.DirectML`](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML) package from NuGet (or direct [package download](https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML)). Open the `.nupkg` archive as a zip, extract `onnxruntime.dll` and `DirectML.dll` from `runtimes/win-x64/native/`, and place them beside the application executable (or in the repository root for development). When `DirectML.dll` is present, GPU acceleration is enabled automatically.
-  - **CPU-only fallback:** Download the standard Windows x64 CPU release from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and place `onnxruntime.dll` beside the executable. If `DirectML.dll` is not present, the app automatically falls back to CPU execution.
-
-## Build and run from source
-
-The supported desktop build target is Windows x64. Install:
+Install:
 
 - Go 1.25.5 or later
-- Node.js 20 or later with npm
+- Node.js 20 or later, with npm
 - Wails CLI v2.16.0
 - Rust and Cargo
-- MSYS2 MinGW-w64 x64 GCC and binutils, including `x86_64-w64-mingw32-gcc` and `ar`
-- The Microsoft WebView2 Runtime
+- MSYS2 MinGW-w64 x64 GCC and binutils (`x86_64-w64-mingw32-gcc` and `ar`)
+- Microsoft WebView2 Runtime
 
-Model and native runtime assets are distributed separately from this source repository and are not downloaded automatically. Download the assets below and extract them into the repository root before building or packaging.
+Then:
 
 ```powershell
 go mod download
@@ -74,9 +57,9 @@ Pop-Location
 wails dev
 ```
 
-`wails dev` starts the desktop application and its Vite frontend. The UI alone can be previewed with `cd frontend; npm run dev`, but desktop features such as indexing and file opening require the Wails Go backend.
+`wails dev` starts the desktop app and the Vite frontend. You can preview only the UI with `cd frontend; npm run dev`, but indexing and opening files need the Go backend.
 
-Build the frontend and Go application for release with:
+To build a release:
 
 ```powershell
 Push-Location frontend
@@ -86,36 +69,114 @@ Pop-Location
 wails build
 ```
 
-The executable is written to `build/bin/filosophy.exe`. To create a Windows zip from the staged runtime assets:
+The executable lands in `build/bin/filosophy.exe`. To make a Windows zip from the assets you downloaded:
 
 ```powershell
 ./scripts/package-release.ps1 -Version 1.0.0
 ```
 
-The script rebuilds the app, checks its required assets, and writes an archive under `dist/`. It does not fetch model files. Test the resulting archive on a clean Windows machine before publishing.
+The script rebuilds the app, checks that the required assets are there, and writes an archive to `dist/`. Test the archive on a clean Windows machine before you share it.
 
-## Verify a source checkout
-
-Run the Go tests and build:
+Run the tests and build:
 
 ```powershell
 go test ./...
 go build ./...
 ```
 
-Build the frontend independently:
+## Downloads
+
+Keep the directory structure intact when you extract into the repository root.
+
+- **Models:** [model bundle](https://drive.google.com/file/d/1-0Ctf13L4wO93oPXhkF2osZwN6ppDTJu/view?usp=sharing). It gives you the `text/` and `image/` directories with the ONNX models and tokenizer files. The optional reranker files go in the repository root.
+- **libvips:** [Windows x64 releases](https://github.com/libvips/build-win64-mxe/releases/tag/v8.18.2). Download `vips-dev-x64-all-8.18.2.zip` and extract its `vips-dev-8.18/` directory into the repository root.
+- **ONNX Runtime:** see below.
+
+### GPU acceleration (DirectML)
+
+Filosophy uses the ONNX Runtime DirectML provider. It runs on any DirectX 12 GPU (AMD, Intel, NVIDIA) and does not need CUDA or cuDNN.
+
+1. Download the [`Microsoft.ML.OnnxRuntime.DirectML`](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML) package from NuGet.
+2. Open the `.nupkg` as a zip and take `onnxruntime.dll` and `DirectML.dll` from `runtimes/win-x64/native/`.
+3. Put both next to the executable (or in the repository root while developing).
+
+If `DirectML.dll` is there, the GPU is used automatically.
+
+### CPU only
+
+Download the Windows x64 CPU release from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and put `onnxruntime.dll` next to the executable. Without `DirectML.dll`, the app falls back to the CPU.
+
+## Search
+
+Search pulls candidates from several channels and merges their ranked lists.
+
+- **Path and filename:** SQLite FTS matches exact terms, prefixes and substrings. Filename boosts and trigram similarity help with exact names and typos.
+- **Document text:** extracted chunks are searched with SQLite FTS5. If exact matching returns little, fuzzy matching kicks in.
+- **Text semantic:** a local text encoder finds chunks that are close in meaning, even when they share no words with the query.
+- **Text to image:** an image encoder finds images from a text query, using a separate and smaller candidate pool.
+
+The lists are merged with weighted Reciprocal Rank Fusion (RRF). RRF uses rank positions, not raw scores, because BM25 and vector similarity are on different scales. Default weights:
+
+| Channel | Weight |
+| :--- | :---: |
+| Path | 3.0 |
+| Path prefix | 1.5 |
+| Image semantic | 1.1 |
+| Text semantic | 1.0 |
+| Content FTS | 1.0 |
+
+After fusion, a few adjustments make the results more useful for finding files. Strong filename matches and typo matches get a boost. Path-only matches are capped so they don't beat real content matches. System files, binaries and generic code files are pushed down, unless the query closely matches their content. Recency and query filters are applied, then the list is sorted again.
+
+If you install the optional local cross-encoder, it reranks the top 8 results using up to two matching excerpts per file. Its score is blended with the fused rank. Everything past the top 8 keeps its fused order. Embedding and reranking both run locally.
+
+### Feedback tuning
+
+Thumbs up and down on results feed a bounded grid search over the channel weights. It optimizes NDCG@10 and MRR@10, needs at least 10 votes, and weights older votes less (about a 7-day half-life). New weights are hot-reloaded. This tunes the ranking weights. It is not model fine-tuning.
+
+## Evaluation
+
+I compared three setups on 30 queries with graded relevance labels:
+
+- **Lexical:** the real `Engine.Search` path with semantics turned off
+- **Semantic:** dense vector similarity only
+- **Hybrid:** the production `Engine.Search`
+
+Queries cover exact names, keyword phrases, conceptual and synonym searches, typos, substrings and acronyms, and noise.
+
+| Pipeline | NDCG@10 | Mean Recall@10 | MRR@10 |
+| :--- | :---: | :---: | :---: |
+| Lexical | 0.8380 | 86.67% | 0.8278 |
+| Semantic | 0.8202 | 93.33% | 0.8098 |
+| **Hybrid** | **0.9071** | **96.67%** | **0.8861** |
+
+Hybrid is best overall and gains the most on typos (0.9262 NDCG@10, against 0.6000 for lexical).
+
+It has some tradeoffs. On conceptual queries, pure semantic scores 0.9926 and hybrid scores 0.8250, because keyword channels pull weaker matches up.
+
+Latency is measured per call over 300 timed runs (30 queries x 10 runs), after warmup. On the 22-file fixture, hybrid has a p50 of 1.67 ms and a p95 of 3.44 ms. The full table, per-query results and failure analysis are in [EVALUATION.md](EVALUATION.md).
+
+Run it yourself (needs `text/model.safetensors` from the model bundle):
 
 ```powershell
-Push-Location frontend
-npm ci
-npm run build
-Pop-Location
+go test -v -run TestRetrievalEvaluation ./shared/...
+# or
+go run ./cmd/eval
 ```
+
+Without the weights, CI runs `TestRetrievalEvaluation_MockRegression` instead. That test is labeled as a mock. It checks the scoring and fusion code, not model quality.
+
+## Assistant, REST and MCP (optional)
+
+The Assistant connects to a local or remote OpenAI-compatible provider and can call file search as a tool. There are also optional local REST and MCP endpoints. None of these are needed for indexing or search.
 
 ## Project layout
 
-- `main.go`, `frontend/`: Wails desktop application and UI
-- `shared/`: indexing, extraction, query parsing, ranking, and local model inference
-- `daemon/`, `cmd/`: background indexer and command-line entry points
+- `main.go`, `frontend/`: Wails desktop app and UI
+- `shared/`: indexing, extraction, query parsing, ranking, local model inference
+- `daemon/`, `cmd/`: background indexer and command-line tools
 - `api.go`, `mcp.go`: optional local REST and MCP endpoints
-- `scripts/`: native tokenizer build and Windows release packaging
+- `scripts/`: tokenizer build and Windows release packaging
+
+## Built with
+
+[Wails](https://wails.io), [ONNX Runtime](https://onnxruntime.ai) with DirectML, [libvips](https://www.libvips.org), [Xberg](https://github.com/xberg-io/xberg) (kreuzberg-ffi) for extraction, [static-retrieval-mrl-en-v1](https://huggingface.co/sentence-transformers/static-retrieval-mrl-en-v1) truncated to 256 dimensions as the text encoder, and [SQLite](https://sqlite.org) FTS5.
